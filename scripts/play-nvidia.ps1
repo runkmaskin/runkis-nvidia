@@ -31,12 +31,14 @@ $settings = @{
     VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
-    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'; VICTORY_SKIP_PIPELINES = 'none'
+    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = $(if ($env:VN_DRED) { $env:VN_DRED } else { '0' }); VICTORY_SKIP_PIPELINES = 'none'
+    # local: DRED 'light' cost an RTX 2070 SUPER 2-4x GPU time, so it is off ($env:VN_DRED='light' turns it on)
     VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '8'; VICTORY_UPLOAD_AHEAD = '1'
     # Cheap picture fixes, on in both sets:
     # - Overbright views: without rays the light probes keep the sky's light indoors. The fog is bounded by 1.5 times
     #   the light around, and what the title left by 2 times the estimate (was 4; ambient.rs).
-    VICTORY_AMBIENT_AIR = '1.5'; VICTORY_AMBIENT_MOST = '2'
+    # (local: VN_AIR from STARTA-NVIDIA.bat overrides the 1.5; lower = less brown haze indoors)
+    VICTORY_AMBIENT_AIR = $(if ($env:VN_AIR) { $env:VN_AIR } else { '1.5' }); VICTORY_AMBIENT_MOST = '2'
     # - Black blobs: a NaN a shader writes is made 0 before blur and the temporal upscaler spread it (emit/lower.rs).
     VICTORY_NAN_SCRUB = '1'
     # Wait for new shaders rather than skip their draws (a hitch the first time a place is seen). Each pipeline is
@@ -52,6 +54,10 @@ $settings = @{
     VICTORY_BVH_MISS = '1'
     # Memory compares on the card instead of the CPU: 11 -> about 22 fps on Series S.
     VICTORY_CARD_BUFFERS_MIN_MB = '1'; VICTORY_CARD_BUFFERS_MB = '1536'
+    # local: copies down to 64 KiB too (shadow.rs card_min): about +10 % on an RTX 2070 SUPER / Ryzen 5 5500X3D
+    VICTORY_CARD_BUFFERS_MIN_KB = '64'
+    # local (after Neptune): guarded textures hashed every 32nd frame, not 8th: prep 47 -> 43 ms
+    VICTORY_TEXTURE_HASH_EVERY = '32'
     # Series S presents the interface as a second plane: laid over the game (compose.rs), else black before gameplay.
     VICTORY_COMPOSE = '1'
 }
