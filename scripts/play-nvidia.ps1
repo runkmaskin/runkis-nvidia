@@ -38,6 +38,8 @@ $settings = @{
     # - Overbright views: without rays the light probes keep the sky's light indoors. The fog is bounded by 1.5 times
     #   the light around, and what the title left by 2 times the estimate (was 4; ambient.rs).
     # (local: VN_AIR from STARTA-NVIDIA.bat overrides the 1.5; lower = less brown haze indoors)
+    # local: 70 % of each pixel's light from the slow mean (whole picture pulsed with many people on screen)
+    VICTORY_AMBIENT_STEADY = $(if ($env:VN_STEADY) { $env:VN_STEADY } else { '0.7' })
     VICTORY_AMBIENT_AIR = $(if ($env:VN_AIR) { $env:VN_AIR } else { '1.5' }); VICTORY_AMBIENT_MOST = '2'
     # - Black blobs: a NaN a shader writes is made 0 before blur and the temporal upscaler spread it (emit/lower.rs).
     VICTORY_NAN_SCRUB = '1'
@@ -56,6 +58,8 @@ $settings = @{
     VICTORY_CARD_BUFFERS_MIN_MB = '1'; VICTORY_CARD_BUFFERS_MB = '1536'
     # local: copies down to 64 KiB too (shadow.rs card_min): about +10 % on an RTX 2070 SUPER / Ryzen 5 5500X3D
     VICTORY_CARD_BUFFERS_MIN_KB = '64'
+    # local: renderer ports 1, 2 and 6 from avatarmanz/VIctory-7900XTX (list calls 9.4 -> 6.8 us each here)
+    VICTORY_PORT_CONSTANTS = '1'; VICTORY_PORT_DESCRIPTORS = '1'; VICTORY_PORT_GUARD = '1'
     # local (after Neptune): guarded textures hashed every 32nd frame, not 8th: prep 47 -> 43 ms
     VICTORY_TEXTURE_HASH_EVERY = '32'
     # Series S presents the interface as a second plane: laid over the game (compose.rs), else black before gameplay.

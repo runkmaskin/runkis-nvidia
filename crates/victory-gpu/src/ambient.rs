@@ -124,6 +124,18 @@ fn most() -> f32 {
     })
 }
 
+/// LOCAL: how much of each pixel's light is the slow mean rather than this
+/// frame's estimate (`VICTORY_AMBIENT_STEADY=<0..1>`, 0.2 when unset). With
+/// many people moving on screen this frame's estimate jumps, and the whole
+/// picture pulsed yellow, dark and bright; more of the mean steadies it.
+fn steady() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_STEADY").unwrap_or_default();
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && (0.0..=1.0).contains(v)).unwrap_or(0.2)
+    })
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -149,7 +161,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; float steady;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -334,7 +346,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float3 all = float3(sr.w, sg.w, sb.w) / sum;
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
-    found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    found = lerp(found, cells[CELLS].rgb, steady) * level * open;
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
