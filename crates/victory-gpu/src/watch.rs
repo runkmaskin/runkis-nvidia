@@ -2624,6 +2624,8 @@ pub(crate) fn install() {
             if opened != 0 {
                 g.opened(block);
                 drop(g);
+                // Renderer port #2's fallback says who wrote a block of the heap.
+                crate::port_descriptors::faulted(at, r.ExceptionAddress as usize);
                 #[cfg(feature = "diagnostics")]
                 {
                     crate::copystat::add(crate::copystat::C::GuardFaults, 1);
