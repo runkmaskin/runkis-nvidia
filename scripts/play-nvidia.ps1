@@ -79,6 +79,9 @@ if (-not $RayTracing -and (Test-Path $rtList)) {
     # local: the BVH skinning passes only feed the ray-tracing structures, which are never built here (VN_SKIP_BVH=1)
     $bvhList = Join-Path $PSScriptRoot 'skip_bvh.txt'
     if ($env:VN_SKIP_BVH -eq '1' -and (Test-Path $bvhList)) { $settings.VICTORY_SKIP_PIPELINES += ',' + (Get-Content $bvhList -Raw).Trim() }
+    # local, optional: the strand hair's physics left out (VN_SKIP_HAIRSIM=1): hair does not sway, saves GPU time
+    $hairList = Join-Path $PSScriptRoot 'skip_hairsim.txt'
+    if ($env:VN_SKIP_HAIRSIM -eq '1' -and (Test-Path $hairList)) { $settings.VICTORY_SKIP_PIPELINES += ',' + (Get-Content $hairList -Raw).Trim() }
 }
 if ($Quality) {
     # Stretched/jumping bodies: relay stage 1 and no card steps (avatarmanz/VIctory-7900XTX issue 13,
