@@ -60,6 +60,8 @@ $settings = @{
     VICTORY_CARD_BUFFERS_MIN_KB = '64'
     # local: renderer ports 1, 2 and 6 from avatarmanz/VIctory-7900XTX (list calls 9.4 -> 6.8 us each here)
     VICTORY_PORT_CONSTANTS = '1'; VICTORY_PORT_DESCRIPTORS = '1'; VICTORY_PORT_GUARD = '1'
+    # local: renderer port 5, constant buffers read in place by the translated shaders (prep 9.4 -> 7.7 ms per 1,000 draws here)
+    VICTORY_PORT_CBV = '1'
     # local (after Neptune): guarded textures hashed every 32nd frame, not 8th: prep 47 -> 43 ms
     VICTORY_TEXTURE_HASH_EVERY = '32'
     # Series S presents the interface as a second plane: laid over the game (compose.rs), else black before gameplay.
