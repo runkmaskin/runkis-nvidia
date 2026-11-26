@@ -76,6 +76,9 @@ $settings = @{
 $rtList = Join-Path $PSScriptRoot 'rt_off_hashes.txt'
 if (-not $RayTracing -and (Test-Path $rtList)) {
     $settings.VICTORY_SKIP_PIPELINES = (Get-Content $rtList -Raw).Trim()
+    # local: the BVH skinning passes only feed the ray-tracing structures, which are never built here (VN_SKIP_BVH=1)
+    $bvhList = Join-Path $PSScriptRoot 'skip_bvh.txt'
+    if ($env:VN_SKIP_BVH -eq '1' -and (Test-Path $bvhList)) { $settings.VICTORY_SKIP_PIPELINES += ',' + (Get-Content $bvhList -Raw).Trim() }
 }
 if ($Quality) {
     # Stretched/jumping bodies: relay stage 1 and no card steps (avatarmanz/VIctory-7900XTX issue 13,

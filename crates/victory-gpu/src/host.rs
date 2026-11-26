@@ -8820,6 +8820,36 @@ struct Presenter {
 
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
+/// LOCAL: `VICTORY_FRAME_LOG=<file>`: the time between presents, one line a frame
+/// (milliseconds, then the draws of the frame), for frame pacing: drops and stalls the
+/// five-second lines average away.
+fn frame_log() {
+    use std::io::Write;
+    struct Log {
+        start: std::time::Instant,
+        last: std::time::Instant,
+        drawn: u64,
+        out: std::io::BufWriter<std::fs::File>,
+        n: u32,
+    }
+    static LOG: Mutex<Option<Option<Log>>> = Mutex::new(None);
+    let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
+    let log = log.get_or_insert_with(|| {
+        let path = std::env::var_os("VICTORY_FRAME_LOG")?;
+        let file = std::fs::File::create(path).ok()?;
+        Some(Log { start: std::time::Instant::now(), last: std::time::Instant::now(), drawn: crate::draw::drawn(), out: std::io::BufWriter::new(file), n: 0 })
+    });
+    let Some(log) = log else { return };
+    let now = std::time::Instant::now();
+    let drawn = crate::draw::drawn();
+    let _ = writeln!(log.out, "{:.3} {:.2} {}", (now - log.start).as_secs_f64(), (now - log.last).as_secs_f64() * 1000.0, drawn - log.drawn);
+    (log.last, log.drawn) = (now, drawn);
+    log.n += 1;
+    if log.n % 64 == 0 {
+        let _ = log.out.flush();
+    }
+}
+
 struct Meter {
     since: std::time::Instant,
     frames: u32,
@@ -8858,6 +8888,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        frame_log();
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
