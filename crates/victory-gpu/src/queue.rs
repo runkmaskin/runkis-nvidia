@@ -862,6 +862,9 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(not(windows))]
     let _ = this;
+    // For the frame log: how long the title's thread is in here.
+    #[cfg(windows)]
+    let began = std::time::Instant::now();
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     let called = crate::timeline::span("the title's Present");
@@ -955,6 +958,7 @@ extern "system" fn present(
         let over = second_plane(planes, plane_parameters, resource as This)
             .map(|(copy, state)| (copy, if crate::list::thin::wanted() { u32::MAX } else { state }));
         behind::present(this, texture.map(|(_, copy, state)| (copy, state)), Shown { frame, resource, over });
+        crate::frame::present_call_took(began.elapsed().as_micros() as u64);
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();
@@ -981,6 +985,8 @@ extern "system" fn present(
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
+    #[cfg(windows)]
+    crate::frame::present_call_took(began.elapsed().as_micros() as u64);
     called.end();
     #[cfg(all(windows, feature = "diagnostics"))]
     frame_ends();

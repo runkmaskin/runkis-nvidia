@@ -76,7 +76,9 @@ Pitfalls:
 - **Caches:** shaders and pipelines are cached in `%LOCALAPPDATA%\victory\cache`; saves and `crashes.log` are in
   `%LOCALAPPDATA%\victory\data\<title id>\`.
 - **Launcher logs:** `%LOCALAPPDATA%\RunkisLauncher\logs\<time>-play.log` (stderr and stdout of the run), plus
-  `*.frames.txt`, one line per presented frame: seconds, ms since the last frame, draws.
+  `*.frames.txt`, one line per presented frame: seconds, ms since the last frame, draws; then ms in the title's
+  present calls, ms in frame waits, ms sending the back-buffer copy, ms in DXGI Present, ms all threads waited for
+  pipelines, and compiles (see `docs/frame-pacing.md` for how to read hitch lines).
 - **Key log lines,** every 5 s:
   - `{fps} fps, {ms} ms/frame ({cpu} preparing: copies … textures …; {gpu} on the GPU; {back} copying back …)`
   - `memory by subsystem: private=… list_allocators=… windows=… gpu_used=…` (MB, each with `_peak`)

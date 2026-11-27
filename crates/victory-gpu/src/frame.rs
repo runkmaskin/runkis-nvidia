@@ -108,15 +108,57 @@ fn next_tick(kind: u32) -> (u64, Duration) {
         interval: SIXTIETH,
         first: 0,
     });
-    let elapsed = c.start.elapsed().as_nanos();
-    let interval = c.interval.as_nanos().max(1);
-    let tick =
-        (c.first + (elapsed / interval + 1) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
-    let at = u128::from(tick - c.first) * interval;
-    (
-        tick,
-        Duration::from_nanos(at.saturating_sub(elapsed) as u64),
-    )
+    tick_after(c.start.elapsed().as_nanos(), c.interval.as_nanos(), c.first, last(kind).load(Ordering::Relaxed))
+}
+
+/// [`next_tick`] on a clock read already: `elapsed` nanoseconds since the
+/// clock's start, ticks of `interval` nanoseconds, tick `first` at the
+/// start, `last` the tick the last wait for the kind ended on.
+fn tick_after(elapsed: u128, interval: u128, first: u64, last: u64) -> (u64, Duration) {
+    let interval = interval.max(1);
+    let tick = (first + (elapsed / interval + 1) as u64).max(last + 1);
+    let at = u128::from(tick - first) * interval;
+    (tick, Duration::from_nanos(at.saturating_sub(elapsed) as u64))
+}
+
+/// Where a blocking wait ends, from [`next_tick`]'s `tick` and `wait`: a
+/// tick has passed since the wait for the kind that ended on `last` (the
+/// frame took longer than a tick), so it ends now, on that tick, instead of
+/// sleeping on to the next one. `late_sleeps` (`VICTORY_LATE_WAITS=1`)
+/// sleeps on, as before; a time-out shorter than the wait is a poll and
+/// answers as before.
+fn passed_tick(tick: u64, wait: Duration, last: u64, limit: Duration, late_sleeps: bool) -> (u64, Duration) {
+    if !late_sleeps && limit >= wait && tick > last + 1 {
+        (tick - 1, Duration::ZERO)
+    } else {
+        (tick, wait)
+    }
+}
+
+/// The frame interval the title set (a sixtieth of a second until it sets
+/// one).
+#[cfg(windows)]
+pub(crate) fn interval() -> Duration {
+    clock().as_ref().map_or(SIXTIETH, |c| c.interval)
+}
+
+/// Microseconds slept in the title's frame waits since the start, and spent
+/// in its present calls (`crate::queue`): for the frame log, which counts
+/// them per presented frame.
+static PACED_US: AtomicU64 = AtomicU64::new(0);
+#[cfg_attr(not(windows), allow(dead_code))]
+static PRESENT_CALLS_US: AtomicU64 = AtomicU64::new(0);
+
+/// [`PACED_US`] and [`PRESENT_CALLS_US`], as they are now.
+#[cfg(windows)]
+pub(crate) fn title_waits_us() -> (u64, u64) {
+    (PACED_US.load(Ordering::Relaxed), PRESENT_CALLS_US.load(Ordering::Relaxed))
+}
+
+/// The title's present call took `us` microseconds.
+#[cfg(windows)]
+pub(crate) fn present_call_took(us: u64) {
+    PRESENT_CALLS_US.fetch_add(us, Ordering::Relaxed);
 }
 
 /// Device method: blocks until the next tick (or the time-out); an origin
@@ -132,7 +174,7 @@ pub(crate) extern "system" fn wait(
     token: *mut u64,
 ) -> HRESULT {
     let origin = kind == ORIGIN;
-    let (mut tick, mut wait) = next_tick(kind);
+    let (tick, wait) = next_tick(kind);
     let limit = Duration::from_millis(u64::from(timeout_ms));
     // A blocking wait for an event that has happened since the last wait
     // for it ended (a frame took longer than a tick) ends at once, on the
@@ -141,13 +183,8 @@ pub(crate) extern "system" fn wait(
     // time-out shorter than a tick) answer as before.
     // `VICTORY_LATE_WAITS=1` sleeps to the next tick, as before.
     static SLEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*SLEEP.get_or_init(|| std::env::var_os("VICTORY_LATE_WAITS").is_some_and(|v| v == "1"))
-        && limit >= wait
-        && tick > last(kind).load(Ordering::Relaxed) + 1
-    {
-        tick -= 1;
-        wait = Duration::ZERO;
-    }
+    let late_sleeps = *SLEEP.get_or_init(|| std::env::var_os("VICTORY_LATE_WAITS").is_some_and(|v| v == "1"));
+    let (tick, wait) = passed_tick(tick, wait, last(kind).load(Ordering::Relaxed), limit, late_sleeps);
     let _called = crate::timeline::span("the title's frame wait");
     let hr = if wait > limit {
         std::thread::sleep(limit);
@@ -157,6 +194,7 @@ pub(crate) extern "system" fn wait(
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };
+    PACED_US.fetch_add(wait.min(limit).as_micros() as u64, Ordering::Relaxed);
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         use crate::copystat::{C, add};
@@ -204,6 +242,77 @@ pub(crate) extern "system" fn statistics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A title's loop on a fake clock: frames of `work` milliseconds, each
+    /// ended by a blocking flip wait. The milliseconds each wait slept and
+    /// the time each frame ended (in ms since the clock's start).
+    fn flips(work: &[f64], late_sleeps: bool) -> Vec<(f64, f64)> {
+        const INTERVAL: u128 = 16_666_667;
+        let (mut now, mut last) = (0u128, 0u64);
+        work.iter()
+            .map(|&ms| {
+                now += (ms * 1e6) as u128;
+                let (tick, wait) = tick_after(now, INTERVAL, 0, last);
+                let (tick, wait) = passed_tick(tick, wait, last, Duration::MAX, late_sleeps);
+                now += wait.as_nanos();
+                last = last.max(tick);
+                // A wait never ends before its tick: the title's rate is kept.
+                assert!(now + 1 >= u128::from(tick) * INTERVAL, "ended before tick {tick}");
+                (wait.as_secs_f64() * 1e3, now as f64 / 1e6)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_early_frame_sleeps_to_its_tick_and_a_late_one_not_at_all() {
+        // 10 ms of work: each frame waits out the rest of its sixtieth.
+        let early = flips(&[10.0; 6], false);
+        for (slept, _) in &early {
+            assert!((slept - 6.667).abs() < 0.01, "{early:?}");
+        }
+        // 55 ms of work (the title at 18 fps): no wait sleeps. Sleeping on to
+        // the next tick would cost up to a sixtieth of every frame on top.
+        let late = flips(&[55.0; 20], false);
+        assert!(late.iter().all(|&(slept, _)| slept == 0.0), "{late:?}");
+        assert!((late[19].1 - 20.0 * 55.0).abs() < 1e-6);
+        // The old way (VICTORY_LATE_WAITS=1) slept on to the next tick.
+        let old = flips(&[20.0; 4], true);
+        assert!(old.iter().all(|&(slept, _)| slept > 13.0), "{old:?}");
+        let new = flips(&[20.0; 4], false);
+        assert!(new.iter().all(|&(slept, _)| slept < 13.0), "{new:?}");
+    }
+
+    #[test]
+    fn a_hitch_is_not_made_up_with_a_burst() {
+        // The world's first frame takes 4 s, then frames of 5 ms follow:
+        // only the first after it ends at once; the others are paced a tick
+        // apart, never several frames at once to catch up. (The hitch does
+        // not end on a tick: one ending a hair before one lets the next
+        // frame take that tick too, which is right but not this test.)
+        let mut work = vec![5.0, 4003.0];
+        work.extend([5.0; 10]);
+        let f = flips(&work, false);
+        assert_eq!(f[1].0, 0.0);
+        for w in f[2..].windows(2) {
+            let gap = w[1].1 - w[0].1;
+            assert!((gap - 16.667).abs() < 0.01, "{f:?}");
+        }
+        // A frame just over a tick ends on the tick that passed: lateness
+        // does not pile up and later frames do not end early to repay it.
+        let f = flips(&[20.0, 10.0, 10.0, 10.0], false);
+        assert_eq!(f[0].0, 0.0);
+        assert!(f[1..].iter().all(|&(slept, _)| slept > 0.0), "{f:?}");
+    }
+
+    #[test]
+    fn a_poll_answers_as_before() {
+        // A time-out shorter than the time to the next tick: not ended early.
+        let (tick, wait) = passed_tick(9, Duration::from_millis(8), 5, Duration::ZERO, false);
+        assert_eq!((tick, wait), (9, Duration::from_millis(8)));
+        // The tick after the last one: nothing passed, it is slept to.
+        let (tick, wait) = passed_tick(6, Duration::from_millis(8), 5, Duration::MAX, false);
+        assert_eq!((tick, wait), (6, Duration::from_millis(8)));
+    }
 
     #[test]
     fn waits_end_on_ticks_and_count_frames() {

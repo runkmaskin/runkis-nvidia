@@ -3988,6 +3988,7 @@ mod card_steps;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
+mod pacing;
 mod place;
 pub(crate) mod rec;
 mod send;
@@ -9317,6 +9318,8 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    /// With `VICTORY_PRESENT_LATENCY`: the swap chain's frame-latency object.
+    latency: Option<pacing::Latency>,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
@@ -9325,13 +9328,16 @@ struct Presenter {
 /// every few seconds.
 /// LOCAL: `VICTORY_FRAME_LOG=<file>`: the time between presents, one line a frame
 /// (milliseconds, then the draws of the frame), for frame pacing: drops and stalls the
-/// five-second lines average away.
-fn frame_log() {
+/// five-second lines average away. After those three columns, what the
+/// frame waited for (`pacing::line`): `presented` holds the presenter's
+/// microseconds in the copy's submission and in the swap chain.
+fn frame_log(presented: [u64; 2]) {
     use std::io::Write;
     struct Log {
         start: std::time::Instant,
         last: std::time::Instant,
         drawn: u64,
+        counters: [u64; 4],
         out: std::io::BufWriter<std::fs::File>,
         flushed: std::time::Instant,
     }
@@ -9341,13 +9347,23 @@ fn frame_log() {
         let path = std::env::var_os("VICTORY_FRAME_LOG")?;
         let file = std::fs::File::create(path).ok()?;
         let now = std::time::Instant::now();
-        Some(Log { start: now, last: now, drawn: crate::draw::drawn(), out: std::io::BufWriter::new(file), flushed: now })
+        Some(Log {
+            start: now,
+            last: now,
+            drawn: crate::draw::drawn(),
+            counters: pacing::counters(),
+            out: std::io::BufWriter::new(file),
+            flushed: now,
+        })
     });
     let Some(log) = log else { return };
     let now = std::time::Instant::now();
     let drawn = crate::draw::drawn();
-    let _ = writeln!(log.out, "{:.3} {:.2} {}", (now - log.start).as_secs_f64(), (now - log.last).as_secs_f64() * 1000.0, drawn - log.drawn);
-    (log.last, log.drawn) = (now, drawn);
+    let counters = pacing::counters();
+    let waits = pacing::waits(log.counters, counters, presented[0], presented[1]);
+    let text = pacing::line((now - log.start).as_secs_f64(), (now - log.last).as_secs_f64() * 1000.0, drawn - log.drawn, &waits);
+    let _ = writeln!(log.out, "{text}");
+    (log.last, log.drawn, log.counters) = (now, drawn, counters);
     // By time, not by count: at 18 fps every 64th frame was 3.5 s behind, too
     // late for anyone reading the file live (the launcher's frame-time graph).
     // Four small writes a second cost nothing next to a frame.
@@ -9437,14 +9453,14 @@ impl Meter {
         self.since.elapsed() >= std::time::Duration::from_secs(1)
     }
 
-    /// Counts a presented frame.
-    fn frame(&mut self, hwnd: HWND) {
+    /// Counts a presented frame; `presented` as [`frame_log`] takes it.
+    fn frame(&mut self, hwnd: HWND, presented: [u64; 2]) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
-        frame_log();
+        frame_log(presented);
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -9763,7 +9779,7 @@ impl Host {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(pacing::buffers(BUFFERS), width, height, format, pacing::flags())
             };
             match resized {
                 Ok(()) => {
@@ -9786,6 +9802,9 @@ impl Host {
         let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
+            // With `VICTORY_PRESENT_LATENCY`: the display's queue is waited
+            // for here, and only as long as the frame is early.
+            let latency_us = p.latency.as_mut().map_or(0, |l| l.wait(crate::frame::interval()));
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
                 return None;
@@ -9850,6 +9869,7 @@ impl Host {
                 ),
             ]);
             copy.close();
+            let sending = std::time::Instant::now();
             let flown = match slot {
                 Some(i) => {
                     let flown = self.execute_own(copy);
@@ -9861,6 +9881,7 @@ impl Host {
                     0
                 }
             };
+            let submit_us = sending.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
             if let Some(taken) = watched {
                 crate::popwatch::sent(taken, flown, frame);
@@ -9874,11 +9895,13 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            let swapping = std::time::Instant::now();
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let swap_us = latency_us + swapping.elapsed().as_micros() as u64;
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
-            p.meter.frame(p.hwnd);
+            p.meter.frame(p.hwnd, [submit_us, swap_us]);
             showing.end();
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -9910,13 +9933,15 @@ impl Host {
                     Quality: 0,
                 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: BUFFERS,
+                BufferCount: pacing::buffers(BUFFERS),
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: pacing::flags().0 as u32,
                 ..Default::default()
             };
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            let latency = pacing::latency().and_then(|frames| pacing::Latency::new(&swap_chain, frames));
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
@@ -9930,6 +9955,7 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                latency,
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })

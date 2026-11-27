@@ -19,12 +19,13 @@ public sealed class FrameStats
 
     public FrameStats(double keepSeconds = 60) => this.keepSeconds = keepSeconds;
 
-    /// <summary>Parses one frame-log line; false for anything else.</summary>
+    /// <summary>Parses one frame-log line; false for anything else. The first three columns are read; the layer may
+    /// write more after them (docs/frame-pacing.md: the waits of the frame), which are left to other readers.</summary>
     public static bool TryParse(string line, out FrameSample sample)
     {
         sample = default;
         var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (parts.Length != 3) return false;
+        if (parts.Length < 3) return false;
         if (!double.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var at)) return false;
         if (!double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var ms)) return false;
         if (!long.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out var draws)) return false;

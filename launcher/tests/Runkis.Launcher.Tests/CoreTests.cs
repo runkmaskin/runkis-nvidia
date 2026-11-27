@@ -356,6 +356,21 @@ public class MonitorTests
         Assert.Equal(6012, f.Draws);
         Assert.False(FrameStats.TryParse("garbage", out _));
         Assert.False(FrameStats.TryParse("1,5 2,5 3", out _));
+        Assert.False(FrameStats.TryParse("12.345 55.20", out _));
+    }
+
+    [Fact]
+    public void Frame_log_lines_with_the_wait_columns_parse_the_same()
+    {
+        // The three columns, then the waits the layer may add (docs/frame-pacing.md).
+        Assert.True(FrameStats.TryParse("12.345 55.20 6012 31.40 0.00 0.62 0.05 0.00 0", out var f));
+        Assert.Equal(12.345, f.At, 3);
+        Assert.Equal(55.2, f.Ms, 3);
+        Assert.Equal(6012, f.Draws);
+        Assert.True(FrameStats.TryParse("12.345 55.20 6012", out var g));
+        Assert.Equal(f, g);
+        // The first three still have to be numbers.
+        Assert.False(FrameStats.TryParse("12.345 x 6012 1.0", out _));
     }
 
     [Fact]

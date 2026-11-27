@@ -480,6 +480,14 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// For the frame log (`VICTORY_FRAME_LOG`), since the start: microseconds
+/// threads waited for pipelines to be made, and host pipelines the driver
+/// compiled (not those loaded from the library).
+#[cfg(windows)]
+pub(crate) fn frame_counts() -> (u64, u64) {
+    (make::WAITED_US.load(std::sync::atomic::Ordering::Relaxed), library::MADE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

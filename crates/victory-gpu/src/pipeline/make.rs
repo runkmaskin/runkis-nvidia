@@ -404,12 +404,17 @@ fn wait(p: &Pending, frame: u64) {
             }
         }
     }
+    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
         started.elapsed().as_micros() as u64,
     );
 }
+
+/// Microseconds waited in [`wait`] since the start, all threads (the frame
+/// log's pipeline column: it counts only, nothing waits for it).
+pub(super) static WAITED_US: AtomicU64 = AtomicU64::new(0);
 
 const NOT_QUEUED: u8 = 0;
 const EARLY: u8 = 1;
