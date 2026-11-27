@@ -89,6 +89,14 @@ Options for `scripts\play-nvidia.ps1`:
 
 Needs: Windows 10/11 x64, an NVIDIA RTX card, 32 GB of RAM (the game uses about 20 GB), an SSD.
 
+**Getting 30 fps on screen (RTX 20):** real fps is CPU-bound at about 17–19, so use frame generation outside
+the game: Lossless Scaling with LSFG 3, adaptive mode, a 30 fps target, flow scale 50 %, WGC capture, max frame
+latency 1. Input still feels like the real rate. For a sharper picture at no fps cost, turn on NVIDIA Image
+Sharpening for `victory.exe` (0.5 sharpen, 0.17 film grain).
+
+**Bodies/textures flying through walls:** `-Quality` (`QUALITY=1` in the start script) fixes them by turning off
+`RELAY=2` and `CARD_STEPS=2`, at about −29 % fps.
+
 **Tips:** close the browser and video players while playing (a YouTube tab costs about 0.8 fps here). Keep the
 NVIDIA shader cache size at "Unlimited" or large. Frame generation (DLSS FG, Smooth Motion) needs an RTX 40/50; on
 RTX 20, an external tool such as Lossless Scaling can add generated frames.
