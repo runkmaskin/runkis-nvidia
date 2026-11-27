@@ -628,6 +628,12 @@ impl Taken {
         self.steps.contains(&(std::ptr::from_ref(list) as usize, i))
     }
 
+    /// The destinations of its copies: the host copy (by address), from, to
+    /// (for [`super::cross_writes`]).
+    pub(super) fn copied_spans(&self) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+        self.copied.iter().map(|(shadow, from, to)| (Arc::as_ptr(shadow) as usize, *from, *to))
+    }
+
     fn copied(&self) -> impl Iterator<Item = Writer> {
         self.copied.iter().map(|(shadow, from, to)| Writer {
             shadow: Some(shadow.clone()),

@@ -2861,6 +2861,105 @@ mod relay_tests {
     }
 }
 
+#[cfg(test)]
+mod cross_tests {
+    use super::cross_hit;
+
+    /// Host copies by address: the skinning's (the heap), a buffer inside it,
+    /// another one; 0 is no copy (a read-back) or, for a read, title memory.
+    const HEAP: usize = 0x10;
+    const INNER: usize = 0x20;
+    const OTHER: usize = 0x30;
+    const ALL: fn(usize, usize) -> bool = |_, _| true;
+
+    /// The wait is due exactly when a read follows a write of another copy to
+    /// the same bytes: a refresh of the inner buffer under the heap's write.
+    #[test]
+    fn a_refresh_through_another_copy_meets_the_write() {
+        let skinning = [(HEAP, 0x1000, 0x9000)];
+        assert_eq!(cross_hit(&skinning, &[(INNER, 0x1800, 0x1900)], ALL), Some((0x1800, 0x1900)));
+        // Partly under it: only the bytes both hold.
+        assert_eq!(cross_hit(&skinning, &[(INNER, 0x8f00, 0xa000)], ALL), Some((0x8f00, 0x9000)));
+        // Otherwise nothing: the same copy (its own flights are ordered on
+        // the card and by `stale_under_flights`), other bytes, a range that
+        // only touches.
+        assert_eq!(cross_hit(&skinning, &[(HEAP, 0x1800, 0x1900)], ALL), None);
+        assert_eq!(cross_hit(&skinning, &[(INNER, 0x9000, 0xa000)], ALL), None);
+        assert_eq!(cross_hit(&skinning, &[(INNER, 0x0, 0x1000)], ALL), None);
+        assert_eq!(cross_hit(&[], &[(INNER, 0x0, 0x1000)], ALL), None);
+        assert_eq!(cross_hit(&skinning, &[], ALL), None);
+        // A read-back (no copy) reaches every copy's refresh late; a step of
+        // ours that reads title memory itself meets every write, its own
+        // copy's too.
+        assert!(cross_hit(&[(0, 0x100, 0x200)], &[(HEAP, 0x0, 0x1000)], ALL).is_some());
+        assert!(cross_hit(&skinning, &[(0, 0x2000, 0x2004)], ALL).is_some());
+        // `VICTORY_CROSS_WAIT=2`: bytes no shader landed in lately do not count.
+        assert_eq!(cross_hit(&skinning, &[(INNER, 0x1800, 0x1900)], |_, _| false), None);
+        let lately = |from: usize, _to: usize| from >= 0x4000;
+        assert_eq!(cross_hit(&skinning, &[(INNER, 0x1800, 0x1900), (OTHER, 0x4000, 0x4100)], lately), Some((0x4000, 0x4100)));
+    }
+
+    /// Flights land in order, and the wait ends when no flight left in the air
+    /// writes what is read: after the last one that does, not before, and
+    /// not later.
+    #[test]
+    fn the_wait_ends_with_the_last_flight_that_writes_it() {
+        let flights: [&[(usize, usize, usize)]; 5] = [
+            &[(HEAP, 0x1000, 0x2000)],
+            &[(OTHER, 0x8000, 0x9000)],
+            &[(HEAP, 0x0, 0x100_0000), (INNER, 0x1000, 0x1100)],
+            &[(INNER, 0x1000, 0x2000)],
+            &[(OTHER, 0x1_0000, 0x2_0000)],
+        ];
+        let reads = [(INNER, 0x1800, 0x1810)];
+        let in_air = |landed: usize| -> Vec<(usize, usize, usize)> { flights[landed..].iter().flat_map(|f| f.iter().copied()).collect() };
+        let first_free = (0..=flights.len()).find(|&k| cross_hit(&in_air(k), &reads, |_, _| true).is_none());
+        // Flight 2 writes it through the heap; flight 3 through the inner
+        // copy itself, which does not count.
+        assert_eq!(first_free, Some(3));
+        // Read nothing the flights write: no wait at all.
+        assert!(cross_hit(&in_air(0), &[(INNER, 0x200_0000, 0x200_1000)], |_, _| true).is_none());
+    }
+
+    /// Against the plain rule, pair by pair, on fixed-seed flights.
+    #[test]
+    fn cross_hit_is_the_plain_rule() {
+        let mut seed = 0x9e37_79b9_u64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for round in 0..2000 {
+            let copies = [0, HEAP, INNER, OTHER];
+            let writes: Vec<(usize, usize, usize)> = (0..next(8))
+                .map(|_| {
+                    let a = next(4096);
+                    (copies[next(4)], a, a + next(300))
+                })
+                .collect();
+            let reads: Vec<(usize, usize, usize)> = (0..next(6))
+                .map(|_| {
+                    let a = next(4096);
+                    (copies[next(4)], a, a + 1 + next(200))
+                })
+                .collect();
+            // "Landed lately" as a property of addresses: a range counts if
+            // it holds one, however the writes are joined.
+            let odd = |from: usize, to: usize| from.div_ceil(64) * 64 < to;
+            let plain = reads.iter().any(|&(rc, ra, rb)| {
+                writes.iter().any(|&(wc, wa, wb)| {
+                    let (a, b) = (ra.max(wa), rb.min(wb));
+                    a < b && (rc == 0 || wc != rc) && (round % 2 == 0 || odd(a, b))
+                })
+            });
+            let got = if round % 2 == 0 { cross_hit(&writes, &reads, |_, _| true) } else { cross_hit(&writes, &reads, odd) };
+            assert_eq!(got.is_some(), plain, "round {round}: {writes:?} {reads:?}");
+        }
+    }
+}
+
 /// The most host lists in the air before the flights are settled
 /// (`VICTORY_LATE_WAIT_LISTS`, 256; `=128` is the value before: with the
 /// relay it stopped the submitting thread twice a frame for 92-103 ms in
@@ -2959,6 +3058,9 @@ struct Line {
     in_hand: Vec<(usize, crate::queue::Written, usize)>,
     /// With [`card_steps`]: what the flights being landed write.
     landing: Vec<card_steps::Writer>,
+    /// With [`cross_wait`]: what the flights being landed write, by the host
+    /// copy it goes through ([`cross_writes`]).
+    cross_landing: Vec<(usize, usize, usize)>,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and host lists nothing records
@@ -2975,6 +3077,7 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     landed: Vec::new(),
     in_hand: Vec::new(),
     landing: Vec::new(),
+    cross_landing: Vec::new(),
 });
 /// Told when a flight joins [`LINE`] or it is poked.
 static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
@@ -3335,6 +3438,163 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
     }
     spans.retain(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
     spans
+}
+
+/// Whether a submission waits for the flights that write title memory it
+/// reads through another host copy than theirs (`VICTORY_CROSS_WAIT`; off by
+/// default): `1` for every such read, `2` only where shaders' writes landed
+/// in the last [`CROSS_LATELY`] frames, `count` counts them and waits for
+/// none (the frame line says how often).
+///
+/// Why: a refresh of a host copy takes title memory as it is. Bytes a flight's
+/// shaders write through another host copy reach title memory only when that
+/// flight lands. Nothing else orders the two: [`blocked_by`] looks at copies,
+/// fills and textures, [`stale_under_flights`] at copies that their own
+/// flights write. The skinning passes write through a view of the title's
+/// whole 174 MB heap (see [`card_steps::stage`]); a draw that binds skinned
+/// vertices through a buffer of its own inside that heap refreshes another
+/// host copy of them. Refreshed before the skinning lands, it draws last
+/// frame's vertices, or a mix of two frames while the landing is under way:
+/// stretched and jumping bodies. With the relay's first stage, or without
+/// card steps, the constant-ring fill or copy that follows the skinning each
+/// frame waits for the skinning to land ("title memory read"), which hides
+/// the race; card steps do that fill on the card and the wait goes.
+///
+/// What it does: before the write-watch asking, the submission's refreshes
+/// (and steps of ours that read title memory, [`Step::Host`]) are looked at
+/// against what the flights in the air and being landed write through other
+/// host copies, or with none (read-backs, textures copied back); if one
+/// meets, the submission waits until the flights that write it have landed
+/// (with [`relay`]: until no flight left in the air writes it; without:
+/// everything). Bottom-of-pipe values are left out: waits for memory values
+/// see them ([`late_met`]). Off: nothing of this runs.
+pub(crate) fn cross_wait() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_CROSS_WAIT").ok().as_deref().map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        Some("count") => CROSS_COUNT,
+        _ => 0,
+    })
+}
+
+/// [`cross_wait`]'s `count`.
+const CROSS_COUNT: u8 = 3;
+
+/// With `VICTORY_CROSS_WAIT=2`: a page of title memory counts if shaders'
+/// writes landed in it in this many frames (as [`fill_is_titles`]). A buffer
+/// the skinning writes is landed every frame it is in view; the static meshes
+/// beside it in the heap never are.
+const CROSS_LATELY: u64 = 600;
+
+/// With `VICTORY_CROSS_WAIT=2`: an overlap of more bytes than this counts
+/// whole, without looking at its pages one by one.
+const CROSS_WHOLE: usize = 16 << 20;
+
+/// Since the last frame-rate line, with [`cross_wait`]: submissions that met
+/// such a read, and the microseconds they waited.
+static CROSS_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// What the flights of `items` write in title memory, into `out`: the host
+/// copy it goes through (its address; 0: none, a read-back or a texture's
+/// copy-back), from, to.
+fn cross_writes(items: &[Late], out: &mut Vec<(usize, usize, usize)>) {
+    for item in items {
+        let Late::Run(flight) = item else {
+            continue;
+        };
+        for (shadow, ranges) in &flight.back {
+            let copy = std::sync::Arc::as_ptr(shadow) as usize;
+            out.extend(ranges.iter().map(|&(from, to)| (copy, from, to)));
+        }
+        out.extend(flight.texture_back_ranges.iter().map(|&(from, to)| (0, from, to)));
+        for &i in &flight.order {
+            for &(_, at, [row, rows, pitch]) in &flight.lists[i].host().deferred().backs {
+                out.push((0, at, at + rows.saturating_sub(1) * pitch + row));
+            }
+        }
+        if let Some(own) = &flight.own {
+            out.extend(own.copied_spans());
+        }
+    }
+}
+
+/// The reads of `runs` that a write through another host copy reaches late:
+/// their refreshes (the host copy by address, from, to), and their steps of
+/// ours that read title memory itself (copy 0: every write reaches it late).
+fn cross_reads(runs: &[&HostList]) -> Vec<(usize, usize, usize)> {
+    let mut reads = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                Step::Refresh(shadow, at, len) if *len > 0 => {
+                    reads.push((std::sync::Arc::as_ptr(shadow) as usize, *at, *at + *len));
+                }
+                &Step::Host(_, (from, to)) if from < to => reads.push((0, from, to)),
+                _ => {}
+            }
+        }
+    }
+    reads
+}
+
+/// The first of `reads` (copy, from, to) that one of `writes` (copy, from,
+/// to) reaches late: a write through another host copy than the read's, or
+/// through none, or any write for a read of title memory itself (copy 0).
+/// Returns the bytes both hold, if `counts` says they count.
+fn cross_hit(
+    writes: &[(usize, usize, usize)],
+    reads: &[(usize, usize, usize)],
+    counts: impl Fn(usize, usize) -> bool,
+) -> Option<(usize, usize)> {
+    if writes.is_empty() || reads.is_empty() {
+        return None;
+    }
+    // Per host copy, its ranges in order and joined.
+    let mut sorted: Vec<(usize, usize, usize)> = writes.iter().copied().filter(|w| w.1 < w.2).collect();
+    sorted.sort_unstable();
+    let mut by_copy: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
+    for (copy, from, to) in sorted {
+        match by_copy.last_mut() {
+            Some((c, ranges)) if *c == copy => match ranges.last_mut() {
+                Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                _ => ranges.push((from, to)),
+            },
+            _ => by_copy.push((copy, vec![(from, to)])),
+        }
+    }
+    for &(copy, from, to) in reads {
+        for (writer, ranges) in &by_copy {
+            if copy != 0 && *writer == copy {
+                continue;
+            }
+            let mut i = ranges.partition_point(|r| r.1 <= from);
+            while let Some(&(a, b)) = ranges.get(i) {
+                if a >= to {
+                    break;
+                }
+                let both = (a.max(from), b.min(to));
+                if counts(both.0, both.1) {
+                    return Some(both);
+                }
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// [`cross_hit`] of `reads` against what the line's flights write, in the
+/// air and being landed; `None` if nothing is.
+fn cross_in_air(line: &Line, reads: &[(usize, usize, usize)]) -> Option<(usize, usize)> {
+    if line.line.is_empty() && line.cross_landing.is_empty() {
+        return None;
+    }
+    let mut writes = line.cross_landing.clone();
+    cross_writes(&line.line, &mut writes);
+    cross_hit(&writes, reads, |from, to| {
+        cross_wait() != 2 || to - from > CROSS_WHOLE || crate::watch::landed_lately(from, to - from, CROSS_LATELY)
+    })
 }
 
 /// How many parts of submissions, and lists, the line's thread gives to the
@@ -3720,6 +3980,11 @@ fn relay_worker() {
                 if card_steps::stage() > 0 {
                     line.landing = card_steps::writers(&items);
                 }
+                if cross_wait() > 0 {
+                    let mut landing = Vec::new();
+                    cross_writes(&items, &mut landing);
+                    line.cross_landing = landing;
+                }
                 break Ok(items);
             }
         };
@@ -3949,6 +4214,21 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    if cross_wait() > 0 {
+        let c: Vec<f64> = CROSS_STATS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "submissions that refresh title memory a flight writes through another host copy, per frame (VICTORY_CROSS_WAIT={}): \
+             {:.2}, {:.1} ms waiting for those flights to land{}",
+            match cross_wait() {
+                CROSS_COUNT => "count",
+                1 => "1",
+                _ => "2",
+            },
+            c[0],
+            c[1] / 1000.0,
+            if cross_wait() == CROSS_COUNT { " (counted only, not waited for)" } else { "" },
+        );
+    }
     crate::port::log(frames);
     crate::watch::port_guard_line(frames);
     crate::port_cbv::log(frames);
@@ -5463,11 +5743,13 @@ impl Host {
                 landed: kept,
                 in_hand,
                 landing,
+                cross_landing,
                 ..
             } = &mut *line;
             kept.extend(landed);
             in_hand.clear();
             landing.clear();
+            cross_landing.clear();
             // What is still in the air, from the flights that are.
             written.clear();
             *lists = 0;
@@ -5957,6 +6239,33 @@ impl Host {
         crate::watch::ask_once(ranges);
     }
 
+    /// [`cross_wait`]: if a refresh of `runs`, or a step of ours that reads
+    /// title memory, reads what a flight writes through another host copy,
+    /// the flights that write it land first. Before the write-watch asking,
+    /// so that the refreshes see what landed.
+    fn cross_settle(&self, submitted: &mut u64, runs: &[&HostList]) {
+        let reads = cross_reads(runs);
+        if reads.is_empty() {
+            return;
+        }
+        let Some((_from, _to)) = cross_in_air(&line(), &reads) else {
+            return;
+        };
+        CROSS_STATS[0].fetch_add(1, Ordering::Relaxed);
+        if cross_wait() == CROSS_COUNT {
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        blame("a refresh through another host copy than a flight's write", &[(_from, _to)], _from, _to - _from);
+        let waiting = std::time::Instant::now();
+        if relay() {
+            relay_wait(WHY_READ, |line| cross_in_air(line, &reads).is_none());
+        } else {
+            self.settle(submitted, WHY_READ);
+        }
+        CROSS_STATS[1].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+
     /// [`Host::execute`], or with `late` the first half of
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
@@ -6003,6 +6312,9 @@ impl Host {
             } else {
                 self.settle(&mut submitted, why);
             }
+        }
+        if late && cross_wait() > 0 {
+            self.cross_settle(&mut submitted, runs);
         }
         #[cfg(feature = "diagnostics")]
         ahead.part(13);
@@ -9537,6 +9849,13 @@ impl Meter {
                      {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there), \
                      {filled:.1} first fillings from the pages there (VICTORY_TEXTURE_FILL=0: left empty), {short:.1} of them \
                      with less than was mapped (looked at again)"
+                );
+            }
+            let rechecked = crate::texture::RECHECKED.swap(0, Ordering::Relaxed) as f64 / frames;
+            if rechecked > 0.0 {
+                tracing::info!(
+                    "texture reads through the kernel that met a change of mapping, read again at the next refresh, per frame \
+                     (VICTORY_TEXTURE_RECHECK=1): {rechecked:.1}"
                 );
             }
         }

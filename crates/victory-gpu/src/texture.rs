@@ -407,6 +407,54 @@ fn fill_unlocked() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FILL").is_none_or(|v| v != "0"))
 }
 
+/// Whether a refresh that did not wait ([`no_wait`]) and read through the
+/// kernel while the runtime may have been changing a mapping is read again at
+/// the texture's next refresh (`VICTORY_TEXTURE_RECHECK=1`; off by default).
+///
+/// Why: such a read is called for exactly when the runtime holds the lock,
+/// that is while it changes a mapping. It unmaps whole views and maps what
+/// stays page by page (`crate::watch::title_memory_reading`), so a read that
+/// finds every page there may still hold some pages from before the change
+/// and some from after it, or a page shown at the moment before the title's
+/// data reached it. The read is taken for good all the same: its hash is kept
+/// and the write-watch asking it followed is noted, so the next refresh finds
+/// the texture "unwritten" and passes it over until its hash turn
+/// (`VICTORY_TEXTURE_HASH_EVERY`, 32 frames in the tuned set). Blocks of
+/// another texture's bytes in compressed colour read as rainbow noise.
+///
+/// What it does: the change counter is read before and after the read
+/// ([`met_change`]). If a change was under way or happened meanwhile, the
+/// asking is forgotten (as for a read that failed), so the next refresh reads
+/// and hashes the texture again, and a texture with no next refresh of its
+/// own (picked by index) has its slots looked at again. Nothing waits; the
+/// cost is that second read. Off: as before.
+fn recheck() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_RECHECK").is_some_and(|v| v == "1"))
+}
+
+/// Whether a read that began with the runtime's count of mapping changes at
+/// `before` and ended with it at `after` may have met a change: one was under
+/// way when it began (the count is odd then), or one began or ended during it.
+fn met_change(before: u64, after: u64) -> bool {
+    !before.is_multiple_of(2) || after != before
+}
+
+/// [`recheck`] (`on`) after a read through the kernel that began at the
+/// change count `before` and ended at `after`: whether the read is not to be
+/// trusted, and if so the texture's asking is forgotten.
+fn after_unlocked_read(last: &mut Last, on: bool, before: u64, after: u64) -> bool {
+    if !on || !met_change(before, after) {
+        return false;
+    }
+    last.asked = 0;
+    true
+}
+
+/// Since the last frame-rate line, with [`recheck`]: reads through the
+/// kernel that met a change of mapping and are read again.
+pub(crate) static RECHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
 /// through the kernel because title memory was being remapped, and those
 /// left for the next refresh because a page was not there; staging buffers
@@ -1372,6 +1420,7 @@ impl Staging {
     /// pages that are there ([`Staging::fill`]). Returns the bytes read.
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
+        let before = crate::watch::changes();
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
                 return false;
@@ -1385,6 +1434,10 @@ impl Staging {
         });
         if read {
             UNLOCKED[0].fetch_add(1, Relaxed);
+            if after_unlocked_read(last, recheck(), before, crate::watch::changes()) {
+                RECHECKED.fetch_add(1, Relaxed);
+                crate::descriptor::host::read_short(self.memory as u64);
+            }
             size
         } else if last.hash.is_none() && fill_unlocked() {
             self.fill(last, size)
@@ -1406,6 +1459,7 @@ impl Staging {
     fn fill(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let start = self.memory as u64;
+        let before = crate::watch::changes();
         let mut there = 0;
         let got = with_read(size, |read| {
             let mut got = 0;
@@ -1428,6 +1482,10 @@ impl Staging {
         if got < there.max(self.expected.load(Relaxed)) {
             UNLOCKED[3].fetch_add(1, Relaxed);
             last.asked = 0;
+            crate::descriptor::host::read_short(start);
+        } else if after_unlocked_read(last, recheck(), before, crate::watch::changes()) {
+            // All that was mapped, but maybe across a change: again.
+            RECHECKED.fetch_add(1, Relaxed);
             crate::descriptor::host::read_short(start);
         } else {
             crate::descriptor::host::read_all(start);
@@ -1911,6 +1969,30 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod recheck_tests {
+    use super::{Last, after_unlocked_read, met_change};
+
+    /// A read through the kernel is read again exactly when the change count
+    /// says a change of mapping was under way or happened during it, and
+    /// only with the switch; otherwise the texture's asking stays.
+    #[test]
+    fn a_read_across_a_change_is_read_again() {
+        // (before, after, met): at rest throughout; under way at the start;
+        // begun during it; begun and ended during it; ended during it.
+        let cases = [(4, 4, false), (5, 5, true), (4, 5, true), (4, 6, true), (5, 6, true), (0, 0, false)];
+        for (before, after, met) in cases {
+            assert_eq!(met_change(before, after), met, "{before} {after}");
+            for on in [false, true] {
+                let mut last = Last { asked: 77, ..Last::default() };
+                let again = after_unlocked_read(&mut last, on, before, after);
+                assert_eq!(again, on && met, "{before} {after} {on}");
+                assert_eq!(last.asked, if again { 0 } else { 77 });
+            }
+        }
+    }
 }
 
 #[cfg(test)]

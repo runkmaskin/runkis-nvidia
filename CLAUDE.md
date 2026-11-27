@@ -113,5 +113,6 @@ at a time.
    instead of the layer finding changes afterwards (write watch, guards, heap compares). The first step is a census
    of which store instructions write GPU-visible memory, and how often. It builds on renderer port 2's load-time
    patching (`crates/victory-loader`: `descriptor_sites`, `write_sites`). This needs the game and is per game build.
-4. **The submitting thread.** The ranked options are in `docs/submit-thread.md`. The big ones need the game to be
+4. **Bodies and textures through walls, rainbow skin** with the speed set (`-Quality` hides them at about -29 % fps). See `docs/speed-mode-bugs.md`: run `VICTORY_CROSS_WAIT=count` first, then its bisect table; the targeted fixes are `VICTORY_CROSS_WAIT=2` and `VICTORY_TEXTURE_RECHECK=1` (off).
+5. **The submitting thread.** The ranked options are in `docs/submit-thread.md`. The big ones need the game to be
    done safely.
