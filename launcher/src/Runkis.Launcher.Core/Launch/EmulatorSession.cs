@@ -46,6 +46,8 @@ public sealed partial class EmulatorSession : IDisposable
     /// <summary>The process to measure: the first one, or the one the title relaunched itself as.</summary>
     public int? Pid => adoptedPid ?? (process is { HasExited: false } p ? p.Id : null);
     public IReadOnlyCollection<Problem> Problems { get { lock (problems) return problems.Values.ToList(); } }
+    /// <summary>The run was ended because the user asked (Stop): not an error, whatever the exit code.</summary>
+    public bool StoppedByUser => stopAsked;
 
     [GeneratedRegex(@"\x1B\[[0-9;]*[A-Za-z]")]
     private static partial Regex Ansi();

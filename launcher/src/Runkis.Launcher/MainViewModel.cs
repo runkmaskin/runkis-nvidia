@@ -382,8 +382,8 @@ public sealed class MainViewModel : Observable, IDisposable
             case SessionState.Failed: SetState("Could not start", s.ExitText ?? "", "Bad"); break;
             case SessionState.Exited:
                 var ok = s.ExitCode == 0;
-                SetState(ok ? "Finished" : "Ended with an error", s.ExitText ?? "", ok ? "Muted" : "Bad");
-                if (!ok && Problems.Count == 0)
+                SetState(ok ? "Finished" : s.StoppedByUser ? "Stopped" : "Ended with an error", s.ExitText ?? "", ok || s.StoppedByUser ? "Muted" : "Bad");
+                if (!ok && !s.StoppedByUser && Problems.Count == 0)
                     Problems.Add(new Problem("exit", Severity.Error, "The run ended unexpectedly", s.ExitText ?? "", "See the log for the last lines before it ended.", ""));
                 foreach (var t in Tiles) t.Unknown("Not running");
                 WarmPercent = null;
