@@ -539,8 +539,61 @@ impl Physical {
 
 /// The title's pages by number.
 struct Pages {
-    next_page: usize,
+    numbers: Numbers,
     pages: HashMap<usize, Slice>,
+}
+
+/// Page numbers: handed out from `next` up, and given back by
+/// [`XMemFreePhysicalPages`] to be handed out again. The title keeps a
+/// number in 21 bits ([`FRAMES`]), 128 GiB of pages: a long session that
+/// allocates and frees its pages over and over would run past that if
+/// numbers were never used again.
+struct Numbers {
+    next: usize,
+    /// Numbers given back and not handed out since: first and how many,
+    /// neighbours joined, none of them ending at `next`.
+    free: BTreeMap<usize, usize>,
+}
+
+impl Numbers {
+    const fn new(first: usize) -> Numbers {
+        Numbers { next: first, free: BTreeMap::new() }
+    }
+
+    /// `len` consecutive numbers: the first stretch given back that is long
+    /// enough, or new ones.
+    fn take(&mut self, len: usize) -> usize {
+        if let Some((&start, &have)) = self.free.iter().find(|&(_, &have)| have >= len) {
+            self.free.remove(&start);
+            if have > len {
+                self.free.insert(start + len, have - len);
+            }
+            return start;
+        }
+        let first = self.next;
+        self.next += len;
+        first
+    }
+
+    /// Gives `[start, start + len)` back; each number must have been handed
+    /// out and not given back since.
+    fn give(&mut self, mut start: usize, mut len: usize) {
+        if let Some((&before, &n)) = self.free.range(..start).next_back()
+            && before + n == start
+        {
+            self.free.remove(&before);
+            start = before;
+            len += n;
+        }
+        if let Some(n) = self.free.remove(&(start + len)) {
+            len += n;
+        }
+        if start + len == self.next {
+            self.next = start;
+        } else {
+            self.free.insert(start, len);
+        }
+    }
 }
 
 /// Where the title sees its pages: [`Physical::views`] the other way.
@@ -630,7 +683,7 @@ fn physical() -> MutexGuard<'static, Physical> {
 static PAGES: LazyLock<RwLock<Pages>> = LazyLock::new(|| {
     RwLock::new(Pages {
         // Page numbers are opaque to titles; 0 stays unused.
-        next_page: 0x10_0000,
+        numbers: Numbers::new(0x10_0000),
         pages: HashMap::new(),
     })
 });
@@ -699,8 +752,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         discarded: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
     });
     let mut table = page_table_mut();
-    let first = table.next_page;
-    table.next_page += n * FRAMES;
+    let first = table.numbers.take(n * FRAMES);
     for index in 0..n {
         let slice = Slice {
             section: section.clone(),
@@ -732,7 +784,15 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let numbers = unsafe { std::slice::from_raw_parts(pages, n) }.to_vec();
     let mut table = page_table_mut();
     // Dropped without the lock: the last page of a section unmaps its window.
-    let gone: Vec<Slice> = numbers.iter().filter_map(|number| table.pages.remove(number)).collect();
+    let mut gone: Vec<Slice> = Vec::with_capacity(numbers.len());
+    for number in &numbers {
+        // Only numbers the title owned: one given twice, or never handed
+        // out, must not be handed out twice.
+        if let Some(slice) = table.pages.remove(number) {
+            table.numbers.give(*number, FRAMES);
+            gone.push(slice);
+        }
+    }
     drop(table);
     drop(gone);
     1
@@ -850,6 +910,8 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let k = (n * PAGE - within).min(data.len() - done);
+        // (`VICTORY_POOL_DISCARD`) Until the bytes are there.
+        let _writing = pool_discard::writing();
         if let Some(at) = slice.section.window(slice.index, *n) {
             // SAFETY: committed bytes of the section's view, which `runs`
             // holds; the title's other uses of them race as on the console.
@@ -872,6 +934,9 @@ pub(crate) struct PageWindow {
     view: Window,
     within: usize,
     len: usize,
+    /// (`VICTORY_POOL_DISCARD`) No discard of the pages while the window
+    /// is written; drop the window once the bytes are there.
+    _writing: Option<std::sync::RwLockReadGuard<'static, ()>>,
 }
 
 enum Window {
@@ -903,6 +968,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let writing = pool_discard::writing();
     let view = match slice.section.window(slice.index, *n) {
         Some(at) => Window::Kept(at, slice.section.clone()),
         None => Window::Own(View::map(slice, *n)?),
@@ -911,6 +977,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         view,
         within: offset % PAGE,
         len,
+        _writing: writing,
     })
 }
 
@@ -1216,34 +1283,42 @@ pub extern "system" fn XMemMapPhysicalPages(
     if let Some(costed) = &mut costed {
         costed.waited = costed.started.elapsed().as_nanos() as u64;
     }
+    // Every page is looked up before anything is unmapped: a call with a
+    // page the title does not own fails and leaves what is mapped there as
+    // it was, instead of taking the old views away and mapping half of the
+    // new ones.
+    let slices: Option<Vec<Slice>> = match &pages {
+        None => None,
+        Some(pages) => {
+            let table = page_table();
+            let mut slices = Vec::with_capacity(pages.len());
+            for page in pages {
+                let Some(slice) = table.pages.get(page) else {
+                    tracing::warn!(page, "XMemMapPhysicalPages: unknown page");
+                    return std::ptr::null_mut();
+                };
+                slices.push(slice.clone());
+            }
+            Some(slices)
+        }
+    };
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, base, n * PAGE);
-    let Some(pages) = pages else {
+    let Some(slices) = slices else {
         return address;
-    };
-    let slices: Vec<Option<Slice>> = {
-        let table = page_table();
-        pages.iter().map(|page| table.pages.get(page).cloned()).collect()
     };
     let mut i = 0;
     while i < n {
-        let Some(first) = slices[i].clone() else {
-            tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
-            return std::ptr::null_mut();
-        };
+        let first = slices[i].clone();
         // One view per run of consecutive slices of one section.
         let run = 1 + slices[i + 1..]
             .iter()
             .zip(1..)
-            .take_while(|&(slice, k)| {
-                slice.as_ref().is_some_and(|s| {
-                    Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + k
-                })
-            })
+            .take_while(|&(s, k)| Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + k)
             .count();
         if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
             return std::ptr::null_mut();
@@ -1938,13 +2013,15 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
 /// last unmapped and while free RAM is under `VICTORY_POOL_DISCARD_BELOW_MB`
 /// (4096; 0: always), is reset in the lasting view (`MEM_RESET`) and taken
 /// out of the working set (`VirtualUnlock`), under the views' lock, so no
-/// map of it can come between the check and the reset. Pages of sections
+/// map of it can come between the check and the reset, and with no write
+/// through a lasting view under way (`pool_discard::WRITES`); a page
+/// written since its last unmapping is not discarded. Pages of sections
 /// without a whole view are never touched. `VICTORY_POOL_DISCARD_DELAY_S`:
 /// 0 (default) adaptive 2-10 s, N fixed. Line every 30 s: "pool discard: ...".
 mod pool_discard {
     use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-    use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+    use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock, RwLockReadGuard};
     use std::time::{Duration, Instant};
 
     use super::{PAGE, Physical, Section, Slice};
@@ -1967,8 +2044,77 @@ mod pool_discard {
     const FAILED: usize = 2;
     const REWRITTEN: usize = 3;
 
-    /// Pages that lost a view, to look at again later: when, and the page.
-    static UNSHOWN: Mutex<VecDeque<(Instant, Slice)>> = Mutex::new(VecDeque::new());
+    /// Pages that lost a view, to look at again later.
+    static UNSHOWN: LazyLock<Mutex<Unshown>> = LazyLock::new(Default::default);
+
+    #[derive(Default)]
+    struct Unshown {
+        /// When, and the page, in that order: a page unmapped again is in it
+        /// once for each time.
+        queue: VecDeque<(Instant, Slice)>,
+        /// By page ([`key`]): when it was last unmapped, until it is written
+        /// or discarded. Only the queue's entry of that moment counts, so the
+        /// delay runs from the last unmapping and a write since cancels it.
+        last: HashMap<(usize, usize), Instant>,
+    }
+
+    /// Held (shared) by every write through a lasting view from before
+    /// [`written`] until the bytes are there, and (alone) by the discard
+    /// loop from its choice of pages to their reset: a page is never reset
+    /// while a write into it is under way, nor after one it did not see.
+    /// Taken before [`super::PHYSICAL`]; nothing that holds that waits for it.
+    static WRITES: RwLock<()> = RwLock::new(());
+
+    /// While a write through a lasting view is under way ([`WRITES`]);
+    /// nothing while the feature is off.
+    pub(super) fn writing() -> Option<RwLockReadGuard<'static, ()>> {
+        on().then(|| WRITES.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Takes the entries of `queue` that are at least `quiet` old at `now`,
+    /// at most `most`, and keeps of them the pages for which they are the
+    /// last unmapping still standing in `last` (which forgets them): older
+    /// ones have a later entry of their own, and a page written since has
+    /// none.
+    pub(super) fn take_due<T>(
+        queue: &mut VecDeque<(Instant, T)>,
+        last: &mut HashMap<(usize, usize), Instant>,
+        key: impl Fn(&T) -> (usize, usize),
+        now: Instant,
+        quiet: Duration,
+        most: usize,
+    ) -> Vec<T> {
+        let mut due = Vec::new();
+        while due.len() < most
+            && let Some((at, _)) = queue.front()
+            && now.saturating_duration_since(*at) >= quiet
+        {
+            let Some((at, page)) = queue.pop_front() else { break };
+            let k = key(&page);
+            if last.get(&k) == Some(&at) {
+                last.remove(&k);
+                due.push(page);
+            }
+        }
+        due
+    }
+
+    /// Drops the oldest entries of `queue` past `most`, and with them what
+    /// `last` says of them.
+    pub(super) fn trim<T>(
+        queue: &mut VecDeque<(Instant, T)>,
+        last: &mut HashMap<(usize, usize), Instant>,
+        key: impl Fn(&T) -> (usize, usize),
+        most: usize,
+    ) {
+        let over = queue.len().saturating_sub(most);
+        for (at, page) in queue.drain(..over) {
+            let k = key(&page);
+            if last.get(&k) == Some(&at) {
+                last.remove(&k);
+            }
+        }
+    }
     /// The most pages kept noted.
     const UNSHOWN_MOST: usize = 1 << 18;
     /// When each page was discarded, until written again (or 5 s on).
@@ -1982,11 +2128,20 @@ mod pool_discard {
         (std::ptr::from_ref(section) as usize, index)
     }
 
-    /// Pages `[index, index + n)` of `section` were written through its
-    /// lasting view: resident there from now on.
+    /// Pages `[index, index + n)` of `section` are being written through its
+    /// lasting view (under [`writing`]): resident there from now on, and no
+    /// longer due for a discard since an unmapping before.
     pub(super) fn written(section: &Section, index: usize, n: usize) {
         if !on() {
             return;
+        }
+        {
+            let mut unshown = UNSHOWN.lock().unwrap_or_else(|e| e.into_inner());
+            if !unshown.last.is_empty() {
+                for k in index..(index + n).min(section.pages) {
+                    unshown.last.remove(&key(section, k));
+                }
+            }
         }
         for k in index..(index + n).min(section.pages) {
             let bit = 1u64 << (k % 64);
@@ -2030,7 +2185,12 @@ mod pool_discard {
         {
             return;
         }
-        UNSHOWN.lock().unwrap_or_else(|e| e.into_inner()).push_back((Instant::now(), page.clone()));
+        {
+            let now = Instant::now();
+            let mut unshown = UNSHOWN.lock().unwrap_or_else(|e| e.into_inner());
+            unshown.last.insert(key(&page.section, page.index), now);
+            unshown.queue.push_back((now, page.clone()));
+        }
         static STARTED: std::sync::Once = std::sync::Once::new();
         STARTED.call_once(|| {
             let _ = std::thread::Builder::new().name("victory-pool-discard".into()).spawn(discard_loop);
@@ -2108,23 +2268,26 @@ mod pool_discard {
             let quiet = delay();
             if free_ram().is_some_and(|free| free >= below()) {
                 HELD_BY_RAM.store(true, Relaxed);
-                let mut queue = UNSHOWN.lock().unwrap_or_else(|e| e.into_inner());
-                let over = queue.len().saturating_sub(UNSHOWN_MOST);
-                queue.drain(..over);
+                let unshown = &mut *UNSHOWN.lock().unwrap_or_else(|e| e.into_inner());
+                trim(&mut unshown.queue, &mut unshown.last, |s| key(&s.section, s.index), UNSHOWN_MOST);
                 continue;
             }
             HELD_BY_RAM.store(false, Relaxed);
-            let due: Vec<Slice> = {
-                let mut queue = UNSHOWN.lock().unwrap_or_else(|e| e.into_inner());
-                let n = queue.iter().take_while(|(at, _)| at.elapsed() >= quiet).count();
-                queue.drain(..n).map(|(_, s)| s).collect()
-            };
-            // Pieces of 1,024 pages, the lock let go between them.
-            for piece in due.chunks(1024) {
+            // Pieces of 1,024 pages, the locks let go between them; each
+            // chosen and reset with no write into a lasting view under way.
+            loop {
+                let writes = WRITES.write().unwrap_or_else(|e| e.into_inner());
                 let physical = super::physical();
+                let piece: Vec<Slice> = {
+                    let unshown = &mut *UNSHOWN.lock().unwrap_or_else(|e| e.into_inner());
+                    take_due(&mut unshown.queue, &mut unshown.last, |s| key(&s.section, s.index), Instant::now(), quiet, 1024)
+                };
+                if piece.is_empty() {
+                    break;
+                }
                 // (lasting view base, first index, pages)
                 let mut runs: Vec<(usize, usize, usize, Arc<Section>)> = Vec::new();
-                for page in piece {
+                for page in &piece {
                     let section = &*page.section;
                     let Some(&base) = section.window.get() else { continue };
                     let bit = 1u64 << (page.index % 64);
@@ -2156,6 +2319,7 @@ mod pool_discard {
                     COUNTS[DISCARDED].fetch_add(n as u64, Relaxed);
                 }
                 drop(physical);
+                drop(writes);
             }
         }
     }
@@ -2185,7 +2349,58 @@ mod pool_discard {
 
     #[cfg(test)]
     mod tests {
-        use super::next_delay;
+        use super::{next_delay, take_due, trim};
+        use std::collections::{HashMap, VecDeque};
+        use std::time::{Duration, Instant};
+
+        type Queue = VecDeque<(Instant, (usize, usize))>;
+
+        /// What `unshown` notes of a page unmapped at `at`.
+        fn unmapped(queue: &mut Queue, last: &mut HashMap<(usize, usize), Instant>, page: (usize, usize), at: Instant) {
+            last.insert(page, at);
+            queue.push_back((at, page));
+        }
+
+        /// The delay runs from a page's last unmapping, not its first; a
+        /// page written since its unmapping is not due at all.
+        #[test]
+        fn pages_are_due_a_delay_after_their_last_unmapping() {
+            let t0 = Instant::now();
+            let s = Duration::from_secs;
+            let quiet = s(2);
+            let (mut queue, mut last) = (Queue::new(), HashMap::new());
+            let (a, b, c) = ((1, 0), (1, 1), (1, 2));
+            unmapped(&mut queue, &mut last, a, t0);
+            unmapped(&mut queue, &mut last, b, t0);
+            unmapped(&mut queue, &mut last, c, t0 + s(1));
+            // `a` mapped again and unmapped just before its first delay ran out.
+            unmapped(&mut queue, &mut last, a, t0 + Duration::from_millis(1900));
+            // `c` written since (`written` forgets it).
+            last.remove(&c);
+            let key = |p: &(usize, usize)| *p;
+            assert_eq!(take_due(&mut queue, &mut last, key, t0 + s(1), quiet, usize::MAX), vec![]);
+            assert_eq!(take_due(&mut queue, &mut last, key, t0 + s(2), quiet, usize::MAX), vec![b], "a was unmapped 0.1 s ago");
+            assert_eq!(take_due(&mut queue, &mut last, key, t0 + s(3), quiet, usize::MAX), vec![], "c was written");
+            assert_eq!(take_due(&mut queue, &mut last, key, t0 + s(4), quiet, usize::MAX), vec![a]);
+            assert!(queue.is_empty() && last.is_empty());
+        }
+
+        #[test]
+        fn due_pages_come_in_pieces_and_trimming_forgets_them() {
+            let t0 = Instant::now();
+            let (mut queue, mut last) = (Queue::new(), HashMap::new());
+            for i in 0..5 {
+                unmapped(&mut queue, &mut last, (2, i), t0);
+            }
+            let key = |p: &(usize, usize)| *p;
+            let later = t0 + Duration::from_secs(10);
+            let quiet = Duration::from_secs(2);
+            assert_eq!(take_due(&mut queue, &mut last, key, later, quiet, 2), vec![(2, 0), (2, 1)]);
+            trim(&mut queue, &mut last, key, 1);
+            assert_eq!(queue.len(), 1);
+            assert_eq!(last.len(), 1);
+            assert_eq!(take_due(&mut queue, &mut last, key, later, quiet, 9), vec![(2, 4)]);
+        }
 
         #[test]
         fn the_discard_delay_adapts_to_pages_rewritten_soon() {
@@ -2542,6 +2757,82 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    /// Page numbers given back are handed out again: a title that allocates
+    /// and frees pages forever stays within the numbers it keeps (21 bits of
+    /// `number >> 4`), and no number is handed out twice while it is owned.
+    #[test]
+    fn page_numbers_are_used_again_and_never_twice() {
+        let first = 0x10_0000;
+        let mut numbers = Numbers::new(first);
+        let mut owned: std::collections::BTreeSet<usize> = Default::default();
+        let mut live: Vec<(usize, usize)> = Vec::new();
+        let mut seed = 12345u64;
+        let mut random = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        for _ in 0..200_000 {
+            if live.len() < 32 && (live.is_empty() || random() % 2 == 0) {
+                let pages = 1 + random() % 512;
+                let start = numbers.take(pages * FRAMES);
+                for k in 0..pages {
+                    assert!(owned.insert(start + k * FRAMES), "{:#x} handed out twice", start + k * FRAMES);
+                }
+                live.push((start, pages));
+            } else {
+                let (start, pages) = live.swap_remove(random() % live.len());
+                // Freed page by page, out of order, as the title may.
+                let mut order: Vec<usize> = (0..pages).collect();
+                for i in (1..order.len()).rev() {
+                    order.swap(i, random() % (i + 1));
+                }
+                for k in order {
+                    assert!(owned.remove(&(start + k * FRAMES)));
+                    numbers.give(start + k * FRAMES, FRAMES);
+                }
+            }
+            // At most 32 allocations of 512 pages are live at once.
+            assert!(numbers.next - first <= 32 * 512 * FRAMES * 4, "numbers run on: {:#x}", numbers.next);
+            assert!(((numbers.next >> 4) & !0x1f_ffff) == 0);
+        }
+        // All given back: the next number is the first again.
+        for (start, pages) in live.drain(..) {
+            for k in 0..pages {
+                numbers.give(start + k * FRAMES, FRAMES);
+            }
+        }
+        assert_eq!(numbers.next, first);
+        assert!(numbers.free.is_empty());
+    }
+
+    /// A call with a page the title does not own fails before it changes
+    /// anything: the pages mapped there before stay mapped, bytes and all.
+    #[test]
+    fn a_map_with_an_unknown_page_leaves_the_old_views() {
+        let pages = allocate(3);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!a.is_null());
+        let at = |k: usize| a.wrapping_byte_add(k * PAGE);
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        // SAFETY: mapped read-write.
+        unsafe {
+            for k in 0..3 {
+                at(k).cast::<u8>().write(10 + k as u8);
+            }
+        }
+        // The second page is unknown; the first and third would be other
+        // pages than before (reversed).
+        let bad = [pages[2], 1, pages[0]];
+        assert!(XMemMapPhysicalPages(a, 3, bad.as_ptr()).is_null());
+        for k in 0..3 {
+            assert_eq!(query(at(k)).host.State, MEM_COMMIT, "page {k} still mapped");
+            // SAFETY: still mapped, as checked.
+            assert_eq!(unsafe { at(k).cast::<u8>().read() }, 10 + k as u8, "page {k} shows what it did");
+        }
+        assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
     /// A thread that reads a mapped page in place, as the GPU side reads a

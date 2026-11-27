@@ -76,3 +76,12 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# Launcher build output (launcher/)
+/launcher/**/bin/
+/launcher/**/obj/
+/launcher/dist/
+/launcher/**/TestResults/
+
+# Claude Code agent worktrees
+/.claude/

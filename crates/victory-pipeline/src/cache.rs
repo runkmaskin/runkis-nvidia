@@ -41,6 +41,67 @@ impl Cache {
         Ok(Cache { root })
     }
 
+    /// Opens (creating) generation `generation` of a cache at `root`: its
+    /// entries are kept in `root/gen-<generation>`. A generation is what
+    /// made the entries (a converter's own sources): one key includes it, so
+    /// the entries of another generation can never be read again, and before
+    /// generations nothing told them apart and nothing removed them. They go
+    /// in [`Cache::sweep`]. `generation` is letters, digits, `-` and `_`.
+    pub fn open_generation(root: impl Into<PathBuf>, generation: &str) -> Result<Self> {
+        let named = !generation.is_empty()
+            && generation.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        anyhow::ensure!(named, "a cache generation named {generation:?}");
+        Cache::open(root.into().join(format!("{GENERATION}{generation}")))
+    }
+
+    /// For a cache of [`Cache::open_generation`]: removes the other
+    /// generations beside it, the entries of the layout from before
+    /// generations (two hex digits as a folder, beside them), and staging
+    /// files in this generation that processes left as they ended. Nothing
+    /// of this generation that a process may still write is touched: a
+    /// staging file is removed only when no process of its number runs.
+    pub fn sweep(&self) -> Swept {
+        let mut swept = Swept::default();
+        let ours = self.root.file_name();
+        // Only beside a generation: a cache of `Cache::open` has no others.
+        let (Some(parent), true) = (
+            self.root.parent(),
+            ours.is_some_and(|n| n.to_string_lossy().starts_with(GENERATION)),
+        ) else {
+            return swept;
+        };
+        for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let text = name.to_string_lossy();
+            let old_generation = text.starts_with(GENERATION) && Some(name.as_os_str()) != ours;
+            let flat = text.len() == 2 && text.bytes().all(|b| b.is_ascii_hexdigit());
+            if (old_generation || flat) && entry.file_type().is_ok_and(|t| t.is_dir()) {
+                let (files, bytes) = measure(&entry.path());
+                if std::fs::remove_dir_all(entry.path()).is_ok() {
+                    swept.generations += u64::from(old_generation);
+                    swept.files += files;
+                    swept.bytes += bytes;
+                }
+            }
+        }
+        for dir in std::fs::read_dir(&self.root).into_iter().flatten().flatten() {
+            for file in std::fs::read_dir(dir.path()).into_iter().flatten().flatten() {
+                let Some(pid) = staging_pid(&file.file_name().to_string_lossy()) else {
+                    continue;
+                };
+                if pid == std::process::id() || process_runs(pid) {
+                    continue;
+                }
+                let bytes = file.metadata().map_or(0, |m| m.len());
+                if std::fs::remove_file(file.path()).is_ok() {
+                    swept.files += 1;
+                    swept.bytes += bytes;
+                }
+            }
+        }
+        swept
+    }
+
     pub fn path_for(&self, key: &CacheKey) -> PathBuf {
         let hex = key.to_hex();
         self.root.join(&hex[..2]).join(&hex[2..])
@@ -70,6 +131,65 @@ impl Cache {
         published?;
         Ok(path)
     }
+}
+
+/// The start of a generation's folder name ([`Cache::open_generation`]).
+const GENERATION: &str = "gen-";
+
+/// What [`Cache::sweep`] removed: generations, files and their bytes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Swept {
+    pub generations: u64,
+    pub files: u64,
+    pub bytes: u64,
+}
+
+/// The files under `dir` and their bytes.
+fn measure(dir: &Path) -> (u64, u64) {
+    let mut out = (0, 0);
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => {
+                let (files, bytes) = measure(&entry.path());
+                out = (out.0 + files, out.1 + bytes);
+            }
+            Ok(_) => out = (out.0 + 1, out.1 + entry.metadata().map_or(0, |m| m.len())),
+            Err(_) => {}
+        }
+    }
+    out
+}
+
+/// The process number in a staging file's name ([`create_tempfile_in`]).
+fn staging_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix(".tmp-")?;
+    let (pid, n) = rest.split_once('-')?;
+    n.parse::<u64>().ok()?;
+    pid.parse().ok()
+}
+
+/// Whether a process numbered `pid` runs now (or may: when unsure, yes).
+#[cfg(windows)]
+fn process_runs(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: plain queries on a handle we close.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            // No such process; anything else (a process we may not ask) runs.
+            return GetLastError() != ERROR_INVALID_PARAMETER;
+        }
+        let mut code = 0u32;
+        let asked = GetExitCodeProcess(process, &mut code) != 0;
+        CloseHandle(process);
+        !asked || code == STILL_ACTIVE as u32
+    }
+}
+
+#[cfg(not(windows))]
+fn process_runs(pid: u32) -> bool {
+    !Path::new("/proc").is_dir() || Path::new(&format!("/proc/{pid}")).exists()
 }
 
 fn tempfile_in(dir: &Path) -> io::Result<(PathBuf, File)> {
@@ -213,6 +333,74 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert_eq!(counter.load(Ordering::Relaxed), 1);
         assert!(!missing.exists());
+    }
+
+    /// The number of a process that has ended.
+    fn ended_pid() -> u32 {
+        let mut child = if cfg!(windows) {
+            std::process::Command::new("cmd").args(["/c", "exit"]).spawn()
+        } else {
+            std::process::Command::new("true").spawn()
+        }
+        .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// Opening a generation keeps its entries; the sweep removes the other
+    /// generations, the layout from before generations and the staging
+    /// files of ended processes, and nothing else.
+    #[test]
+    fn a_sweep_removes_only_what_cannot_be_read_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("shaders");
+        let conv = Upper { version: 1, runs: AtomicUsize::new(0) };
+        let old = Cache::open_generation(&root, "old").unwrap();
+        old.get_or_convert(&conv, b"old entry").unwrap();
+        // The layout before generations, and a file that is no cache's.
+        let flat = root.join("ab");
+        std::fs::create_dir_all(&flat).unwrap();
+        std::fs::write(flat.join("cdef"), b"an entry of an older build").unwrap();
+        std::fs::write(root.join("notes.txt"), b"kept").unwrap();
+        let cache = Cache::open_generation(&root, "new").unwrap();
+        let kept = cache.get_or_convert(&conv, b"current entry").unwrap();
+        let dir = kept.parent().unwrap().to_path_buf();
+        let dead = dir.join(format!(".tmp-{}-0", ended_pid()));
+        let own = dir.join(format!(".tmp-{}-0", std::process::id()));
+        std::fs::write(&dead, b"left by a crash").unwrap();
+        std::fs::write(&own, b"being written").unwrap();
+        let swept = cache.sweep();
+        assert_eq!(swept.generations, 1);
+        // The old entry, the flat one and the dead staging file.
+        assert_eq!(swept.files, 3, "{swept:?}");
+        assert!(swept.bytes > 0);
+        assert!(!root.join("gen-old").exists());
+        assert!(!flat.exists());
+        assert!(!dead.exists());
+        assert!(own.exists(), "a staging file of a running process stays");
+        assert!(root.join("notes.txt").exists());
+        assert_eq!(std::fs::read(&kept).unwrap(), b"CURRENT ENTRY");
+        // A second sweep finds nothing, and the entry still hits.
+        assert_eq!(cache.sweep(), Swept { generations: 0, files: 0, bytes: 0 });
+        cache.get_or_convert(&conv, b"current entry").unwrap();
+        assert_eq!(conv.runs.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn generations_have_plain_names_and_plain_caches_sweep_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(Cache::open_generation(tmp.path(), "").is_err());
+        assert!(Cache::open_generation(tmp.path(), "../up").is_err());
+        let beside = tmp.path().join("gen-other");
+        std::fs::create_dir_all(&beside).unwrap();
+        let plain = Cache::open(tmp.path().join("plain")).unwrap();
+        assert_eq!(plain.sweep(), Swept::default());
+        assert!(beside.exists());
+        assert_eq!(staging_pid(".tmp-12-3"), Some(12));
+        assert_eq!(staging_pid(".tmp-12"), None);
+        assert_eq!(staging_pid("0123abcd"), None);
+        assert!(process_runs(std::process::id()));
     }
 
     #[test]

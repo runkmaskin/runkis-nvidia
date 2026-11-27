@@ -43,6 +43,18 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+    let now = now();
+    settle(&TEXTURES, now);
+    settle(&STAGING, now);
+}
+
+/// What a take does first ([`Pool::rested`]), also while nothing is taken:
+/// pieces given back that have rested are free again, and empty blocks past
+/// those kept go. Only takes did it: once the world had loaded and few
+/// textures were made, a pool kept every block whose pieces had come back,
+/// and kept them when the card's room fell ([`room`]).
+fn settle<B: Clone>(pool: &Mutex<Pool<B>>, now: u64) {
+    pool.lock().unwrap_or_else(|e| e.into_inner()).rested(now);
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
@@ -325,8 +337,7 @@ pub(crate) fn texture_room() -> u64 {
     (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
 }
 
-/// For the memory line: blocks of textures and of staging buffers, in MiB.
-#[cfg(feature = "diagnostics")]
+/// For the memory lines: blocks of textures and of staging buffers, in MiB.
 pub(crate) fn memory() -> [u64; 2] {
     [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
 }
@@ -594,6 +605,34 @@ mod tests {
         assert!(pool.take(BLOCK, 65536, 30, make).is_none());
         let mut none: Pool<u32> = Pool::new(SPARE);
         assert!(none.take(65536, 65536, 0, || None).is_none());
+    }
+
+    /// Pieces given back free their blocks with the once-a-second look, not
+    /// only at the next take; pieces still resting keep theirs.
+    #[test]
+    fn empty_blocks_go_without_a_take() {
+        let pool: Mutex<Pool<u32>> = Mutex::new(Pool::new(0));
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let pieces: Vec<Piece> = {
+            let mut p = pool.lock().unwrap();
+            (0..3).map(|_| p.take(BLOCK / 2, 65536, 0, make).unwrap().0).collect()
+        };
+        assert_eq!(pool.lock().unwrap().blocks(), 2);
+        for piece in &pieces[..2] {
+            pool.lock().unwrap().give(*piece, 10);
+        }
+        settle(&pool, 10 + REST - 1);
+        assert_eq!(pool.lock().unwrap().blocks(), 2, "still resting");
+        settle(&pool, 10 + REST);
+        assert_eq!(pool.lock().unwrap().blocks(), 1, "the empty one went, the held one stays");
+        pool.lock().unwrap().give(pieces[2], 20);
+        settle(&pool, 20 + REST);
+        assert_eq!(pool.lock().unwrap().blocks(), 0);
+        assert_eq!(made.get(), 2);
     }
 
     #[test]

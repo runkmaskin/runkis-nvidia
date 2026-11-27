@@ -252,6 +252,7 @@ fn show_config() -> Result<()> {
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
+    let mut violations = 0;
     for p in cfg
         .game_dir
         .iter()
@@ -260,7 +261,13 @@ fn show_config() -> Result<()> {
     {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
             println!("POLICY VIOLATION: {e}");
+            violations += 1;
         }
+    }
+    // A check that fails must say so in its exit code, so that scripts and
+    // the launcher can stop before a run that would be refused later.
+    if violations > 0 {
+        anyhow::bail!("{violations} configured path(s) are inside the VIctory source tree");
     }
     Ok(())
 }

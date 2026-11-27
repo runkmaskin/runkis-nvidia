@@ -21,7 +21,6 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -1398,22 +1397,27 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
-    // The console's order: zlib first, then BCPack.
-    let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
-    } else {
-        source
+    let decode = |source: &[u8]| {
+        into_destination(request, size, |out| match tables {
+            Some(tables) => bcpack::decode(bc, source, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+            None => inflate(source, out).map_err(|hr| fail(hr, "zlib")),
+        })
     };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
-    })?;
+    with_source(request, |source| {
+        // The console's order: zlib first, then BCPack.
+        if bc != 0 && options & ZLIB != 0 {
+            with_scratch(Scratch::Intermediate, request.intermediate_size as usize, |packed| {
+                let n = inflate(source, packed).map_err(|hr| fail(hr, "zlib"))?;
+                // Only what zlib wrote: the rest is an earlier request's.
+                decode(&packed[..n])
+            })
+        } else {
+            decode(source)
+        }
+    })
+    .map_err(|hr| fail(hr, "reading the source"))??;
     tracing::trace!(
         options = format_args!("{options:#x}"),
         offset = request.offset,
@@ -1510,18 +1514,57 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
-/// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+/// Runs `f` on a compressed request's source: borrowed from memory, or read
+/// from the file into this thread's buffer. The outer error is the read's.
+fn with_source<R>(request: &Request, f: impl FnOnce(&[u8]) -> R) -> Result<R, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(f(bytes));
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    // `read_into` fills all of it or fails: nothing an earlier request left
+    // is read.
+    with_scratch(Scratch::Source, size, |bytes| {
+        read_into(request, bytes)?;
+        Ok(f(bytes))
+    })
+}
+
+/// A worker's buffers for one compressed request, apart so they can be in
+/// use at once.
+#[derive(Clone, Copy)]
+enum Scratch {
+    /// The source as read from the file.
+    Source,
+    /// What zlib makes of it before BCPack.
+    Intermediate,
+    /// The output, for destination pages that are not one run.
+    Scattered,
+}
+
+/// Runs `f` on `len` bytes of one of this thread's buffers, kept from
+/// request to request and only ever grown: a fresh zero-filled buffer for
+/// every request cost an allocation and a fault on every 4 KiB of it,
+/// several times a request. The bytes hold whatever an earlier request left
+/// there, so every caller reads only what it has written itself. Buffers
+/// larger than `KEEP` are made for the one request, so that a few large
+/// requests leave no lasting memory on each of the workers.
+fn with_scratch<R>(which: Scratch, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    const KEEP: usize = 4 << 20;
+    thread_local! {
+        static BUFFERS: [std::cell::RefCell<Vec<u8>>; 3] = Default::default();
+    }
+    if len > KEEP {
+        return f(&mut vec![0; len]);
+    }
+    BUFFERS.with(|buffers| {
+        let mut buffer = buffers[which as usize].borrow_mut();
+        if buffer.len() < len {
+            buffer.resize(len, 0);
+        }
+        f(&mut buffer[..len])
+    })
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
@@ -1644,11 +1687,23 @@ fn into_pages(
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
         let filled = fill(window.bytes()).map(drop);
+        // The bytes are there: the window goes before the notice, which
+        // needs no hold on the pages.
+        drop(window);
         super::xmem::pages_written(pages, offset, len);
         return filled;
     }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
+    with_scratch(Scratch::Scattered, len, |data| {
+        let n = fill(data)?;
+        // Only the `n` bytes `fill` made: the rest is an earlier request's.
+        write_scattered(pages, offset, len, &data[..n])
+    })
+}
+
+/// Writes `data`, made for `len` bytes of `pages` from `offset` into the
+/// first, into pages that are not one run.
+fn write_scattered(pages: &[usize], offset: usize, len: usize, data: &[u8]) -> Result<(), HRESULT> {
+    let n = data.len();
     // A page the title has just made, or a view the host refuses for a moment (commit
     // or address space short while a load maps many at once), can come right a little
     // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
@@ -1929,6 +1984,33 @@ mod tests {
         assert_eq!(raw, plain[5000..6000]);
         assert_eq!(inflated, plain);
         void(queue, 0x40);
+    }
+
+    /// A worker's buffers are kept from request to request, are exactly as
+    /// long as asked, and can be in use at once.
+    #[test]
+    fn scratch_buffers_are_kept_and_in_use_side_by_side() {
+        let first = with_scratch(Scratch::Source, 1000, |b| {
+            b.fill(7);
+            b.as_ptr() as usize
+        });
+        let again = with_scratch(Scratch::Source, 10, |b| {
+            assert_eq!(b.len(), 10);
+            b.as_ptr() as usize
+        });
+        assert_eq!(first, again, "kept, not made anew");
+        with_scratch(Scratch::Source, 5, |a| {
+            with_scratch(Scratch::Intermediate, 5, |b| {
+                with_scratch(Scratch::Scattered, 5, |c| {
+                    a.fill(1);
+                    b.fill(2);
+                    c.fill(3);
+                    assert_eq!((a[0], b[0], c[0]), (1, 2, 3));
+                })
+            })
+        });
+        // Past what is kept: one of its own, zeroed.
+        with_scratch(Scratch::Source, (4 << 20) + 1, |b| assert!(b.iter().all(|&x| x == 0)));
     }
 
     #[test]

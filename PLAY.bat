@@ -17,13 +17,20 @@ set "VN_AIR=0.3"
 set "VN_STEADY=0.7"
 set "VN_SKIP_BVH=1"
 powershell -NoProfile -Command "Get-Process victory,victory_sm -ErrorAction SilentlyContinue | Stop-Process -Force"
-set "VICTORY_CACHE_DIR=%~dp0cache"
-set "VICTORY_DATA_DIR=%~dp0data"
+rem In a source checkout (.victory-root here) the layer refuses caches and saves inside the tree
+rem (docs\asset-policy.md), so they go under %LOCALAPPDATA% there; a plain unpacked folder keeps them beside this file.
+if exist "%~dp0.victory-root" (
+  set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\victory\cache"
+  set "VICTORY_DATA_DIR=%LOCALAPPDATA%\victory\data"
+) else (
+  set "VICTORY_CACHE_DIR=%~dp0cache"
+  set "VICTORY_DATA_DIR=%~dp0data"
+)
 set "VICTORY_GAME_DIR=%GAMEDIR:~0,-1%"
 echo First start translates shaders and builds pipelines: slow for the first minutes, smooth after.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\play-nvidia.ps1" -Exe "%GAME%" -NoSmoothMotion -Resolution 540
 if errorlevel 1 (
   echo.
-  echo The game ended with an error. See "%~dp0data" for crashes.log
+  echo The game ended with an error. See "%VICTORY_DATA_DIR%\<title id>\crashes.log"
   pause
 )

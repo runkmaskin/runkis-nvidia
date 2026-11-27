@@ -29,7 +29,7 @@
 
 use super::*;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use crate::descriptor::RtvRecord;
@@ -66,6 +66,9 @@ pub(super) struct Front {
     words: Vec<u64>,
     closed: bool,
     submitted: bool,
+    /// The calls the list's last translated recording made on our list:
+    /// what the next one likely makes ([`back_list`]).
+    calls: u32,
 }
 
 impl Drop for Front {
@@ -88,8 +91,14 @@ impl Front {
 
     /// Begins a recording, with `pipeline` bound.
     pub(super) fn begin(&mut self, kind: u32, pipeline: This) {
+        if let Some(r) = &self.recording {
+            let calls = r.calls.load(Acquire);
+            if calls != 0 {
+                self.calls = calls;
+            }
+        }
         self.leave();
-        self.recording = Some(Arc::new(Recording::new(kind)));
+        self.recording = Some(Arc::new(Recording::new(kind, self.calls)));
         self.closed = false;
         self.submitted = false;
         self.put(RESET, &[pipeline as u64]);
@@ -165,7 +174,10 @@ static WORDS: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
 static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
 static WORK: Condvar = Condvar::new();
 /// Lists of ours nobody uses, closed.
-static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// By what their host lists' allocators hold ([`super::Classed`]): taken
+/// last in, first out, every one of them came to hold the memory of the
+/// largest recording of a frame.
+static BACKS: Mutex<super::Classed<usize>> = Mutex::new(super::Classed::new());
 /// Since the last line of the log: streams handed over; calls translated and
 /// the microseconds that took (all threads), recordings translated, and
 /// recordings let go of in the middle.
@@ -185,6 +197,10 @@ pub(crate) struct Recording {
     done: AtomicBool,
     moved: Condvar,
     abandoned: AtomicBool,
+    /// The calls the title list's last recording made on our list.
+    hint: u32,
+    /// The calls this one made, once translated to its end.
+    calls: AtomicU32,
 }
 
 #[derive(Default)]
@@ -201,9 +217,11 @@ struct Inner {
 }
 
 impl Recording {
-    fn new(kind: u32) -> Self {
+    fn new(kind: u32, hint: u32) -> Self {
         Recording {
             kind,
+            hint,
+            calls: AtomicU32::new(0),
             inner: Mutex::default(),
             done: AtomicBool::new(false),
             moved: Condvar::new(),
@@ -238,7 +256,7 @@ impl Recording {
                     return;
                 };
                 if inner.back == 0 {
-                    inner.back = back_list(self.kind) as usize;
+                    inner.back = back_list(self.kind, self.hint) as usize;
                 }
                 (chunk, inner.back as This)
             };
@@ -249,6 +267,9 @@ impl Recording {
             let mut inner = held(&self.inner);
             inner.kept.push(chunk);
             if closed {
+                if let Some(host) = super::host_list(back) {
+                    self.calls.store(host.calls().max(1), Release);
+                }
                 inner.closed = true;
                 let kept = std::mem::take(&mut inner.kept);
                 self.done.store(true, Release);
@@ -272,7 +293,8 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            held(&BACKS).push(inner.back);
+            let holds = super::host_list(inner.back as This).map_or(0, |h| h.peak());
+            held(&BACKS).give(inner.back, super::class(holds), 0);
         }
     }
 }
@@ -287,9 +309,9 @@ fn give_back(streams: Vec<Vec<u64>>) {
     }
 }
 
-/// A list of ours, closed.
-fn back_list(kind: u32) -> This {
-    if let Some(back) = held(&BACKS).pop() {
+/// A list of ours, closed, for a recording of about `calls` calls.
+fn back_list(kind: u32, calls: u32) -> This {
+    if let Some(back) = held(&BACKS).take(super::class(calls)) {
         // SAFETY: a list of ours nobody uses.
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
@@ -880,7 +902,7 @@ mod tests {
     #[test]
     fn a_stream_gives_back_what_was_written() {
         let mut f = Front::default();
-        f.recording = Some(Arc::new(Recording::new(0)));
+        f.recording = Some(Arc::new(Recording::new(0, 0)));
         f.put(Plain::DRAW_INDEXED as u64, &[3, 1, 0, Word::word(-7i32), 5]);
         let viewport = [1.0f32, 2.0, 3.0, 4.0, 0.0, 1.0];
         f.put_with(VIEWPORTS, &[1], &[bytes_of(viewport.as_ptr(), 6)]);

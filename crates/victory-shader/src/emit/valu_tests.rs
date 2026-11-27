@@ -296,6 +296,86 @@ fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     });
 }
 
+/// Runs the SOP2 `op s16, s0, s1` once storing `s16` and once storing the
+/// SCC it leaves (through `s_cselect_b32`), and checks both against `want`.
+fn check_sop2_and_scc(op: u8, cases: &[[u32; 4]], want: impl Fn(u32, u32) -> (u32, bool)) {
+    let value = build_valu_cs(&[sop2(op, 16, 0, 1), vop1(1, 0, sgpr(16))]);
+    let scc = build_valu_cs(&[
+        sop2(op, 16, 0, 1),
+        sop2(0x0a, 18, 129, 128), // s_cselect_b32 s18, 1, 0
+        vop1(1, 0, sgpr(18)),
+    ]);
+    run_cases(&value, cases, |backend, _, [a, b, ..], got| {
+        assert_eq!(got, want(a, b).0, "{backend}: op {op:#x} ({a:#x}, {b:#x}) result");
+    });
+    run_cases(&scc, cases, |backend, _, [a, b, ..], got| {
+        assert_eq!(got, u32::from(want(a, b).1), "{backend}: op {op:#x} ({a:#x}, {b:#x}) SCC");
+    });
+}
+
+#[test]
+fn scalar_min_and_max_set_scc_when_the_first_operand_is_chosen() {
+    let cases = [
+        [0, 7, 0, 0],
+        [7, 5, 0, 0],
+        [3, 3, 0, 0],
+        [0, 0, 0, 0],
+        [0xFFFF_FFFF, 1, 0, 0],
+        [1, 0xFFFF_FFFF, 0, 0],
+        [0x8000_0000, 0x7FFF_FFFF, 0, 0],
+        [0xFFFF_FFFE, 0xFFFF_FFFE, 0, 0],
+    ];
+    // RDNA2: D = S0 < S1 ? S0 : S1 (min), S0 > S1 ? S0 : S1 (max); SCC =
+    // whether S0 was chosen, so it is clear for equal operands.
+    check_sop2_and_scc(0x06, &cases, |a, b| {
+        let lt = (a as i32) < (b as i32);
+        (if lt { a } else { b }, lt)
+    });
+    check_sop2_and_scc(0x07, &cases, |a, b| (a.min(b), a < b));
+    check_sop2_and_scc(0x08, &cases, |a, b| {
+        let gt = (a as i32) > (b as i32);
+        (if gt { a } else { b }, gt)
+    });
+    check_sop2_and_scc(0x09, &cases, |a, b| (a.max(b), a > b));
+}
+
+#[test]
+fn scalar_shift_and_add_sets_scc_to_the_carry_out() {
+    let cases = [
+        [0, 0, 0, 0],
+        [1, 2, 0, 0],
+        // Only the bits shifted out of S0 carry; the low result is zero.
+        [0x8000_0000, 0, 0, 0],
+        [0xF000_0000, 0, 0, 0],
+        // Only the add carries.
+        [1, 0xFFFF_FFFF, 0, 0],
+        [0x8000_0001, 0xFFFF_FFFE, 0, 0],
+        [0x0FFF_FFFF, 0x10, 0, 0],
+    ];
+    // RDNA2: tmp = (u64(S0) << N) + u64(S1); D = tmp[31:0]; SCC = tmp >> 32 != 0.
+    for n in 1..=4u32 {
+        check_sop2_and_scc(0x2d + n as u8, &cases, |a, b| {
+            let t = (u64::from(a) << n) + u64::from(b);
+            (t as u32, t >> 32 != 0)
+        });
+    }
+    // The carry feeds an s_addc_u32 as the high half of a 64-bit address.
+    let addc = build_valu_cs(&[
+        sop2(0x2e, 16, 0, 1), // s_lshl1_add_u32 s16, s0, s1
+        sop2(0x04, 17, 2, 3), // s_addc_u32 s17, s2, s3
+        vop1(1, 0, sgpr(17)),
+    ]);
+    let wide = [
+        [0x8000_0000, 0, 5, 10],
+        [0x4000_0000, 0, 5, 10],
+        [1, 0xFFFF_FFFF, 0xFFFF_FFFF, 0],
+    ];
+    run_cases(&addc, &wide, |backend, _, [a, b, x, y], got| {
+        let carry = ((u64::from(a) << 1) + u64::from(b)) >> 32 != 0;
+        assert_eq!(got, x.wrapping_add(y).wrapping_add(u32::from(carry)), "{backend}: {a:#x}, {b:#x}");
+    });
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }

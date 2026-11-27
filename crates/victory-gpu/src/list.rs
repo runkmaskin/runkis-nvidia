@@ -205,10 +205,10 @@ impl Detached {
     }
 }
 
-/// A host list that has run and waits to be used again, and the bytes of
-/// upload memory it keeps.
+/// A host list that has run and waits to be used again (with the bytes of
+/// upload memory it keeps beside it, in [`Classed`]).
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle(crate::host::HostList);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -222,8 +222,72 @@ unsafe impl Send for Idle {}
 /// frame in gameplay, each two command allocators and two lists, and for
 /// four in ten a budget and an argument buffer (run 61: "104 host lists
 /// made 21.2 ms" a frame, and the graphics kernel's time to free them).
+///
+/// They are kept by how much their allocators hold ([`Classed`]): a list's
+/// allocator keeps the command memory of the largest recording it ever had,
+/// over every reset. Taken last in, first out, each list was in time the
+/// host side of every kind of title list, and every one of them held the
+/// memory of the frame's largest recording (lists' allocators, 9 GB of a
+/// 40 GB run on the RX 7900 XTX).
 #[cfg(windows)]
-static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
+static IDLE: std::sync::Mutex<Classed<Idle>> = std::sync::Mutex::new(Classed::new());
+
+/// Classes of how much a list's allocator holds: by its largest recording's
+/// calls ([`crate::host::HostList::peak`]), each class twice the one before.
+pub(crate) const CLASSES: usize = 24;
+
+/// The class of a recording of `calls` calls: 0 below 512, then one more
+/// for each doubling.
+pub(crate) fn class(calls: u32) -> usize {
+    ((u32::BITS - (calls >> 9).leading_zeros()) as usize).min(CLASSES - 1)
+}
+
+/// Of classes `0..CLASSES` (`has`: whether one is there), the one to give
+/// a recording of class `wanted`: its own; else the largest one below (its
+/// allocator grows to what the recording needs, as a new one would); else
+/// the smallest above. A small recording is never given a large allocator
+/// while a smaller one is there.
+pub(crate) fn nearest(has: impl Fn(usize) -> bool, wanted: usize) -> Option<usize> {
+    let wanted = wanted.min(CLASSES - 1);
+    (0..=wanted).rev().chain(wanted + 1..CLASSES).find(|&c| has(c))
+}
+
+/// Things kept by [`class`], each with its bytes.
+pub(crate) struct Classed<T> {
+    by_class: [Vec<(T, u64)>; CLASSES],
+    count: usize,
+    bytes: u64,
+}
+
+impl<T> Classed<T> {
+    pub(crate) const fn new() -> Self {
+        Classed { by_class: [const { Vec::new() }; CLASSES], count: 0, bytes: 0 }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.count
+    }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// The thing for a recording of class `wanted` ([`nearest`]); the one
+    /// given last of its class.
+    pub(crate) fn take(&mut self, wanted: usize) -> Option<T> {
+        let c = nearest(|c| !self.by_class[c].is_empty(), wanted)?;
+        let (thing, bytes) = self.by_class[c].pop()?;
+        self.count -= 1;
+        self.bytes -= bytes;
+        Some(thing)
+    }
+
+    pub(crate) fn give(&mut self, thing: T, class: usize, bytes: u64) {
+        self.by_class[class.min(CLASSES - 1)].push((thing, bytes));
+        self.count += 1;
+        self.bytes += bytes;
+    }
+}
 
 /// The most host lists kept idle (128 were too few: flights land several at
 /// a time, so lists were thrown away and others made in the same frame, with
@@ -243,19 +307,13 @@ fn pools() -> bool {
 }
 
 /// A host list open for recording: one that has run, as a title's list is
-/// after its reset, or a new one.
+/// after its reset, or a new one. `calls`: what the recording it is for will
+/// likely make, the calls the list it replaces made ([`Classed`]).
 #[cfg(windows)]
-fn fresh_list() -> Option<crate::host::HostList> {
-    let idle = {
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
-            idle.1 -= bytes;
-        }
-        taken
-    };
+fn fresh_list(calls: u32) -> Option<crate::host::HostList> {
+    let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner()).take(class(calls));
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -273,17 +331,17 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).len() >= IDLE_MOST.0 {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
         host.reset();
         let bytes = host.scratch_kept();
+        let held = class(host.peak());
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
-            idle.1 += bytes;
+        if idle.len() < IDLE_MOST.0 && idle.bytes() + bytes <= IDLE_MOST.1 {
+            idle.give(Idle(host), held, bytes);
         }
     }
 }
@@ -320,7 +378,7 @@ fn cut(this: This, wait: ValueWait) {
         list.gate.push(wait);
         return;
     }
-    let Some(fresh) = fresh_list() else {
+    let Some(fresh) = fresh_list(current.calls()) else {
         // shortcut: without a new host list the wait stands before the part
         // it was recorded in.
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -397,7 +455,8 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        // The list's next recording is likely of the size of this one.
+        let Some(fresh) = fresh_list(host_list(this).map_or(0, |h| h.calls())) else {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
@@ -469,7 +528,8 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        // The list's next recording is likely of the size of this one.
+        let Some(fresh) = fresh_list(host_list(this).map_or(0, |h| h.calls())) else {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
@@ -769,6 +829,33 @@ const UAV_BARRIER: Barrier = Barrier {
     last: 0,
 };
 
+/// Barriers of one call kept on the stack ([`gathered`]).
+const FEW_BARRIERS: usize = 32;
+
+/// What `f` makes of each of `items` (those it keeps, in order) and then
+/// `last`: in `few` when they fit, else in a vector. A title's barrier call
+/// names a few; each call made a vector, for every barrier call of every
+/// list.
+fn gathered<'a, T: Copy>(
+    items: &[T],
+    mut f: impl FnMut(&T) -> Option<T>,
+    last: Option<T>,
+    few: &'a mut [T],
+) -> std::borrow::Cow<'a, [T]>
+where
+    [T]: ToOwned<Owned = Vec<T>>,
+{
+    if items.len() < few.len() {
+        let mut n = 0;
+        for made in items.iter().filter_map(&mut f).chain(last) {
+            few[n] = made;
+            n += 1;
+        }
+        return std::borrow::Cow::Borrowed(&few[..n]);
+    }
+    std::borrow::Cow::Owned(items.iter().filter_map(f).chain(last).collect())
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -780,19 +867,17 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
-        if barriers.iter().any(|b| {
+        let buffers = barriers.iter().any(|b| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) {
-            host.push(UAV_BARRIER);
-            #[cfg(feature = "diagnostics")]
+        });
+        #[cfg(feature = "diagnostics")]
+        if buffers {
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
+        let mut few = [UAV_BARRIER; FEW_BARRIERS];
+        let host = gathered(barriers, |b| host_barrier(list, b), buffers.then_some(UAV_BARRIER), &mut few);
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
@@ -1758,16 +1843,30 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
+        // No vector: this runs at every change of render targets. A range
+        // of up to eight (all the host takes) is made on the stack; the
+        // title's own handles are read where they are.
+        let mut range = [0u64; 8];
+        let owned: Vec<u64>;
+        let handles: &[u64] = if one_range != 0 && !handles.is_null() {
             // SAFETY: the title passes the first handle.
             let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
+            let at = |i: usize| first + 128 * i as u64;
+            if count as usize <= range.len() {
+                for (i, h) in range.iter_mut().enumerate().take(count as usize) {
+                    *h = at(i);
+                }
+                &range[..count as usize]
+            } else {
+                owned = (0..count as usize).map(at).collect();
+                &owned
+            }
         } else {
-            items(handles, count).to_vec()
+            items(handles, count)
         };
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        with_state(this, |list, s| s.set_targets(list, &handles, depth));
+        with_state(this, |list, s| s.set_targets(list, handles, depth));
     }
     pub(super) extern "system" fn draw(
         this: This,
@@ -2213,7 +2312,7 @@ fn value_written(this: This, address: u64, value: u64) {
         let Some(current) = list.host.as_ref() else {
             return;
         };
-        let Some(fresh) = fresh_list() else {
+        let Some(fresh) = fresh_list(current.calls()) else {
             return;
         };
         current.close();
@@ -2377,6 +2476,139 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// Gathered on the stack or not, the same items in the same order.
+    #[test]
+    fn gathered_items_are_the_vector_they_were() {
+        let keep = |&x: &u32| (x % 3 != 0).then_some(x * 10);
+        for len in [0usize, 1, 5, 30, 31, 32, 33, 100] {
+            let items: Vec<u32> = (0..len as u32).collect();
+            for last in [None, Some(7)] {
+                let mut want: Vec<u32> = items.iter().filter_map(keep).collect();
+                want.extend(last);
+                let mut few = [0u32; FEW_BARRIERS];
+                let got = gathered(&items, keep, last, &mut few);
+                assert_eq!(&*got, &want[..], "{len} {last:?}");
+                assert_eq!(matches!(got, std::borrow::Cow::Borrowed(_)), len < FEW_BARRIERS);
+            }
+        }
+    }
+
+    /// Timing of a barrier call's gathering of four, against a vector:
+    /// `cargo test -p victory-gpu --release --lib gathering_four -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gathering_four_barriers_takes_no_vector() {
+        let items = [UAV_BARRIER; 4];
+        let keep = |b: &Barrier| Some(*b);
+        let n = 2_000_000;
+        let began = std::time::Instant::now();
+        let mut sum = 0usize;
+        for _ in 0..n {
+            let v: Vec<Barrier> = std::hint::black_box(&items).iter().filter_map(keep).chain(Some(UAV_BARRIER)).collect();
+            sum += std::hint::black_box(v).len();
+        }
+        let vector = began.elapsed();
+        let began = std::time::Instant::now();
+        for _ in 0..n {
+            let mut few = [UAV_BARRIER; FEW_BARRIERS];
+            sum += std::hint::black_box(gathered(std::hint::black_box(&items), keep, Some(UAV_BARRIER), &mut few)).len();
+        }
+        let stack = began.elapsed();
+        eprintln!(
+            "{n} gatherings of 4 barriers: vector {:.1} ns each, stack {:.1} ns each ({sum})",
+            vector.as_nanos() as f64 / n as f64,
+            stack.as_nanos() as f64 / n as f64
+        );
+    }
+
+    /// A recording gets an idle list of its own class, else the largest
+    /// below, else the smallest above.
+    #[test]
+    fn idle_lists_go_to_recordings_of_their_size() {
+        assert_eq!(class(0), 0);
+        assert_eq!(class(511), 0);
+        assert_eq!(class(512), 1);
+        assert_eq!(class(1024), 2);
+        assert_eq!(class(u32::MAX), CLASSES - 1);
+        let mut pool = Classed::new();
+        for (name, calls) in [("small", 10), ("mid", 5_000), ("big", 100_000)] {
+            pool.give(name, class(calls), 1);
+        }
+        assert_eq!(pool.take(class(6_000)), Some("mid"));
+        assert_eq!(pool.take(class(3)), Some("small"));
+        // Nothing of its size or below: the smallest above.
+        assert_eq!(pool.take(class(3)), Some("big"));
+        assert_eq!((pool.len(), pool.bytes()), (0, 0));
+        assert_eq!(pool.take(0), None);
+    }
+
+    /// Host lists rotating between title lists of a frame, as submissions
+    /// do: each title list's host list goes to the card and the title list
+    /// takes an idle one; the ones that ran come back in another order.
+    /// What the allocators hold is the sum of each list's largest recording
+    /// ([`crate::host::HostList::peak`]). `classed`: taken by [`Classed`];
+    /// else last in, first out, as before.
+    fn rotate(classed: bool, sizes: &[u32], frames: usize) -> (u64, usize) {
+        let mut peaks: Vec<u32> = Vec::new();
+        let mut lifo: Vec<usize> = Vec::new();
+        let mut pool = Classed::new();
+        let mut hosts: Vec<usize> = (0..sizes.len()).collect();
+        peaks.resize(sizes.len(), 0);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut shuffle = |v: &mut Vec<usize>| {
+            for i in (1..v.len()).rev() {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                v.swap(i, (seed % (i as u64 + 1)) as usize);
+            }
+        };
+        for _ in 0..frames {
+            let mut order: Vec<usize> = (0..sizes.len()).collect();
+            shuffle(&mut order);
+            let mut flying = Vec::new();
+            for t in order {
+                // The title list records into its host list and submits it.
+                let host = hosts[t];
+                peaks[host] = peaks[host].max(sizes[t]);
+                flying.push(host);
+                let fresh = if classed { pool.take(class(sizes[t])) } else { lifo.pop() };
+                hosts[t] = fresh.unwrap_or_else(|| {
+                    peaks.push(0);
+                    peaks.len() - 1
+                });
+            }
+            shuffle(&mut flying);
+            for host in flying {
+                if classed {
+                    pool.give(host, class(peaks[host]), 0);
+                } else {
+                    lifo.push(host);
+                }
+            }
+        }
+        (peaks.iter().map(|&p| u64::from(p)).sum(), peaks.len())
+    }
+
+    /// With idle lists taken by their class, a large allocator stays with
+    /// the large recordings: a frame of 6 lists of 60,000 calls, 4 of 8,000
+    /// and 90 of 50, for 60 frames.
+    #[test]
+    fn large_allocators_stay_with_large_recordings() {
+        let mut sizes = vec![60_000; 6];
+        sizes.extend([8_000; 4]);
+        sizes.extend([50; 90]);
+        let (before, lists) = rotate(false, &sizes, 60);
+        let (after, lists_after) = rotate(true, &sizes, 60);
+        eprintln!("calls held by allocators: last in, first out {before} in {lists} lists; by class {after} in {lists_after}");
+        assert_eq!(lists, lists_after, "as many lists either way");
+        // At most twice what the frame records: one list on the card, one
+        // waiting, per title list.
+        let frame: u64 = sizes.iter().map(|&s| u64::from(s)).sum();
+        assert!(after <= 2 * frame, "{after} > 2 x {frame}");
+        assert!(after * 4 < before, "{after} vs {before}");
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

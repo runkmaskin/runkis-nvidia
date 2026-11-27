@@ -171,8 +171,9 @@ struct Memory {
     open: std::collections::HashSet<usize>,
     /// Pages taken from faults.
     faulted: usize,
-    /// Per host view heap (by address): the first slot of its run, and how
-    /// many copies have their view there.
+    /// Per host view heap (by its number, `HostHeap::serial`: a heap made
+    /// where a released one was has not made the run): the first slot of
+    /// its run, and how many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
     /// The frame the faults were last read in.
     frame: u64,
@@ -1025,7 +1026,7 @@ pub(crate) fn ready(
     for (sum, n) in m.stats.came.iter_mut().zip(came) {
         *sum += n;
     }
-    let key = std::ptr::from_ref(heap) as usize;
+    let key = heap.serial() as usize;
     let (base, made) = match m.heaps.get(&key) {
         Some(&run) => run,
         None => {

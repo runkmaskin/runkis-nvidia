@@ -537,6 +537,22 @@ pub(crate) fn sync_heaps() {
         let samplers = heap.samplers();
         let in_place = sync_in_place() && step == 32 && crate::safecopy::on();
         let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(pages_a_job).map(|_| Default::default()).collect();
+        // A part taken that could not be read, or not all of it: looked at
+        // again at the next sync (its page marked changed again, or its
+        // slots marked), else its slots kept the records seen before until
+        // the title wrote the page once more.
+        // (`lead`: the first record whose first byte is in the part.)
+        let again = |lead: usize, from: usize, to: usize| {
+            if port {
+                let mut handle = lead;
+                while handle < to {
+                    crate::port_descriptors::mark(handle as u64);
+                    handle += step as usize;
+                }
+            } else {
+                written.again(from);
+            }
+        };
         let phase = crate::timeline::span("the heaps' records: pages read and compared");
         crate::land::each_view(true, found.len(), &|n| {
             let mut out = SyncPart::default();
@@ -568,6 +584,9 @@ pub(crate) fn sync_heaps() {
                     out.bytes += (to - from) as u64;
                     out.looked += count;
                     out.short += u64::from(!whole);
+                    if !whole {
+                        again(lead, from, to);
+                    }
                     // What was read of the changed records is in the records
                     // last seen now.
                     // SAFETY: this part's records alone, which nothing else
@@ -580,6 +599,7 @@ pub(crate) fn sync_heaps() {
                     let at = std::time::Instant::now();
                     page_bytes.resize(to - from, 0);
                     if !crate::host::read_into(from as *const u8, &mut page_bytes) {
+                        again(lead, from, to);
                         continue;
                     }
                     out.ns[0] += since(at);
@@ -932,13 +952,16 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// `heap`, if that heap still exists and its host heap is the one numbered
+/// `serial` ([`host::HostHeap::serial`]) that handed them out: a heap made
+/// where a released one was would otherwise free slots other lists hold.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic(heap: usize, serial: u64, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+        && host.serial() == serial
     {
         host.release(first, n);
     }
@@ -986,6 +1009,12 @@ impl Drop for Heap {
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
         crate::port_descriptors::let_go(self.start);
+        drop(heaps);
+        // What the heap pass kept of it holds host copies, which could
+        // never be let go (`shadow::let_go_idle`) while it stayed.
+        if let Some(Some(host)) = self.host.get() {
+            crate::draw::forget_heap(host.serial());
+        }
     }
 }
 
@@ -1981,6 +2010,73 @@ mod tests {
             offset / 32 + 2,
             "the next allocation took the table's second slot"
         );
+    }
+
+    /// A shader-visible view heap with a host heap (none without a host GPU).
+    #[cfg(windows)]
+    fn view_heap() -> Option<This> {
+        crate::host::host()?;
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 4,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let none = Placement { address: 0, size: 0 };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        heap(h).host()?;
+        Some(h)
+    }
+
+    /// What the heap pass keeps of a heap (host copies among it) goes with
+    /// the heap; and a heap made where a released one was is another heap
+    /// to it, which starts with a whole pass.
+    #[cfg(windows)]
+    #[test]
+    fn the_heap_pass_forgets_a_released_heap() {
+        let Some(h) = view_heap() else {
+            return; // no host GPU
+        };
+        let serial = crate::draw::heap_pass_kept(heap(h), 1).expect("a host heap");
+        assert!(crate::draw::heap_ranges_kept(serial));
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        assert!(!crate::draw::heap_ranges_kept(serial), "kept after the heap was released");
+        let Some(again) = view_heap() else {
+            return;
+        };
+        assert_ne!(heap(again).host().unwrap().serial(), serial, "another heap, another number");
+        slot::<extern "system" fn(This) -> u32>(again, 0x10)(again);
+    }
+
+    /// Dynamic slots handed out by a released heap's host heap are not
+    /// given back to a heap made at the same address: other lists hold
+    /// them there.
+    #[cfg(windows)]
+    #[test]
+    fn dynamic_slots_go_back_only_to_the_heap_that_gave_them() {
+        let Some(h) = view_heap() else {
+            return; // no host GPU
+        };
+        let at = h as usize;
+        let host = heap(h).host().unwrap();
+        // All of them, so whether any came back shows.
+        let mut n = 1u32 << 20;
+        let first = loop {
+            if let Some(first) = host.dynamic(n) {
+                break first;
+            }
+            n /= 2;
+            assert!(n > 0, "no dynamic slots");
+        };
+        while host.dynamic(1).is_some() {}
+        // The slots, as a list that took them from an earlier heap at this
+        // address would give them back.
+        release_dynamic(at, host.serial() + 1_000_000, first, n);
+        assert_eq!(host.dynamic(1), None, "another heap's slots were given back to this one");
+        release_dynamic(at, host.serial(), first, n);
+        assert_eq!(host.dynamic(1), Some(first));
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
     }
 
     #[test]

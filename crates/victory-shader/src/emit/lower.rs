@@ -5921,9 +5921,17 @@ impl<'a> Lower<'a> {
             }
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
-                let k = self.s.m.i32(u32::from(name.as_bytes()[6] - b'0'));
+                let n = u32::from(name.as_bytes()[6] - b'0');
+                let k = self.s.m.i32(n);
                 let t = self.s.m.bin(c, Bin::Shl, a, k);
-                (self.s.m.bin(c, Bin::Add, t, b), None)
+                let r = self.s.m.bin(c, Bin::Add, t, b);
+                // SCC is the carry out of the 64-bit (S0 << N) + S1: the bits
+                // shifted out of S0, or the carry of the add, not "r != 0".
+                let (back, z) = (self.s.m.i32(32 - n), self.s.m.i32(0));
+                let out = self.s.m.bin(c, Bin::LShr, a, back);
+                let shifted = self.s.m.cmp(c, pred::NE, out, z);
+                let added = self.s.m.cmp(c, pred::IULT, r, t);
+                (r, Some(self.s.m.bin(c, Bin::Or, shifted, added)))
             }
             "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
@@ -5934,7 +5942,9 @@ impl<'a> Lower<'a> {
                     _ => pred::SGT,
                 };
                 let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                // SCC is whether S0 was chosen (the strict compare), so it is
+                // clear for equal operands, whatever the result.
+                (self.s.m.select(c, t, a, b), Some(t))
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
