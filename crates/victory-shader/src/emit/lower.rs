@@ -1227,9 +1227,16 @@ fn meeting_mode() -> u32 {
 /// there: before the exit of an all-lane block into a region with LDS accesses, and at the
 /// start of an all-lane block entered from one. Accesses in all-lane blocks get their own
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
-/// joined without an all-lane block between them): refused.
+/// joined without an all-lane block between them): refused, unless `apart` proves that the
+/// two halves of a console wave touch no dword in ways that conflict there
+/// ([`super::lds_apart`]; it is given the region's blocks).
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
-fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
+fn lds_meetings(
+    p: &crate::ir::Program,
+    st: &Structured,
+    all: &[bool],
+    apart: &dyn Fn(&[usize]) -> bool,
+) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
     let succ = |b: usize| -> Vec<usize> {
         match st.exits[b] {
@@ -1275,8 +1282,11 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             }
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) {
-        return None;
+    for r in (0..n).filter(|&r| reads[r] && writes[r]) {
+        let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
+        if !apart(&blocks) {
+            return None;
+        }
     }
     let mut meet = vec![(false, false); n];
     for b in 0..n {
@@ -1291,6 +1301,23 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     Some(meet)
+}
+
+/// Whether the two halves of each console wave stay apart in LDS inside `region`
+/// ([`super::lds_apart`]), for [`lds_meetings`]. The title's barriers there order the halves
+/// only where they wait for the group: `VICTORY_GROUP_SYNC` unset or 2 (in mode 1 a barrier
+/// in a block not every lane runs keeps only its fence).
+fn lds_apart_ok(
+    p: &Program,
+    st: &Structured,
+    all: &[bool],
+    cs: &crate::native::ComputeIo,
+    region: &[usize],
+) -> Result<(), (usize, Why)> {
+    if !super::lds_apart::on() || !LDS_APART.get() {
+        return Err((0, "not tried"));
+    }
+    super::lds_apart::Halves::new(p, st, all, cs).apart(region, super::group_sync() == 2)
 }
 
 /// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its
@@ -1342,6 +1369,18 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_lds_apart`].
+    static LDS_APART: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with LDS that both halves of a console wave read and write in one lane-branch
+/// region taken where they stay apart there ([`lds_meetings`], [`super::lds_apart`]); only for
+/// programs that do not translate otherwise.
+pub(super) fn with_lds_apart<R>(f: impl FnOnce() -> R) -> R {
+    let was = LDS_APART.replace(true);
+    let r = f();
+    LDS_APART.set(was);
+    r
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1754,7 +1793,8 @@ impl<'a> Lower<'a> {
                             })
                         });
                         let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
-                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
+                        let apart = |region: &[usize]| lds_apart_ok(p, x.st, &all, &cs, region).is_ok();
+                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all, &apart) {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
                         }
@@ -1808,10 +1848,21 @@ impl<'a> Lower<'a> {
                         why.push("LDS in a group over 32");
                         match all_lane_blocks(x.st) {
                             None => why.push("an indirect exit"),
-                            Some(all) if lds_meetings(p, x.st, &all).is_none() => {
-                                why.push("an LDS read and write in one lane-branch region")
+                            Some(all) => {
+                                // (and, with `VICTORY_LDS_APART` on, why the halves are not apart)
+                                let apart = |region: &[usize]| match lds_apart_ok(p, x.st, &all, &cs, region) {
+                                    Ok(()) => true,
+                                    Err(_) if !LDS_APART.get() => false,
+                                    Err((offset, what)) => {
+                                        let at = p.blocks[region[0]].offset;
+                                        eprintln!("WAVE64-LDS-APART region at {at:#x}: {what} at {offset:#x}");
+                                        false
+                                    }
+                                };
+                                if lds_meetings(p, x.st, &all, &apart).is_none() {
+                                    why.push("an LDS read and write in one lane-branch region");
+                                }
                             }
-                            Some(_) => {}
                         }
                     }
                     why.sort_unstable();

@@ -945,3 +945,421 @@ fn a_first_lane_read_of_lds_that_may_still_change_is_refused() {
         r.err()
     );
 }
+/// An LDS instruction (DS encoding): opcode, address VGPR, data VGPRs, destination VGPR,
+/// offset (offset1 in the high byte).
+fn ds(op: u32, addr: u32, data0: u32, data1: u32, vdst: u32, offset: u32) -> [u32; 2] {
+    [0xD800_0000 | op << 18 | offset, vdst << 24 | data1 << 16 | data0 << 8 | addr]
+}
+
+const DS_ADD_U32: u32 = 0;
+const DS_MAX_U32: u32 = 8;
+const DS_WRITE_B32: u32 = 13;
+const DS_WRITE2_B32: u32 = 14;
+const DS_ADD_RTN_U32: u32 = 32;
+const DS_SWIZZLE_B32: u32 = 53;
+const DS_READ_B32: u32 = 54;
+const DS_READ2_B32: u32 = 55;
+
+/// `native` lowered for a host of 32-lane waves as the last try of a program that does not
+/// translate otherwise (LDS halves apart, [`lower::with_lds_apart`]), and the wave size it asks
+/// of the host (64: refused there).
+fn lowered_wave(native: &NativeProgram) -> (HostShader, Option<u32>) {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = lower::with_lds_apart(|| lower::lower(&lower::Parts {
+        native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    }));
+    lower::TEST_HOST_WAVE.set(was);
+    let lowered = lowered.expect("lower");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+        half_views: lowered.half_views,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    (shader, lowered.wave_size)
+}
+
+/// The whole UAV of `dwords` dwords after `shader` ran once with root constants s0, s1; None
+/// (and a line) without a device that takes it.
+fn all_on_the_card(shader: &HostShader, constants: [u32; 2], dwords: u32) -> Option<Vec<u32>> {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return None;
+    };
+    let (root, pso) = match host.compute_pipeline(shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
+            return None;
+        }
+    };
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+            ud[u.index as usize] = constants[d as usize];
+        }
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(dwords)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    Some(out[0].clone())
+}
+
+/// A mip level made in LDS, as the title's transmission prefilter makes it
+/// (`CS_AlphTransmissionPrefilterMip`): 256 threads (four console waves), all of the body
+/// inside `if (t < s0)` (a bounds test). Each thread writes its texel 3t + 1 to LDS dword t,
+/// the group meets at the title's `s_barrier`, and the first 64 threads each store the sum
+/// of texels 4t..4t+3. The barrier stands in a block not every lane runs, so the halves of a
+/// console wave cannot meet around each access there. `barrier` false: an `s_nop` instead.
+fn mip_level(barrier: bool) -> NativeProgram {
+    let mut w = vec![
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0: in bounds
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0,           // s_cbranch_execz end (filled in below)
+        0x340A_0081, // v_lshlrev_b32 v5, 1, v0
+        0x4A0A_0B00, // v_add_nc_u32 v5, v0, v5
+        0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5: the texel
+        0x340C_0082, // v_lshlrev_b32 v6, 2, v0
+    ];
+    // (a quad swap, as the title's filter combines its quads: a lane read makes the program
+    // one that needs the console's lanes; the sums over each quad stay the same)
+    w.extend(ds(DS_SWIZZLE_B32, 5, 0, 0, 5, 0x80B1)); // ds_swizzle_b32 v5, v5 quad_perm:[1,0,3,2]
+    w.extend(ds(DS_WRITE_B32, 6, 5, 0, 0, 0)); // ds_write_b32 v6, v5
+    w.push(if barrier { 0xBF8A_0000 } else { 0xBF80_0000 }); // s_barrier, or s_nop
+    w.push(0x7DA8_00C0); // v_cmpx_gt_u32 exec, 64, v0
+    let skip = w.len();
+    w.push(0); // s_cbranch_execz end (filled in below)
+    w.push(0x340E_0084); // v_lshlrev_b32 v7, 4, v0
+    w.extend(ds(DS_READ2_B32, 7, 0, 0, 8, 1 << 8)); // ds_read2_b32 v[8:9], v7 offset1:1
+    w.extend(ds(DS_READ2_B32, 7, 0, 0, 10, 2 | 3 << 8)); // ds_read2_b32 v[10:11], v7 offset0:2 offset1:3
+    w.extend_from_slice(&[
+        0x4A10_1109, // v_add_nc_u32 v8, v9, v8
+        0x4A10_110A, // v_add_nc_u32 v8, v10, v8
+        0x4A10_110B, // v_add_nc_u32 v8, v11, v8
+        0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+        0xE070_1000,
+        0x8002_0807, // buffer_store_dword v8, v7, s[8:11], 0 offen
+    ]);
+    let end = w.len();
+    w[2] = 0xBF88_0000 | (end - 3) as u32;
+    w[skip] = 0xBF88_0000 | (end - skip - 1) as u32;
+    w.push(0xBEFE_040C); // end: s_mov_b64 exec, s[12:13]
+    let mut native = native_of(&w, true, 256);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 2 << 15; // 1 KiB of LDS
+    }
+    native
+}
+
+/// The region of the bounds test both writes and reads LDS, but the title's barrier lies
+/// between the writes and the reads: the halves of a console wave are ordered by it, and
+/// within each side of it they touch no dword the other half does. Runs in waves of 32,
+/// exact against the console's sums; with threads out of bounds too (s0 = 200: whole host
+/// waves of the last console wave skip the body).
+#[test]
+fn a_mip_level_in_lds_behind_a_bounds_test_runs_in_waves_of_32() {
+    let native = mip_level(true);
+    let (shader, wave) = lowered_wave(&native);
+    assert_eq!(wave, Some(32), "refused for 32-lane waves");
+    for s0 in [256u32, 200, 129] {
+        let Some(out) = all_on_the_card(&shader, [s0, 0], 256) else {
+            return;
+        };
+        // texels 4t..4t+3, all in bounds
+        for t in 0..(s0 / 4).min(64) {
+            let want: u32 = (0..4).map(|k| 3 * (4 * t + k) + 1).sum();
+            assert_eq!(out[t as usize], want, "s0 = {s0}: thread {t}");
+        }
+        assert!(out[64..].iter().all(|&x| x == 0), "s0 = {s0}: only the first 64 threads store");
+    }
+    eprintln!("ran on the hardware device: a mip level through LDS behind a bounds test");
+}
+
+/// Without the barrier the first 64 threads read texels other threads wrote in the same
+/// region: half 0 of console wave 0 reads what half 1 writes. Refused for 32-lane waves.
+#[test]
+fn a_mip_level_in_lds_without_its_barrier_is_refused() {
+    let (_, wave) = lowered_wave(&mip_level(false));
+    assert_eq!(wave, Some(64));
+}
+
+/// What the lanes of [`counters`] read in their region.
+#[derive(Clone, Copy, PartialEq)]
+enum Read {
+    /// LDS dword 2, which only the first thread wrote before.
+    Base,
+    /// Dword 0, the counter the lanes add to in the same region.
+    Counter,
+    /// The dword at byte s1 + 8: its distance from the counters is not known.
+    Scalar,
+    /// Dword 2, with `ds_max_u32` on the slot counter beside the adds.
+    Mixed,
+}
+
+/// Slots handed out through LDS counters, as the title's particle visibility program
+/// (`GpuParticleUpdate:CS_Visibility`) does: one console wave of 64 threads, no barrier.
+/// The group's first thread (64 * s1 + t == 0) zeroes two counters and writes the base 7;
+/// each thread below s0 reads the base, takes a slot with `ds_add_rtn_u32` and adds its number
+/// to the second counter, and stores base + slot; the first thread then reads both counters,
+/// writes their sum, reads it back, and stores the three at dwords 64, 65, 66.
+fn counters(read: Read) -> NativeProgram {
+    let mut w = vec![
+        0xD746_0001,
+        0x0401_0C01, // v_lshl_add_u32 v1, s1, 6, v0: the thread's number in the dispatch
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0,           // s_cbranch_execz (filled in below)
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E06_0287, // v_mov_b32 v3, 7
+    ];
+    w.extend(ds(DS_WRITE2_B32, 2, 2, 2, 0, 1 << 8)); // ds_write2_b32 v2, v2, v2 offset1:1
+    w.extend(ds(DS_WRITE_B32, 2, 3, 0, 0, 8)); // ds_write_b32 v2, v3 offset:8
+    w[4] = 0xBF88_0000 | (w.len() - 5) as u32;
+    w.extend_from_slice(&[
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8E_246A, // s_and_saveexec_b64 s[14:15], vcc
+    ]);
+    let skip = w.len();
+    w.extend_from_slice(&[
+        0,           // s_cbranch_execz (filled in below)
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E08_0281, // v_mov_b32 v4, 1
+        0x7E18_0201, // v_mov_b32 v12, s1
+    ]);
+    w.extend(match read {
+        Read::Base | Read::Mixed => ds(DS_READ_B32, 2, 0, 0, 5, 8), // ds_read_b32 v5, v2 offset:8
+        Read::Counter => ds(DS_READ_B32, 2, 0, 0, 5, 0),            // ds_read_b32 v5, v2
+        Read::Scalar => ds(DS_READ_B32, 12, 0, 0, 5, 8),            // ds_read_b32 v5, v12 offset:8
+    });
+    w.extend(ds(DS_ADD_RTN_U32, 2, 4, 0, 6, 0)); // ds_add_rtn_u32 v6, v2, v4: the slot
+    w.extend(if read == Read::Mixed {
+        ds(DS_MAX_U32, 2, 0, 0, 0, 0) // ds_max_u32 v2, v0
+    } else {
+        ds(DS_ADD_U32, 2, 0, 0, 0, 4) // ds_add_u32 v2, v0 offset:4
+    });
+    w.extend_from_slice(&[
+        0x4A0C_0D05, // v_add_nc_u32 v6, v5, v6
+        0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+        0xE070_1000,
+        0x8002_0607, // buffer_store_dword v6, v7, s[8:11], 0 offen
+    ]);
+    w[skip] = 0xBF88_0000 | (w.len() - skip - 1) as u32;
+    w.extend_from_slice(&[
+        0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+    ]);
+    let skip = w.len();
+    w.extend_from_slice(&[0, 0x7E04_0280]); // s_cbranch_execz (filled in below); v_mov_b32 v2, 0
+    w.extend(ds(DS_READ2_B32, 2, 0, 0, 8, 1 << 8)); // ds_read2_b32 v[8:9], v2 offset1:1
+    w.push(0x4A14_1308); // v_add_nc_u32 v10, v8, v9
+    w.extend(ds(DS_WRITE_B32, 2, 10, 0, 0, 12)); // ds_write_b32 v2, v10 offset:12
+    w.extend(ds(DS_READ_B32, 2, 0, 0, 11, 12)); // ds_read_b32 v11, v2 offset:12
+    w.extend_from_slice(&[
+        0xE070_1100,
+        0x8002_0802, // buffer_store_dword v8, v2, s[8:11], 0 offen offset:256
+        0xE070_1104,
+        0x8002_0902, // buffer_store_dword v9, v2, s[8:11], 0 offen offset:260
+        0xE070_1108,
+        0x8002_0B02, // buffer_store_dword v11, v2, s[8:11], 0 offen offset:264
+    ]);
+    w[skip] = 0xBF88_0000 | (w.len() - skip - 1) as u32;
+    w.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    let mut native = native_of(&w, true, 64);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    native
+}
+
+/// The lanes' region reads only the base, which no one writes there, and adds to the counters
+/// only with commuting atomics; the first thread's region (64 * s1 + t is 0 for no other
+/// thread, whatever s1 is) is in one half. Runs in waves of 32: every thread below s0 gets a
+/// slot of its own (the order may differ from the console's lane order, as it may between
+/// console waves), and the counters are the console's.
+#[test]
+fn slots_from_lds_counters_in_one_console_wave_run_in_waves_of_32() {
+    let (shader, wave) = lowered_wave(&counters(Read::Base));
+    assert_eq!(wave, Some(32), "refused for 32-lane waves");
+    let mut ran = false;
+    for below in [64u32, 63, 40, 33, 32, 17, 1] {
+        let Some(out) = all_on_the_card(&shader, [below, 0], 67) else {
+            return;
+        };
+        ran = true;
+        let mut slots: Vec<u32> = out[..below as usize].to_vec();
+        slots.sort_unstable();
+        assert_eq!(slots, (7..7 + below).collect::<Vec<_>>(), "{below} threads: a slot each");
+        assert!(out[below as usize..64].iter().all(|&x| x == 0), "{below} threads: only they store");
+        let sum: u32 = (0..below).sum();
+        assert_eq!(out[64..67], [below, sum, below + sum], "{below} threads: the counters");
+    }
+    if ran {
+        eprintln!("ran on the hardware device: a slot each and the console's counters");
+    }
+}
+
+/// A plain read of the counter the other half adds to in the same region, an address whose
+/// distance from the counters is a scalar, and two kinds of atomics on one dword: each needs
+/// the console's order of the halves. Refused for 32-lane waves.
+#[test]
+fn lds_counters_the_halves_share_otherwise_are_refused() {
+    for read in [Read::Counter, Read::Scalar, Read::Mixed] {
+        let (_, wave) = lowered_wave(&counters(read));
+        assert_eq!(wave, Some(64), "read {}", read as u8);
+    }
+}
+/// A strided loop over LDS records inside `if (t < s0)`, as the title's decal trail packing
+/// (`vfx_proj_decal_trail:CS_PackProjDecalTrailVertexBuffer`) walks them: one console wave of
+/// 64 threads, no barrier. LDS dword 2 + i holds record i's flag (i & 1, written before by
+/// every thread); in two rounds thread t takes records i = t and t + 64. A record whose flag
+/// is 0 stores 1000 to UAV dword i (and the arm then reuses its address register); one whose
+/// flag is set takes a slot from the counter at dword 0 and writes 100 + slot over its flag,
+/// at the address made before the branch. After the region every thread stores its records'
+/// LDS dwords at UAV dwords 256 + i. `step`: the records' stride, 64 (or 32: thread t then
+/// takes t and t + 32, which the other half takes too).
+fn strided_records(step: u32) -> NativeProgram {
+    let mut w = vec![
+        0x3610_0081, // v_and_b32 v8, 1, v0
+        0x3412_0082, // v_lshlrev_b32 v9, 2, v0
+    ];
+    w.extend(ds(DS_WRITE2_B32, 9, 8, 8, 0, 2 | 66 << 8)); // ds_write2_b32 v9, v8, v8 offset0:2 offset1:66
+    w.push(0x7E14_0280); // v_mov_b32 v10, 0
+    w.extend(ds(DS_WRITE_B32, 10, 10, 0, 0, 0)); // ds_write_b32 v10, v10: the counter
+    w.extend_from_slice(&[
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+    ]);
+    let skip = w.len();
+    w.extend_from_slice(&[
+        0,           // s_cbranch_execz end (filled in below)
+        0xBE94_0380, // s_mov_b32 s20, 0: the round
+        0x7E02_0300, // v_mov_b32 v1, v0: the record
+    ]);
+    let top = w.len();
+    w.push(0x3404_0282); // loop: v_lshlrev_b32 v2, 2, v1
+    w.extend(ds(DS_READ_B32, 2, 0, 0, 3, 8)); // ds_read_b32 v3, v2 offset:8: the flag
+    w.extend_from_slice(&[
+        0x7D84_0680, // v_cmp_eq_u32 vcc, 0, v3
+        0xBE90_246A, // s_and_saveexec_b64 s[16:17], vcc
+    ]);
+    let then = w.len();
+    w.extend_from_slice(&[
+        0, // s_cbranch_execz else (filled in below)
+        0x7E08_02FF,
+        1000, // v_mov_b32 v4, 1000
+        0xE070_1000,
+        0x8002_0402, // buffer_store_dword v4, v2, s[8:11], 0 offen
+        0x7E04_0280, // v_mov_b32 v2, 0
+    ]);
+    w[then] = 0xBF88_0000 | (w.len() - then - 1) as u32;
+    w.push(0x8AFE_7E10); // else: s_andn2_b64 exec, s[16:17], exec
+    let other = w.len();
+    w.extend_from_slice(&[
+        0,           // s_cbranch_execz join (filled in below)
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0x7E0C_0281, // v_mov_b32 v6, 1
+    ]);
+    w.extend(ds(DS_ADD_RTN_U32, 5, 6, 0, 7, 0)); // ds_add_rtn_u32 v7, v5, v6: the slot
+    w.extend_from_slice(&[0x4A0E_0EFF, 100]); // v_add_nc_u32 v7, 100, v7
+    w.extend(ds(DS_WRITE_B32, 2, 7, 0, 0, 8)); // ds_write_b32 v2, v7 offset:8
+    w[other] = 0xBF88_0000 | (w.len() - other - 1) as u32;
+    w.extend_from_slice(&[
+        0xBEFE_0410, // join: s_mov_b64 exec, s[16:17]
+        0x4A02_0280 | (128 + step), // v_add_nc_u32 v1, step, v1
+        0x8014_8114, // s_add_u32 s20, s20, 1
+        0xBF0A_8214, // s_cmp_lt_u32 s20, 2
+    ]);
+    let back = w.len();
+    w.push(0xBF85_0000 | (top as i32 - back as i32 - 1) as u16 as u32); // s_cbranch_scc1 loop
+    w[skip] = 0xBF88_0000 | (w.len() - skip - 1) as u32;
+    w.push(0xBEFE_040C); // end: s_mov_b64 exec, s[12:13]
+    w.extend(ds(DS_READ2_B32, 9, 0, 0, 11, 2 | 66 << 8)); // ds_read2_b32 v[11:12], v9 offset0:2 offset1:66
+    w.extend_from_slice(&[
+        0xE070_1400,
+        0x8002_0B09, // buffer_store_dword v11, v9, s[8:11], 0 offen offset:1024
+        0xE070_1500,
+        0x8002_0C09, // buffer_store_dword v12, v9, s[8:11], 0 offen offset:1280
+    ]);
+    let mut native = native_of(&w, true, 64);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 2 << 15; // 1 KiB of LDS
+    }
+    native
+}
+
+/// Each half touches only its own records (i = t + 64 k, the round k each thread's own), and
+/// the counter only through commuting atomics; the flag read and the record write lie apart
+/// from the counter whatever the round (the rounds are below the loop limit). The record's
+/// address in the arm that takes a slot is the one made before the branch: the lanes there
+/// did not run the other arm, which overwrote it. Runs in waves of 32, exact against the
+/// console: a distinct slot per flagged record, the others untouched.
+#[test]
+fn records_walked_in_rounds_behind_a_bounds_test_run_in_waves_of_32() {
+    let (shader, wave) = lowered_wave(&strided_records(64));
+    assert_eq!(wave, Some(32), "refused for 32-lane waves");
+    let mut ran = false;
+    for s0 in [64u32, 63, 40, 33, 32, 31, 1] {
+        let Some(out) = all_on_the_card(&shader, [s0, 0], 384) else {
+            return;
+        };
+        ran = true;
+        let mut slots = Vec::new();
+        for i in 0..128u32 {
+            let taken = i % 64 < s0;
+            let flag = i & 1;
+            assert_eq!(out[i as usize], if taken && flag == 0 { 1000 } else { 0 }, "s0 = {s0}: record {i}'s store");
+            let last = out[256 + i as usize];
+            if taken && flag == 1 {
+                slots.push(last.wrapping_sub(100));
+            } else {
+                assert_eq!(last, flag, "s0 = {s0}: record {i} untouched");
+            }
+        }
+        slots.sort_unstable();
+        assert_eq!(slots, (0..slots.len() as u32).collect::<Vec<_>>(), "s0 = {s0}: a slot each");
+    }
+    if ran {
+        eprintln!("ran on the hardware device: records in rounds, a slot each");
+    }
+}
+/// With a stride of 32 a thread's second record is the first one of a thread in the other
+/// half: both halves read and write it in the region. Refused for 32-lane waves.
+#[test]
+fn records_the_halves_share_across_rounds_are_refused() {
+    let (_, wave) = lowered_wave(&strided_records(32));
+    assert_eq!(wave, Some(64));
+}
