@@ -175,6 +175,7 @@ pub(crate) fn spent(which: usize, from: std::time::Instant) -> std::time::Instan
 
 /// For the frame-rate line: where landing went, per frame.
 pub(crate) fn log(frames: f64) {
+    census::log(frames);
     let t: Vec<f64> = TAKEN.iter().map(|t| t.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if t[0] > 0.0 {
         tracing::info!(
@@ -737,6 +738,7 @@ unsafe fn piece_at(
         dwords += done.dwords;
         missing += u64::from(!done.there);
         if done.new > 0 {
+            census::landed(title + from, done.dwords * 4);
             new_pages += 1;
             if beside.is_some() {
                 let page = (title + from) / PAGE;
@@ -779,6 +781,8 @@ fn for_pages(title: usize, parts: &[(usize, usize)], mut f: impl FnMut(usize, us
         }
     }
 }
+
+pub(crate) mod census;
 
 #[cfg(test)]
 mod tests;

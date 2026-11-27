@@ -2757,6 +2757,20 @@ fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
     written
 }
 
+/// `f` with `title` and a copy of it as it is now ([`put_changed`] wants
+/// both after a merge), the copy in memory this thread keeps: a piece of up
+/// to 64 KiB, one allocation a thread instead of one a piece.
+fn put_with_was<R>(title: &mut [u8], f: impl FnOnce(&[u8], &mut [u8]) -> R) -> R {
+    thread_local! {
+        static WAS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    WAS.with_borrow_mut(|was| {
+        was.clear();
+        was.extend_from_slice(title);
+        f(was, title)
+    })
+}
+
 /// For `crate::land`'s measurement: a piece as [`Shadow::card_merge_relay`]
 /// lands it without `VICTORY_LAND`: `n` bytes at `now`, `held` what the CPU's
 /// side held, both the caller's alone.
@@ -4132,11 +4146,7 @@ impl Shadow {
         if !crate::host::read_into((start + at) as *const u8, title) {
             return 0;
         }
-        let was = title.clone();
-        if !merge_piece(now, held, title) {
-            return 0;
-        }
-        put_changed(start + at, &was, title)
+        put_with_was(title, |was, title| if merge_piece(now, held, title) { put_changed(start + at, was, title) } else { 0 })
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -5234,18 +5244,17 @@ impl Shadow {
             // title's, and may have been written again since.
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
-            let mut differs = 0u8;
-            let was = title.clone();
-            for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
-                let wrote = if *g != *o { 0xffu8 } else { 0 };
-                let merged = (*t & !wrote) | (*g & wrote);
-                differs |= merged ^ *t;
-                *t = merged;
-                *o = merged;
-            }
-            if differs != 0 {
-                written = put_changed(start + at, &was, title);
-            }
+            written = put_with_was(title, |was, title| {
+                let mut differs = 0u8;
+                for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
+                    let wrote = if *g != *o { 0xffu8 } else { 0 };
+                    let merged = (*t & !wrote) | (*g & wrote);
+                    differs |= merged ^ *t;
+                    *t = merged;
+                    *o = merged;
+                }
+                if differs != 0 { put_changed(start + at, was, title) } else { 0 }
+            });
         } else {
             // Title memory is not mapped there: the copy keeps what the
             // card wrote, as before.
@@ -5304,18 +5313,16 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
-        let was = title.clone();
-        let mut changed = false;
-        for (a, b) in outside(at, at + n, skip) {
-            let (a, b) = (a - at, b - at);
-            // Title memory that is not mapped: the CPU's side keeps what
-            // the card wrote, as before; `title` is scratch then.
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
-        }
-        if !mapped || !changed {
-            return 0;
-        }
-        put_changed(start + at, &was, title)
+        put_with_was(title, |was, title| {
+            let mut changed = false;
+            for (a, b) in outside(at, at + n, skip) {
+                let (a, b) = (a - at, b - at);
+                // Title memory that is not mapped: the CPU's side keeps what
+                // the card wrote, as before; `title` is scratch then.
+                changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            }
+            if !mapped || !changed { 0 } else { put_changed(start + at, was, title) }
+        })
     }
 }
 

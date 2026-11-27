@@ -2767,6 +2767,47 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
     line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len())
 }
 
+/// Whether the thread that lands flights takes them up to the first fence
+/// signal or bottom-of-pipe write behind them, and the rest after
+/// (`VICTORY_LAND_SEGMENTS=1`; off by default: everything the card has run
+/// in one landing, as before).
+///
+/// A landing tells the title nothing before all of it is in: a fence behind
+/// the first of four flights the card had run waits for the fetches and
+/// merges of all four. With the switch it waits for those of the first.
+/// The cost: a fetch, and its wait, per part.
+///
+/// Why it changes no order: [`segment_end`] cuts only right before a flight,
+/// where [`landable`] itself cuts when the card has run the flights ahead
+/// and not that one. The relay sees such a line every time it is quicker
+/// than the card; the rest stays in the line, as it would then.
+fn land_segments() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_SEGMENTS").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line, with [`land_segments`]: landings cut
+/// short, and the things of the line they left for the next one.
+static SEGMENT_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`land_segments`]: of the first `n` things of the line (`Some`: a
+/// flight), how many are landed now: up to the tells (signals, writes) that
+/// follow the first flights, never past the next flight. Flights with no
+/// tell between them are landed together. At least one thing when `n` is.
+fn segment_end(line: &[Option<u64>], n: usize) -> usize {
+    let n = n.min(line.len());
+    let mut flown = false;
+    for i in 0..n {
+        if line[i].is_some() {
+            if flown && line[i - 1].is_none() {
+                return i;
+            }
+            flown = true;
+        }
+    }
+    n
+}
+
 /// For one plan of copies in the card's memory, with [`relay`]: `flags`
 /// holds, for every piece of every range of the plan, the copy, the
 /// piece's number in the copy and whether the compare flagged it there (or
@@ -2784,7 +2825,94 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{flagged_pieces, landable, segment_end};
+
+    /// [`segment_end`] cuts only where [`landable`] could, and every tell
+    /// goes behind every flight ahead of it.
+    #[test]
+    fn landings_cut_at_tells_cut_where_the_card_could() {
+        let (f, t) = (Some(1), None);
+        assert_eq!(segment_end(&[f, t, f, t], 4), 2);
+        assert_eq!(segment_end(&[t, f, f, t, t, f], 6), 5);
+        assert_eq!(segment_end(&[f, f, f], 3), 3);
+        assert_eq!(segment_end(&[t, t], 2), 2);
+        assert_eq!(segment_end(&[f, t, f], 1), 1);
+        assert_eq!(segment_end(&[], 0), 0);
+        // Every line of up to 8 things and every landable count: the cut is
+        // a prefix, not empty, and at its end comes a flight or nothing.
+        for len in 0..=8usize {
+            for bits in 0..1u32 << len {
+                let line: Vec<Option<u64>> = (0..len).map(|i| (bits >> i & 1 == 1).then_some(i as u64 + 1)).collect();
+                for completed in 0..=len as u64 + 1 {
+                    let n = landable(&line, completed);
+                    let k = segment_end(&line, n);
+                    assert!(k <= n && (k > 0 || n == 0), "{line:?} {n} {k}");
+                    assert!(k == n || line[k].is_some(), "cut before a tell: {line:?} {n} {k}");
+                    // The same cut is what the card alone gives, had it run
+                    // only the flights ahead of the cut.
+                    let ahead = line[..k].iter().flatten().max().copied().unwrap_or(0);
+                    assert_eq!(landable(&line[..n], ahead), k, "{line:?}");
+                }
+            }
+        }
+    }
+
+    /// A model of the relay with and without the cut: the flight at place i
+    /// of the line writes value i + 1 to title address i % 3 on the card; the
+    /// card runs flights in order, a few between two looks of the relay; a
+    /// landing puts what the card holds into title memory; at a tell, a
+    /// reader looks at every address the flights ahead of it wrote. Over
+    /// every line of up to 8 things and every pace of the card: no reader
+    /// sees a value older than the one its flights wrote, tells come in the
+    /// line's order, and both settings end with the same title memory.
+    #[test]
+    fn no_tell_lets_a_stale_byte_be_read() {
+        for len in 1..=8usize {
+            for bits in 0..1u32 << len {
+                let line: Vec<Option<u64>> = (0..len).map(|i| (bits >> i & 1 == 1).then_some(i as u64 + 1)).collect();
+                let flights: Vec<usize> = (0..len).filter(|&i| line[i].is_some()).collect();
+                for pace in 0..9usize {
+                    let mut ends = Vec::new();
+                    for cut in [false, true] {
+                        let (mut title, mut card, mut told) = ([0u64; 3], [0u64; 3], Vec::new());
+                        let (mut ran, mut next, mut look) = (0usize, 0usize, 0usize);
+                        while next < len {
+                            // The card runs 0-2 more flights, by the pace.
+                            let more = (pace >> (look % 3)) % 3;
+                            look += 1;
+                            for _ in 0..more.max(usize::from(look > 4 * len)) {
+                                if let Some(&i) = flights.get(ran) {
+                                    card[i % 3] = i as u64 + 1;
+                                    ran += 1;
+                                }
+                            }
+                            let completed = ran.checked_sub(1).map_or(0, |r| flights[r] as u64 + 1);
+                            let mut n = landable(&line[next..], completed);
+                            if n == 0 {
+                                continue;
+                            }
+                            if cut {
+                                n = segment_end(&line[next..], n);
+                            }
+                            title = card;
+                            for i in next..next + n {
+                                if line[i].is_none() {
+                                    for &j in flights.iter().filter(|&&j| j < i) {
+                                        assert!(title[j % 3] > j as u64, "stale: {line:?} tell {i} flight {j} pace {pace} cut {cut}");
+                                    }
+                                    told.push(i);
+                                }
+                            }
+                            next += n;
+                        }
+                        assert!(told.windows(2).all(|w| w[0] < w[1]));
+                        ends.push((title, told));
+                    }
+                    assert_eq!(ends[0], ends[1], "{line:?} pace {pace}");
+                }
+            }
+        }
+    }
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -3963,10 +4091,18 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
-                let n = landable(&fences, completed);
+                let mut n = landable(&fences, completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
                     break Err(fences[0].unwrap_or(0));
+                }
+                if land_segments() {
+                    let all = n;
+                    n = segment_end(&fences, n);
+                    if n < all {
+                        SEGMENT_STATS[0].fetch_add(1, Ordering::Relaxed);
+                        SEGMENT_STATS[1].fetch_add((all - n) as u64, Ordering::Relaxed);
+                    }
                 }
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
@@ -4167,6 +4303,15 @@ fn late_line(frames: f64) {
             r[3] / 1000.0,
             r[4] / 1000.0,
         );
+        if land_segments() {
+            let s: Vec<f64> = SEGMENT_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            tracing::info!(
+                "landings cut at the first tells behind their flights per frame (VICTORY_LAND_SEGMENTS=1): {:.1}, leaving {:.1} \
+                 things of the line to the next landing",
+                s[0],
+                s[1],
+            );
+        }
         if fetch_parts() > 1 {
             let p: Vec<f64> = FETCH_PARTS_STATS.iter().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
@@ -5425,9 +5570,11 @@ impl Host {
                     }
                 }
                 let mut notes = land::Notes::default();
+                // (One list for the job's runs, not one each.)
+                let mut addressed: Vec<(usize, usize, usize)> = Vec::new();
                 for run in pieces[jobs[j].clone()].chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0)) {
-                    let addressed: Vec<(usize, usize, usize)> =
-                        run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)).collect();
+                    addressed.clear();
+                    addressed.extend(run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)));
                     // SAFETY: the mapping of the fetched bytes, `total` of
                     // them; the copy into it has run, and the next waits
                     // for this call.
@@ -5593,8 +5740,10 @@ impl Host {
             land::each(part_jobs.len(), &|j| {
                 let working = std::time::Instant::now();
                 let mut notes = land::Notes::default();
+                let mut addressed: Vec<(usize, usize, usize)> = Vec::new();
                 for run in pieces[part_jobs[j].clone()].chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0)) {
-                    let addressed: Vec<(usize, usize, usize)> = run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)).collect();
+                    addressed.clear();
+                    addressed.extend(run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)));
                     // SAFETY: the mapping of the fetched bytes; the copy of
                     // this part into it has run, and the next fetch waits for
                     // this call.
