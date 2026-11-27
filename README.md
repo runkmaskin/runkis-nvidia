@@ -39,6 +39,7 @@ The game starts at roughly 4–9 fps on the build this one began from. The bigge
 | Texture mip drop for textures 2048 px and larger | less pressure on 8 GB of VRAM; 1 % low 6 → 7.2 fps |
 | 6 memory-compare threads instead of 3, woken only when there is work | small CPU saving |
 | Big-compare thread split fix (from Yaekai) | a compare could wrap below zero and skip memory |
+| Render-target reserve 1.5 GB instead of 3 GB (`VICTORY_CARD_ROOM_FOR_TARGETS_MB=1536`) | twice the textures on the card (1.2 → 2.3 GB), far less texture churn, worst frame 0.7–1.2 s → 0.2 s |
 | Pool discard when free RAM is under 4 GB (from foxhound) | keeps a 32 GB PC from paging (one such PC ran at 4–5 fps with RAM full) |
 | Pipeline recording (`VICTORY_PIPELINE_BOOK=1`) | lets `-Warm` build every pipeline ahead of play |
 
