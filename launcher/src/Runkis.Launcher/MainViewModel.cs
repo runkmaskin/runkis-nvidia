@@ -125,6 +125,12 @@ public sealed class MainViewModel : Observable, IDisposable
     public BenchmarkViewModel Bench { get; }
     private string runTitle = "";
     public string RunTitle { get => runTitle; private set => Set(ref runTitle, value); }
+    /// <summary>The warm-up's progress, read from victory.exe's lines; null outside a warm-up.</summary>
+    private WarmProgress? warm;
+    private double? warmPercent;
+    /// <summary>0..100 while a warm-up's total is known, else null (the bar is hidden).</summary>
+    public double? WarmPercent { get => warmPercent; private set { if (Set(ref warmPercent, value)) Raise(nameof(WarmBarVisible)); } }
+    public bool WarmBarVisible => warmPercent != null;
 
     // ---------------------------------------------------------------- profile
     public ObservableCollection<string> ProfileNames { get; } = [];
@@ -353,6 +359,8 @@ public sealed class MainViewModel : Observable, IDisposable
             s.StateChanged += st => Application.Current.Dispatcher.BeginInvoke(() => OnSessionState(s, st));
             session = s;
             RunTitle = mode switch { RunMode.Warm => "Warm-up: building the pipeline cache", RunMode.Precompile => "Warm-up: translating shaders", _ => $"{GameName} · {SelectedStart?.Label}" };
+            warm = mode switch { RunMode.Warm => new WarmProgress(), RunMode.Precompile => new WarmProgress(settings.LastShaderTotal ?? 0), _ => null };
+            WarmPercent = warm?.Percent;
             s.Start();
             if (mode == RunMode.Play) Page = "Play";
         }
@@ -378,6 +386,7 @@ public sealed class MainViewModel : Observable, IDisposable
                 if (!ok && Problems.Count == 0)
                     Problems.Add(new Problem("exit", Severity.Error, "The run ended unexpectedly", s.ExitText ?? "", "See the log for the last lines before it ended.", ""));
                 foreach (var t in Tiles) t.Unknown("Not running");
+                WarmPercent = null;
                 // Warm up, second step: the pipelines earlier plays recorded, once the shaders are in the cache.
                 if (s.Plan.Mode == RunMode.Precompile && warmUpNext)
                 {
@@ -431,7 +440,24 @@ public sealed class MainViewModel : Observable, IDisposable
     {
         // Log lines in batches: one UI update per tick, not one per line.
         var added = 0;
-        while (pending.TryDequeue(out var l) && added < 2000) { LogLines.Add(l); added++; }
+        var moved = false;
+        while (pending.TryDequeue(out var l) && added < 2000)
+        {
+            LogLines.Add(l);
+            added++;
+            moved |= warm?.Take(l.Text) == true;
+        }
+        if (moved && warm != null && session != null)
+        {
+            var precompile = session.Plan.Mode == RunMode.Precompile;
+            RunTitle = (precompile ? "Translating shaders: " : "Building pipelines: ") + warm.Describe(precompile ? "shaders" : "pipelines");
+            WarmPercent = warm.Percent;
+            if (precompile && warm.FinishedTotal is long total && total != settings.LastShaderTotal)
+            {
+                settings.LastShaderTotal = total;
+                settings.Save();
+            }
+        }
         while (LogLines.Count > 20000) LogLines.RemoveAt(0);
         if (added > 0 && AutoScroll) LogAdded?.Invoke();
         session?.Flush();

@@ -63,7 +63,10 @@
               <Ellipse Width="9" Height="9" Fill="{Binding StateTone}" Margin="0,0,8,0"/>
               <TextBlock Text="{Binding State}" FontWeight="SemiBold"/>
             </StackPanel>
-            <TextBlock Text="{Binding RunTitle}" Style="{StaticResource Hint}" TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"/>
+            <TextBlock Text="{Binding RunTitle}" Style="{StaticResource Hint}" TextWrapping="Wrap"/>
+            <ProgressBar Height="6" Margin="0,8,0,0" Minimum="0" Maximum="100" Value="{Binding WarmPercent, Mode=OneWay, TargetNullValue=0}"
+                         Foreground="{StaticResource Accent}" Background="{StaticResource Line}" BorderThickness="0"
+                         Visibility="{Binding WarmBarVisible, Converter={StaticResource Vis}}"/>
           </StackPanel>
         </Border>
         <StackPanel>

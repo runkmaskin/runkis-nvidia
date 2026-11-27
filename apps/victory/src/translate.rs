@@ -426,7 +426,8 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
                     match victory_hle::modules::d3d12x::precompile(&bytes) {
                         Ok(_) => {
                             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                            if n.is_multiple_of(1000) {
+                            // (Often enough for the launcher's progress bar.)
+                            if n.is_multiple_of(250) {
                                 println!("{n} shaders in the cache, {:.0} s", started.elapsed().as_secs_f64());
                             }
                         }
