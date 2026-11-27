@@ -244,7 +244,10 @@ fn viewable(format: i32) -> Option<i32> {
 
 /// The address of a texture: the base its descriptor has.
 fn texture_address(texture: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> Option<u64> {
-    struct Slot(ID3D12DescriptorHeap, usize);
+    struct Slot(
+        #[allow(dead_code, reason = "keeps the heap alive: the address beside it is in it")] ID3D12DescriptorHeap,
+        usize,
+    );
     // SAFETY: a descriptor heap, used under the lock.
     unsafe impl Send for Slot {}
     static SLOT: Mutex<Option<Slot>> = Mutex::new(None);

@@ -2923,6 +2923,10 @@ struct Flight {
 }
 
 /// One thing in the line of what waits for the card, in order.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "most of the line is flights; a box would add an allocation per submission"
+)]
 enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
@@ -3149,7 +3153,7 @@ fn blame_stale(stale: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) 
 /// title memory read, took `us`.
 #[cfg(feature = "diagnostics")]
 fn blamed(why: usize, us: u64) {
-    let (named, refused) = std::mem::replace(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()), (None, ""));
+    let (named, refused) = std::mem::take(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()));
     let (key, at) = match (why, named) {
         (WHY_READ | WHY_STALE, Some(named)) => named,
         (WHY_READ, None) => (("a host copy of what a copy done on the card wrote", refused, 0, 0, 0), 0),
@@ -3979,6 +3983,8 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+// Only diagnostics builds keep device-removed reports; the tests run either way.
+#[cfg(any(feature = "diagnostics", test))]
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
@@ -8169,7 +8175,9 @@ fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)>
                 given[i] = part;
             }
             Touch::Part => part += 1,
-            Touch::Title | Touch::Nothing => {}
+            #[cfg(test)]
+            Touch::Title => {}
+            Touch::Nothing => {}
         }
     }
     spans.retain(|s| s.1 < s.2);
@@ -8351,7 +8359,8 @@ enum Touch {
     Refresh(usize, usize, usize),
     /// The copy is given to shaders.
     Write(usize),
-    /// Title memory is written.
+    /// Title memory is written. Only the tests make one now.
+    #[cfg(test)]
     Title,
     Nothing,
     /// Another part of the submission begins.
@@ -8377,6 +8386,7 @@ fn written_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize
                     span.2 = true;
                 }
             }
+            #[cfg(test)]
             Touch::Title => break,
             Touch::Nothing | Touch::Part => {}
         }
@@ -9719,13 +9729,9 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
-        self.present_over(texture, state, None, frame)
-    }
-
-    /// LOCAL (port of fxceless #1189): [`Self::present`], with a second
-    /// plane laid over `texture` if there is one (`crate::compose`): its
-    /// texture and its state, which it is left in.
+    /// LOCAL (port of fxceless #1189): with a second plane laid over
+    /// `texture` if there is one (`crate::compose`): its texture and its
+    /// state, which it is left in.
     pub(crate) fn present_over(
         &self,
         texture: &ID3D12Resource,

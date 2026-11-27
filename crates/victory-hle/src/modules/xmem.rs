@@ -1671,10 +1671,11 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
     let mut ok = true;
     for (op, done) in done {
         // (`VICTORY_POOL_DISCARD`) The page's old view is gone.
-        if op.had && done {
-            if let Some(old) = &op.old {
-                pool_discard::unshown(physical, old);
-            }
+        if op.had
+            && done
+            && let Some(old) = &op.old
+        {
+            pool_discard::unshown(physical, old);
         }
         match op.slice {
             Some(slice) if done => {

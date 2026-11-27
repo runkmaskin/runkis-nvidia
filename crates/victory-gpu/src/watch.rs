@@ -480,7 +480,7 @@ fn ask_early(every: std::time::Duration) {
                 idle = 0;
             }
             round += 1;
-            if round % 64 == 0 {
+            if round.is_multiple_of(64) {
                 hot.retain(|_, n| {
                     *n /= 2;
                     *n > 0
@@ -3025,7 +3025,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texback::remapped(at, len);
-    open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
+    open(&title_memory_changed(at, len), at, at.saturating_add(len));
 }
 
 /// The runtime is about to unmap title memory `[at, at + len)`: it is

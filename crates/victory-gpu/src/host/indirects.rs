@@ -12,6 +12,7 @@
 //! `VICTORY_D3D12_DRED=faults` and no data at all: nothing is noted.
 
 use std::collections::HashMap;
+#[cfg(feature = "diagnostics")]
 use std::sync::{Arc, Mutex};
 
 /// The kind of a direct mesh dispatch.
@@ -39,6 +40,7 @@ pub(crate) struct Indirects {
 }
 
 /// A list's, shared with the report's table of lists.
+#[cfg(feature = "diagnostics")]
 pub(crate) type Shared = Arc<Mutex<Indirects>>;
 
 impl Indirects {

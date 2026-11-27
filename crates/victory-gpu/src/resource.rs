@@ -101,7 +101,7 @@ pub(crate) struct ResourceDesc {
 #[cfg(windows)]
 impl ResourceDesc {
     /// The texture of this one's levels from `base` on.
-    fn from_level(&self, base: u32) -> ResourceDesc {
+    fn levels_from(&self, base: u32) -> ResourceDesc {
         let mut d = *self;
         if base > 0 {
             d.width = (d.width >> base).max(1);
@@ -1641,7 +1641,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let texture = match texture {
             Some(texture) => Some(texture),
-            None => host_texture(&r.desc.from_level(base), r.host.state, clear),
+            None => host_texture(&r.desc.levels_from(base), r.host.state, clear),
         };
         let Some(texture) = texture else {
             r.host.refused.store(true, Relaxed);
