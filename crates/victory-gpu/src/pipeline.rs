@@ -187,6 +187,22 @@ impl Shader {
     }
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+impl Shader {
+    /// The compute program's name as the container carries it (`CS_` and
+    /// what follows), for reports that must say which pass they found.
+    pub(crate) fn compute_name(&self) -> Option<String> {
+        let at = self.container.windows(3).position(|w| w == b"CS_")?;
+        let name: Vec<u8> = self.container[at..]
+            .iter()
+            .copied()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .take(96)
+            .collect();
+        String::from_utf8(name).ok()
+    }
+}
+
 #[cfg(windows)]
 impl Shader {
     /// The console programs of the container; `None` if they are not known.

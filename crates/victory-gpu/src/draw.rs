@@ -26,6 +26,9 @@ use crate::list::sets::RootView;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+/// DLSS evaluations recorded so far (`State::dlss_after`).
+static DLSS_EVALUATIONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -2780,6 +2783,247 @@ impl State {
         });
     }
 
+    /// With `VICTORY_TAAU_REPORT`: whether this dispatch (`groups`) or
+    /// draw (`None`: its first target is what it writes) is an upscaler's
+    /// (`crate::taau`), or a pass the switch names by shader hash, and if so
+    /// what each of its bindings holds, logged. The textures it binds are
+    /// noted for `VICTORY_DUMP_TARGETS`, so a listed frame saves them and
+    /// logs their values (motion vectors' range and sign, depth's near and
+    /// far).
+    #[cfg(feature = "diagnostics")]
+    fn upscaler_report(&self, p: &HostPipeline, groups: Option<[u32; 3]>) {
+        use crate::taau::{Access, Image};
+        use std::fmt::Write;
+        let compute = groups.is_some();
+        // The stage that reads the inputs: the compute program, or the pixel
+        // shader of a draw.
+        let Some(stage) = (if compute { p.stages.first() } else { p.stages.last() }) else { return };
+        let t = stage.translated();
+        let named = crate::taau::named(&stage.shader.hash);
+        let mut images = Vec::new();
+        // Every binding as text, and the title resource of each texture.
+        let mut lines = Vec::new();
+        let mut textures = Vec::new();
+        let described = |r: usize| {
+            let host = crate::resource::host_made(r as This)?;
+            // SAFETY: a live resource.
+            Some(unsafe { host.GetDesc() })
+        };
+        let (covered, group) = match groups {
+            Some(groups) => {
+                let group = t.threads.unwrap_or([1, 1, 1]);
+                ((groups[0].saturating_mul(group[0]), groups[1].saturating_mul(group[1])), (group[0], group[1]))
+            }
+            None => {
+                let Some(d) = self.targets.first().and_then(|&r| described(r)) else { return };
+                let size = (d.Width as u32, d.Height);
+                for (i, &r) in self.targets.iter().enumerate() {
+                    if let Some(d) = described(r) {
+                        let s = (d.Width as u32, d.Height);
+                        images.push(Image { access: Access::Written, slot: u8::MAX, offset: i as u32, size: s, format: d.Format.0 as u32 });
+                        lines.push(format!("render target {i}: resource {r:#x} {}x{} f{}", s.0, s.1, d.Format.0));
+                        textures.push(r);
+                    }
+                }
+                (size, (1, 1))
+            }
+        };
+        let roots = self.roots_ref(compute);
+        for u in t.used.iter().filter(|u| u.root == RootType::Table) {
+            let Some(Root::Table(table)) = roots.get(usize::from(u.slot)) else { continue };
+            let view = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4);
+            let at = format!("{:?} slot {} offset {}", u.kind, u.slot, u.table_offset_dwords);
+            match (u.kind, view) {
+                (ResourceType::Srv, Some(View::Shader(r, _))) | (ResourceType::Uav, Some(View::Unordered(r, ..))) => {
+                    let Some(d) = described(r) else {
+                        lines.push(format!("{at}: resource {r:#x}, a buffer or not made"));
+                        continue;
+                    };
+                    let access = if u.kind == ResourceType::Uav { Access::Written } else { Access::Read };
+                    let size = (d.Width as u32, d.Height);
+                    if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+                        images.push(Image { access, slot: u.slot, offset: u.table_offset_dwords, size, format: d.Format.0 as u32 });
+                        textures.push(r);
+                    }
+                    lines.push(format!(
+                        "{at}: resource {r:#x} {}x{} f{} dim {} mips {} {}",
+                        size.0,
+                        size.1,
+                        d.Format.0,
+                        d.Dimension.0,
+                        d.MipLevels,
+                        crate::taau::guess(d.Format.0 as u32)
+                    ));
+                }
+                (ResourceType::Cbv, Some(View::Constant(address, bytes))) => {
+                    lines.push(format!("{at}: constants at {address:#x}, {bytes} bytes"));
+                }
+                (_, other) => lines.push(format!("{at}: {:?}", other.map(|_| "another kind of view"))),
+            }
+        }
+        // A draw reads its inputs at a smaller size and writes its target:
+        // one input is enough there (a spatial upscale of the finished
+        // picture), so it is looked at as a pass with its target twice.
+        let shape = crate::taau::upscale_shape(covered, group, &images).or_else(|| {
+            let mut doubled = images.clone();
+            if !compute {
+                doubled.extend(images.iter().filter(|i| i.access == Access::Read).copied());
+            }
+            (!compute).then(|| crate::taau::upscale_shape(covered, group, &doubled)).flatten()
+        });
+        if shape.is_none() && !named {
+            return;
+        }
+        // In a captured frame a named pass's textures are dumped whether or not
+        // its report is due.
+        if named {
+            for &r in &textures {
+                crate::capture::note_target(r as This);
+            }
+        }
+        let Some(seen) = crate::taau::wanted(&stage.shader.hash) else { return };
+        let frame = crate::queue::presented() + 1;
+        // Well into play (600 frames of a pass the switch names): the next
+        // frame is saved as F9 saves one, with every target it draws when
+        // VICTORY_DUMP_TARGETS=1.
+        if seen == 600 && named {
+            crate::capture::capture_next(frame);
+        }
+        let what = match &shape {
+            Some(s) => format!("output {}x{} from {}x{} (x{:.3})", s.output.0, s.output.1, s.render.0, s.render.1, s.ratio),
+            None => "no upscaler's shape (named)".to_owned(),
+        };
+        let name = if compute { stage.shader.compute_name().unwrap_or_default() } else { "a draw".to_owned() };
+        let mut text = match groups {
+            Some(g) => format!(
+                "upscaler pass {} ({name}) at frame {frame}: {}x{}x{} groups of {:?}, {what}",
+                stage.shader.hash, g[0], g[1], g[2], t.threads
+            ),
+            None => format!("upscaler pass {} ({name}, pipeline {}) at frame {frame}: {what}", stage.shader.hash, p.name),
+        };
+        for line in &lines {
+            let _ = write!(text, "\n    {line}");
+        }
+        // The constant buffers' words: the jitter is a pair that moves each
+        // frame by less than a pixel.
+        for u in t.used.iter().filter(|u| u.kind == ResourceType::Cbv && u.root == RootType::Table) {
+            let Some(Root::Table(table)) = roots.get(usize::from(u.slot)) else { continue };
+            if let Some(View::Constant(address, bytes)) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) {
+                let words = crate::taau::words(address, bytes).unwrap_or_else(|| " (not readable)".to_owned());
+                let _ = write!(text, "\n    constants slot {} offset {}:{words}", u.slot, u.table_offset_dwords);
+            }
+        }
+        // Root constants too (a pass may get its jitter there).
+        for (slot, root) in roots.iter().enumerate() {
+            if let Root::Constants(v) = root {
+                let _ = write!(text, "\n    root constants slot {slot}: {:x?}", &v[..v.len().min(64)]);
+            }
+        }
+        tracing::info!("{text}");
+        for r in textures {
+            crate::capture::note_target(r as This);
+        }
+    }
+    /// LOCAL (`VICTORY_DLSS=1`): DLSS recorded right after
+    /// the title's pass `map` names, from that pass's inputs into its
+    /// output (`crate::dlss`). The title's own result is overwritten; what
+    /// else the pass wrote (its history, its statistics) stays the title's,
+    /// so the passes after it read what they always read. Whether it ran.
+    fn dlss_after(&mut self, list: &HostList, p: &HostPipeline, map: &crate::dlss::Map) -> bool {
+        use crate::dlss::{Frame, Image};
+        let Some(stage) = p.stages.first() else { return false };
+        if stage.shader.hash != map.hash {
+            return false;
+        }
+        let Some(host) = crate::host::host() else { return false };
+        let Ok(dlss) = crate::dlss::attach(&host.device) else { return false };
+        let roots = &self.compute;
+        let view_at = |(slot, offset): (u8, u32)| {
+            let Some(Root::Table(table)) = roots.get(usize::from(slot)) else { return None };
+            match crate::descriptor::view(table + u64::from(offset) * 4)? {
+                View::Shader(r, _) | View::Unordered(r, ..) => Some(r),
+                View::Constant(address, _) => Some(address as usize),
+                _ => None,
+            }
+        };
+        let (Some(colour), Some(depth), Some(motion), Some(output)) =
+            (view_at(map.colour), view_at(map.depth), view_at(map.motion), view_at(map.output))
+        else {
+            once!("DLSS: a binding of the title's pass is not there; the title's result is kept");
+            return false;
+        };
+        // The textures in the states DLSS reads and writes them in, through
+        // the list's own state tracking, so the title's next barriers start
+        // from where they are.
+        const READ: u32 = 0x40;
+        const WRITE: u32 = 0x8;
+        for (r, state) in [(colour, READ), (depth, READ), (motion, READ), (output, WRITE)] {
+            crate::list::ensure_state(list, r as This, state);
+        }
+        let host_of = |r: usize| crate::resource::host_resource(r as This);
+        let (Some(c), Some(d), Some(m), Some(o)) = (host_of(colour), host_of(depth), host_of(motion), host_of(output)) else {
+            return false;
+        };
+        // SAFETY: live resources.
+        let (cd, od) = unsafe { (c.GetDesc(), o.GetDesc()) };
+        let render = (cd.Width as u32, cd.Height);
+        let out = (od.Width as u32, od.Height);
+        // The jitter as the title gave it to its pass this frame.
+        let jitter = view_at(map.jitter.0)
+            .and_then(|address| crate::dlss::two_floats(address + map.jitter.1 * 4))
+            .map_or([0.0; 2], |words| crate::dlss::jitter_pixels(words, map.jitter_scale, render));
+        let motion_scale = crate::dlss::motion_scale_set().unwrap_or(if map.motion_per_pixel {
+            [1.0 / render.0 as f32, 1.0 / render.1 as f32]
+        } else {
+            [1.0, 1.0]
+        });
+        let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        let frame = Frame {
+            colour: Image { resource: c, state: read },
+            depth: Image { resource: d, state: read },
+            motion: Image { resource: m, state: read },
+            output: Image { resource: o, state: D3D12_RESOURCE_STATE_UNORDERED_ACCESS },
+            render,
+            out,
+            jitter,
+            motion_scale,
+            depth_inverted: map.depth_inverted,
+            hdr: true,
+            reset: false,
+            // A number of its own per evaluation: Streamline refuses a second
+            // set of constants for a frame number it has seen, and the title
+            // records the pass twice in some frames (and ahead of the frame
+            // counter).
+            index: DLSS_EVALUATIONS.fetch_add(1, Ordering::Relaxed),
+            preset: crate::dlss::preset_set(),
+        };
+        // The title's result must be written before DLSS overwrites it.
+        let barrier = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() };
+        // SAFETY: an open list; the barrier names no resource.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        match dlss.evaluate(&list.list, &frame) {
+            Ok(()) => {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    let mode = crate::dlss::mode_for(out.0 as f32 / render.0.max(1) as f32);
+                    let range = dlss.optimal(mode, out);
+                    tracing::info!(?render, ?out, ?mode, ?range, "DLSS: the title's upscaler result is replaced by DLSS Super Resolution (range: optimal, least, most render size)");
+                });
+                // DLSS set its own heaps, root signature and pipeline: the
+                // next draw or dispatch sets the title's again.
+                self.host_pipeline = 0;
+                self.host_roots = [0; 2];
+                self.host_heaps = [0; 2];
+                self.sets.forget();
+                true
+            }
+            Err(why) => {
+                once!(why = %why, "DLSS: evaluation failed; the title's result is kept");
+                false
+            }
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
@@ -2855,6 +3099,15 @@ impl State {
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        if crate::taau::report_on() {
+            self.upscaler_report(p, Some([x, y, z]));
+        }
+        if crate::dlss::on()
+            && let Some(map) = &crate::dlss::PASS
+        {
+            self.dlss_after(list, p, map);
+        }
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -3856,6 +4109,14 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            // Whole-screen passes only (a triangle or two rectangles' worth).
+            if crate::taau::report_on()
+                && count <= 6
+                && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+            {
+                self.upscaler_report(p, None);
+            }
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list

@@ -928,6 +928,11 @@ fn create() -> windows::core::Result<Host> {
         // Before anything is made with it (`VICTORY_RECORD`).
         #[cfg(feature = "diagnostics")]
         crate::replay::record::from_env(&device);
+        // LOCAL: with `VICTORY_DLSS=1`, NVIDIA Streamline is given this
+        // device (`crate::dlss`): whether DLSS runs on this card is logged.
+        if crate::dlss::on() {
+            let _ = crate::dlss::attach(&device);
+        }
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
         // for minutes after pipelines were made or loaded) is switched off.

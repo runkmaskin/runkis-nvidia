@@ -124,6 +124,17 @@ fn world_on() -> bool {
 /// LOCAL: the frame F9 asked for ([`frame_drew`]); `u64::MAX`: none.
 static KEY_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
+/// Captures the frame after `frame` as F9 does (`crate::taau`'s report asks
+/// for one well into play), unless a later one is asked for already.
+pub(crate) fn capture_next(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let asked = KEY_FRAME.load(Relaxed);
+    if folder().is_some() && (asked == u64::MAX || asked <= frame) {
+        KEY_FRAME.store(frame + 1, Relaxed);
+        tracing::info!(frame = frame + 1, "this frame is captured (the upscaler report asked)");
+    }
+}
+
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -653,6 +664,21 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     let above = values.iter().filter(|v| v.iter().any(|c| c.is_finite() && *c > low)).count();
     let nonzero_percent = above as f32 * 100.0 / values.len().max(1) as f32;
     tracing::info!(format, low, high, nonzero_percent, "target values");
+    // Per channel of two-channel and single-channel float or depth
+    // formats: lowest, highest, mean, and the share exactly 0 and exactly 1.
+    // Motion vectors show their scale (pixels or a fraction of the screen)
+    // and sign this way; depth shows which end the sky is at (0 when the
+    // depth is reversed).
+    if matches!(format, 15..=16 | 19..=22 | 33..=38 | 39..=41 | 53..=56) {
+        let n = values.len().max(1) as f64;
+        for c in 0..if matches!(format, 15..=16 | 33..=38) { 2 } else { 1 } {
+            let all = values.iter().map(|v| v[c]).filter(|v| v.is_finite());
+            let (lo, hi, sum) = all.fold((f32::MAX, f32::MIN, 0f64), |(l, h, s), v| (l.min(v), h.max(v), s + f64::from(v)));
+            let zeros = values.iter().filter(|v| v[c] == 0.0).count() as f64 * 100.0 / n;
+            let ones = values.iter().filter(|v| v[c] == 1.0).count() as f64 * 100.0 / n;
+            tracing::info!(format, channel = c, lowest = lo, highest = hi, mean = sum / n, zero_percent = zeros, one_percent = ones, "target channel values");
+        }
+    }
     // Small float colour targets (the 1x1 luminance and exposure targets):
     // every texel's four channels as numbers. The picture has no alpha and
     // eight bits a channel.

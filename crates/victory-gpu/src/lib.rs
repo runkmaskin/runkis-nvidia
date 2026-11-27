@@ -34,6 +34,9 @@ pub mod device;
 // LOCAL: VICTORY_WINDOW, VICTORY_WINDOW_SIZE, VICTORY_MONITOR.
 #[cfg(windows)]
 pub mod display;
+// NVIDIA DLSS through Streamline (VICTORY_DLSS=1, off; docs/dlss.md).
+#[cfg(windows)]
+mod dlss;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
@@ -93,6 +96,8 @@ mod shadow;
 mod tiles;
 pub mod signature;
 mod switch;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod taau;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod ab;
 #[cfg(windows)]
