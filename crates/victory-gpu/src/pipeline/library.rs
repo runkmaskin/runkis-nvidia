@@ -430,11 +430,16 @@ struct Earlier {
 /// when a save has replaced it.
 const GENERATION_FILE: &str = "host-pipelines.generation";
 
-/// Whether the library in `dir` was saved by a run of another translator,
-/// or by a build from before [`GENERATION_FILE`] (none is beside it).
+/// Whether the library in `dir` was saved by a run of another translator of
+/// these generations. A library with no [`GENERATION_FILE`] beside it is an
+/// older build's, which may share the folder and still play: it is kept
+/// whole and added to, as builds before generations did, never cut down to
+/// what this run uses (the older build then compiled again all it had).
 fn outdated(dir: &std::path::Path) -> bool {
-    let saved = std::fs::read_to_string(dir.join(GENERATION_FILE)).unwrap_or_default();
-    saved.trim() != crate::shader_cache::generation()
+    match std::fs::read_to_string(dir.join(GENERATION_FILE)) {
+        Ok(saved) => saved.trim() != crate::shader_cache::generation(),
+        Err(_) => false,
+    }
 }
 
 // SAFETY: D3D12 objects are free-threaded, and the library synchronises

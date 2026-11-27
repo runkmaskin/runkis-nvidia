@@ -51,15 +51,22 @@ impl Cache {
         let named = !generation.is_empty()
             && generation.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
         anyhow::ensure!(named, "a cache generation named {generation:?}");
-        Cache::open(root.into().join(format!("{GENERATION}{generation}")))
+        let cache = Cache::open(root.into().join(format!("{GENERATION}{generation}")))?;
+        // Each run marks its generation used, so a sweep by a build of
+        // another translator leaves it while it is still played with.
+        let _ = std::fs::write(cache.root.join(USED), b"");
+        Ok(cache)
     }
 
     /// For a cache of [`Cache::open_generation`]: removes the other
-    /// generations beside it, the entries of the layout from before
-    /// generations (two hex digits as a folder, beside them), and staging
-    /// files in this generation that processes left as they ended. Nothing
-    /// of this generation that a process may still write is touched: a
-    /// staging file is removed only when no process of its number runs.
+    /// generations beside it that no run has used for [`UNUSED_FOR`], and
+    /// staging files in this generation that processes left as they ended.
+    /// The layout from before generations (two hex digits as a folder) is
+    /// left alone: older builds sharing the folder read it, and removing it
+    /// made them translate every shader again (with another build's runs in
+    /// between, at every start). Nothing of this generation that a process
+    /// may still write is touched: a staging file is removed only when no
+    /// process of its number runs.
     pub fn sweep(&self) -> Swept {
         let mut swept = Swept::default();
         let ours = self.root.file_name();
@@ -73,9 +80,10 @@ impl Cache {
         for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
             let name = entry.file_name();
             let text = name.to_string_lossy();
-            let old_generation = text.starts_with(GENERATION) && Some(name.as_os_str()) != ours;
-            let flat = text.len() == 2 && text.bytes().all(|b| b.is_ascii_hexdigit());
-            if (old_generation || flat) && entry.file_type().is_ok_and(|t| t.is_dir()) {
+            let old_generation = text.starts_with(GENERATION)
+                && Some(name.as_os_str()) != ours
+                && unused(&entry.path());
+            if old_generation && entry.file_type().is_ok_and(|t| t.is_dir()) {
                 let (files, bytes) = measure(&entry.path());
                 if std::fs::remove_dir_all(entry.path()).is_ok() {
                     swept.generations += u64::from(old_generation);
@@ -135,6 +143,23 @@ impl Cache {
 
 /// The start of a generation's folder name ([`Cache::open_generation`]).
 const GENERATION: &str = "gen-";
+
+/// The file a run of a generation writes on opening it ([`Cache::open_generation`]).
+const USED: &str = "last-used";
+
+/// How long a generation of another translator is kept unused.
+const UNUSED_FOR: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+
+/// Whether no run has opened the generation in `dir` for [`UNUSED_FOR`]
+/// (its mark, else the folder itself, from before marks).
+fn unused(dir: &Path) -> bool {
+    let at = std::fs::metadata(dir.join(USED))
+        .or_else(|_| std::fs::metadata(dir))
+        .and_then(|m| m.modified());
+    at.ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age >= UNUSED_FOR)
+}
 
 /// What [`Cache::sweep`] removed: generations, files and their bytes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -370,14 +395,27 @@ mod tests {
         let own = dir.join(format!(".tmp-{}-0", std::process::id()));
         std::fs::write(&dead, b"left by a crash").unwrap();
         std::fs::write(&own, b"being written").unwrap();
+        // A generation used lately stays (another build may still play with it).
+        let first = cache.sweep();
+        assert_eq!(first.generations, 0, "{first:?}");
+        assert!(root.join("gen-old").exists());
+        assert!(!dead.exists(), "a dead staging file goes at once");
+        // Unused for longer than UNUSED_FOR: it goes.
+        let long_ago = std::time::SystemTime::now() - UNUSED_FOR - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(root.join("gen-old").join(USED))
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
         let swept = cache.sweep();
         assert_eq!(swept.generations, 1);
-        // The old entry, the flat one and the dead staging file.
-        assert_eq!(swept.files, 3, "{swept:?}");
+        // The old entry and its mark.
+        assert_eq!(swept.files, 2, "{swept:?}");
         assert!(swept.bytes > 0);
         assert!(!root.join("gen-old").exists());
-        assert!(!flat.exists());
-        assert!(!dead.exists());
+        // The layout from before generations is older builds' cache: kept.
+        assert!(flat.join("cdef").exists());
         assert!(own.exists(), "a staging file of a running process stays");
         assert!(root.join("notes.txt").exists());
         assert_eq!(std::fs::read(&kept).unwrap(), b"CURRENT ENTRY");
