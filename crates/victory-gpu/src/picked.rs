@@ -117,7 +117,7 @@ fn ask(shader: Arc<crate::pipeline::Shader>) {
     static ASKS: OnceLock<Mutex<Sender<Arc<crate::pipeline::Shader>>>> = OnceLock::new();
     let asks = ASKS.get_or_init(|| {
         let (send, asks) = channel::<Arc<crate::pipeline::Shader>>();
-        let _ = std::thread::Builder::new().name("victory-picked".into()).spawn(move || {
+        let _ = crate::named::spawn("victory-picked", move || {
             use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
             // SAFETY: this thread's own.
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };

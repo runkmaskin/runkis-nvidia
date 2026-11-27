@@ -81,6 +81,10 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod carded;
+#[cfg(windows)]
+mod named;
+#[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
 mod tiles;
@@ -99,6 +103,8 @@ pub mod titlewrite;
 mod upload;
 #[cfg(windows)]
 mod watch;
+#[cfg(all(windows, test))]
+mod watch_bench;
 #[cfg(windows)]
 mod texback;
 #[cfg(windows)]

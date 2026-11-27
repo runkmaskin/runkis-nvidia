@@ -676,7 +676,7 @@ fn started() -> bool {
                 crate::host::fail(format_args!("the thread that prepares and sends submissions panicked"));
             }
         };
-        match std::thread::Builder::new().name("victory-submit".into()).spawn(worker) {
+        match crate::named::spawn("victory-submit", worker) {
             Ok(_) => {
                 tracing::info!(
                     frames = frames_most(),

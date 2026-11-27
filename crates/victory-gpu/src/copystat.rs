@@ -745,7 +745,7 @@ fn log_memory() {
     static LINES: AtomicU64 = AtomicU64::new(0);
     static WALKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if memory_map() && LINES.fetch_add(1, Relaxed) % 6 == 5 && !WALKING.swap(true, Relaxed) {
-        let walk = std::thread::Builder::new().name("victory-memory-map".into()).spawn(|| {
+        let walk = crate::named::spawn("victory-memory-map", || {
             log_memory_map();
             WALKING.store(false, Relaxed);
         });

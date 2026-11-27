@@ -484,7 +484,7 @@ pub(crate) fn check() {
         return;
     }
     ONCE.call_once(|| {
-        let _ = std::thread::Builder::new().name("slot check".into()).spawn(walk);
+        let _ = crate::named::spawn("slot check", walk);
     });
 }
 

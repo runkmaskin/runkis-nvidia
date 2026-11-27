@@ -242,10 +242,55 @@ thread_local! {
     static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Who asks the kernel ([`kernel_written`]), for the frame line: a run of
+/// ranges asked together ([`ask_run`]), a range left alone by that
+/// ([`ask_rest`]), a range on its own ([`writes`]).
+#[derive(Clone, Copy)]
+enum Asker {
+    Run = 13,
+    Rest = 14,
+    One = 15,
+}
+
+/// Diagnostics: the page ranges the kernel was asked about in this frame,
+/// in order and joined, and the frame: what an asking walks again of them is
+/// counted ([`ASKS`] 16, in KiB). A page asked twice in a frame is not
+/// wasted if the title wrote it between: this says how much there is.
+#[cfg(feature = "diagnostics")]
+static ASKED_IN_FRAME: Mutex<(u64, Vec<(usize, usize)>)> = Mutex::new((0, Vec::new()));
+
+/// Of pages `[first, last)`, how many `ranges` (in order, joined) hold; and
+/// `ranges` with them, still in order and joined.
+#[cfg(feature = "diagnostics")]
+fn asked_again(ranges: &mut Vec<(usize, usize)>, first: usize, last: usize) -> usize {
+    let from = ranges.partition_point(|r| r.1 < first);
+    let to = ranges.partition_point(|r| r.0 <= last);
+    let again: usize = ranges[from..to].iter().map(|r| r.1.min(last).saturating_sub(r.0.max(first))).sum();
+    if from < to {
+        let joined = (ranges[from].0.min(first), ranges[to - 1].1.max(last));
+        ranges.splice(from..to, [joined]);
+    } else {
+        ranges.insert(from, (first, last));
+    }
+    again
+}
+
 /// The pages of `[first, last)` the kernel says were written since it was
 /// last asked, in order, each once, with their written parts; `None` if the range is not write-watched
 /// memory of one reservation. The caller holds the range ([`Asking`]).
-fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
+fn kernel_written(first: usize, last: usize, _asker: Asker) -> Option<Vec<(usize, u16)>> {
+    #[cfg(feature = "diagnostics")]
+    {
+        tally(_asker as usize, 1);
+        let mut asked = ASKED_IN_FRAME.lock().unwrap_or_else(|e| e.into_inner());
+        let frame = crate::frame::current();
+        if asked.0 != frame {
+            *asked = (frame, Vec::new());
+        }
+        let again = asked_again(&mut asked.1, first, last);
+        drop(asked);
+        tally(16, (again * (PAGE >> 10)) as u64);
+    }
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     FOUND.with(|found| {
@@ -302,7 +347,7 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
-const AHEAD_GAP: usize = (8 << 20) / PAGE;
+pub(crate) const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
@@ -331,20 +376,8 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     }
     let _all = Asking::hold_all();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
-    let mut i = 0;
-    while i < pieces.len() {
-        let first = pieces[i].0;
-        let mut last = pieces[i].1;
-        let mut k = i + 1;
-        while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
-            && last.max(pieces[k].1) - first <= AHEAD_MAX
-        {
-            last = last.max(pieces[k].1);
-            k += 1;
-        }
-        ask_run(&pieces[i..k], &mut asked, &mut written);
-        i = k;
+    for run in runs_of(&pieces, ahead_gap()) {
+        ask_run(&pieces[run], &mut asked, &mut written);
     }
     note_hot(&written);
     let mut j = journal_mut();
@@ -354,6 +387,43 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     for (page, parts) in written {
         j.note(page, parts, now);
     }
+}
+
+/// The pieces (page ranges in order) asked together, as index ranges of
+/// `pieces`: a piece joins the run before it if it starts within `gap` pages
+/// of the run's end and the run stays within [`AHEAD_MAX`].
+pub(crate) fn runs_of(pieces: &[(usize, usize)], gap: usize) -> Vec<std::ops::Range<usize>> {
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < pieces.len() {
+        let first = pieces[i].0;
+        let mut last = pieces[i].1;
+        let mut k = i + 1;
+        while k < pieces.len() && pieces[k].0 <= last + gap && last.max(pieces[k].1) - first <= AHEAD_MAX {
+            last = last.max(pieces[k].1);
+            k += 1;
+        }
+        runs.push(i..k);
+        i = k;
+    }
+    runs
+}
+
+/// The pages between ranges asked together at most ([`runs_of`]):
+/// `VICTORY_AHEAD_GAP_KIB` (default 8192, [`AHEAD_GAP`], as before).
+///
+/// Measured on a 5500X3D (`crate::watch_bench`): a kernel call costs about
+/// 1.4 us beside the pages it walks, and walking costs about 0.6 us a MiB of
+/// unwritten memory. A gap of 8 MiB walked costs some 5 us to save one call;
+/// the line where the two cost the same is about 2 MiB. The pages walked
+/// between are asked and noted as any others (nothing written is missed);
+/// what changes is which asking finds a page in a gap written. For an A/B
+/// run, off (the default) unchanged.
+fn ahead_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        std::env::var("VICTORY_AHEAD_GAP_KIB").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(AHEAD_GAP, |kib| kib * 1024 / PAGE)
+    })
 }
 
 /// Whether the kernel would refuse to ask about `[start, end)` for its view
@@ -458,7 +528,7 @@ fn note_hot(written: &[(usize, u16)]) {
     drop(hot);
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
-        let _ = std::thread::Builder::new().name("victory-ask-early".into()).spawn(move || ask_early(every));
+        let _ = crate::named::spawn("victory-ask-early", move || ask_early(every));
     });
 }
 
@@ -573,7 +643,7 @@ fn ask_rest(ranges: &[(usize, usize)]) {
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
         if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
-            && let Some(pages) = kernel_written(first, last)
+            && let Some(pages) = kernel_written(first, last, Asker::Rest)
         {
             written.extend(pages);
             ahead.push((first, last));
@@ -646,7 +716,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
-    if let Some(pages) = kernel_written(first, last) {
+    if let Some(pages) = kernel_written(first, last, Asker::Run) {
         written.extend(pages);
         asked.push((first, last));
         return;
@@ -714,7 +784,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         port6_count(P6_NOT_ASKED, 1);
     }
     let refused = protected || viewed;
-    let pages = match if refused { None } else { kernel_written(first, last) } {
+    let pages = match if refused { None } else { kernel_written(first, last, Asker::One) } {
         Some(pages) => pages,
         None => {
             guards_asked = true;
@@ -728,7 +798,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 // Not a view after all (other memory there now): forgotten as
                 // one, and the kernel asked as before.
                 (first..last).for_each(|block| VIEWS.clear(block));
-                if let Some(pages) = kernel_written(first, last) {
+                if let Some(pages) = kernel_written(first, last, Asker::One) {
                     guards_asked = false;
                     written = Some(pages);
                 }
@@ -1566,9 +1636,11 @@ fn published(start: usize, end: usize) -> bool {
 /// opened by ourselves; nanoseconds waiting for the guards' lock and
 /// nanoseconds of changing protections (all threads); questions to Windows
 /// about holes; kernel askings refused; nanoseconds in kernel askings; the
-/// 4 KiB pages they found written.
+/// 4 KiB pages they found written; kernel askings by who asked ([`Asker`]:
+/// runs, ranges left alone by runs, ranges on their own); KiB of kernel
+/// askings that an earlier asking of the same frame walked too.
 #[cfg(feature = "diagnostics")]
-static ASKS: [std::sync::atomic::AtomicU64; 13] = [const { std::sync::atomic::AtomicU64::new(0) }; 13];
+static ASKS: [std::sync::atomic::AtomicU64; 17] = [const { std::sync::atomic::AtomicU64::new(0) }; 17];
 
 #[cfg(feature = "diagnostics")]
 fn tally(what: usize, n: u64) {
@@ -1577,7 +1649,7 @@ fn tally(what: usize, n: u64) {
 
 /// [`ASKS`], taken.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn asks() -> [u64; 13] {
+pub(crate) fn asks() -> [u64; 17] {
     std::array::from_fn(|i| ASKS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 

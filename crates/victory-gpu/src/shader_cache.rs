@@ -39,7 +39,7 @@ pub fn use_shader_cache(dir: PathBuf) {
         Ok(cache) => {
             let sweeping = cache.clone();
             let _ = CACHE.set(cache);
-            let swept = std::thread::Builder::new().name("victory-cache-sweep".into()).spawn(move || {
+            let swept = crate::named::spawn("victory-cache-sweep", move || {
                 let swept = sweeping.sweep();
                 if swept.files > 0 {
                     tracing::info!(

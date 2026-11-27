@@ -188,7 +188,7 @@ pub(crate) fn sent(taken: Taken, flown: u64, frame: u64) {
     static THREAD: OnceLock<Option<mpsc::Sender<Job>>> = OnceLock::new();
     let Some(to) = THREAD.get_or_init(|| {
         let (to, from) = mpsc::channel::<Job>();
-        std::thread::Builder::new().name("pop watch".into()).spawn(move || watch(&from)).ok().map(|_| to)
+        crate::named::spawn("pop watch", move || watch(&from)).ok().map(|_| to)
     }) else {
         return;
     };

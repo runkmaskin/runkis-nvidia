@@ -106,9 +106,7 @@ impl Drop for Awake {
 pub(crate) fn start(device: &ID3D12Device, wanted: impl Fn() -> bool + Send + 'static) -> Option<Awake> {
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let (device, ended) = (device.clone(), stop.clone());
-    let thread = std::thread::Builder::new()
-        .name("victory-card-awake".into())
-        .spawn(move || {
+    let thread = crate::named::spawn("victory-card-awake", move || {
             if let Err(e) = run(&device, &wanted, &ended) {
                 tracing::warn!(error = %e, "the card is not kept awake");
             }

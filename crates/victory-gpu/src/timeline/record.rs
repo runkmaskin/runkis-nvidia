@@ -533,7 +533,7 @@ pub(crate) fn presented() {
         stage.before = Some(super::report::Threads::now());
         tracing::info!(file = %asked.file.display(), frames = asked.frames, "the timeline begins (VICTORY_TIMELINE)");
         begin();
-        if std::thread::Builder::new().name("victory-sample".into()).spawn(sample).is_err() {
+        if crate::named::spawn("victory-sample", sample).is_err() {
             tracing::warn!("the timeline is without samples of the title's threads");
         }
         frame();
@@ -566,7 +566,7 @@ pub(crate) fn presented() {
         (stage.began, stage.frames, stage.writing) = (false, 0, false);
         stage.made += 1;
     };
-    if std::thread::Builder::new().name("victory-timeline".into()).spawn(write).is_err() {
+    if crate::named::spawn("victory-timeline", write).is_err() {
         tracing::warn!("no thread to write the timeline");
     }
 }

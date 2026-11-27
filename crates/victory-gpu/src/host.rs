@@ -3522,36 +3522,73 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 /// through the lists' refreshes for copies shaders may be writing.
 static UNDER_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+thread_local! {
+    /// [`Under`]'s table, kept from one submission to the next: it grew
+    /// from nothing to some 4,500 copies each time (the profile of 2026-11-27:
+    /// 1.4 % of the submitting thread growing tables).
+    static UNDER_PLACES: std::cell::RefCell<crate::fx::Map<usize, Option<usize>>> = std::cell::RefCell::default();
+}
+
+/// [`stale_under_flights`]' gathering: per copy that shaders may be writing,
+/// the span of what is refreshed of it (a flush brings that much up to date
+/// at most), in the order of each copy's first refresh. The table of where
+/// each copy is in it is looked up only, so its order reaches nothing; several
+/// refreshes of one copy on end are looked up once.
+struct Under<'a, S> {
+    spans: Vec<(std::sync::Arc<S>, usize, usize)>,
+    places: &'a mut crate::fx::Map<usize, Option<usize>>,
+    /// The last copy looked up and its place. (No copy is at address 0.)
+    last: (usize, Option<usize>),
+}
+
+impl<'a, S> Under<'a, S> {
+    fn new(places: &'a mut crate::fx::Map<usize, Option<usize>>) -> Under<'a, S> {
+        places.clear();
+        Under { spans: Vec::new(), places, last: (0, None) }
+    }
+
+    /// A refresh of `len` bytes at `address` of `shadow`; `pending` says
+    /// whether shaders may be writing it, asked once per copy.
+    fn step(&mut self, shadow: &std::sync::Arc<S>, address: usize, len: usize, pending: impl FnOnce(&S) -> bool) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let place = if key == self.last.0 {
+            self.last.1
+        } else {
+            let spans = &mut self.spans;
+            let place = *self.places.entry(key).or_insert_with(|| {
+                pending(shadow).then(|| {
+                    spans.push((shadow.clone(), address, address + len));
+                    spans.len() - 1
+                })
+            });
+            self.last = (key, place);
+            place
+        };
+        if let Some(i) = place {
+            let s = &mut self.spans[i];
+            (s.1, s.2) = (s.1.min(address), s.2.max(address + len));
+        }
+    }
+}
+
 /// With flights in the air, after the submission's write-watch asking:
 /// whether `runs` refresh a range of a host copy that a flight's shaders
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
 fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
-    use std::sync::Arc;
-    // Per copy, the span of what is refreshed (a flush brings that much
-    // up to date at most).
-    let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-    // Where each copy is in it, if shaders may be writing it (none begins to
-    // while this runs): a frame has 20,000 refreshes of some 4,500 copies.
-    let mut places: ByCopy<Option<usize>> = ByCopy::default();
     let scanning = std::time::Instant::now();
-    for list in runs {
-        for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step {
-                let place = places.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| {
-                    shadow.writes_pending().then(|| {
-                        spans.push((shadow.clone(), *address, *address + *len));
-                        spans.len() - 1
-                    })
-                });
-                if let Some(i) = *place {
-                    let s = &mut spans[i];
-                    (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+    let mut spans = UNDER_PLACES.with_borrow_mut(|places| {
+        let mut under = Under::new(places);
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::Refresh(shadow, address, len) = step {
+                    under.step(shadow, *address, *len, |shadow| shadow.writes_pending());
                 }
             }
         }
-    }
+        under.spans
+    });
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -3978,7 +4015,7 @@ fn late_helper() {
 fn late_threads() {
     static HELPER: std::sync::Once = std::sync::Once::new();
     HELPER.call_once(|| {
-        if let Err(e) = std::thread::Builder::new().name("victory-late-wait".into()).spawn(late_helper) {
+        if let Err(e) = crate::named::spawn("victory-late-wait", late_helper) {
             tracing::warn!(error = %e, "no thread to settle submissions sent ahead: they are settled by the calls that follow");
         }
         tracing::info!(
@@ -3988,7 +4025,7 @@ fn late_threads() {
         );
         if relay() {
             // Without it nothing would ever land.
-            if let Err(e) = std::thread::Builder::new().name("victory-relay".into()).spawn(relay_worker) {
+            if let Err(e) = crate::named::spawn("victory-relay", relay_worker) {
                 fail(format_args!("no thread to land submissions sent ahead (VICTORY_RELAY=1): {e}"));
             }
             tracing::info!(
@@ -4535,8 +4572,9 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
     // Where each copy is in it, and the ranges seen: dispatches declare the
     // same ranges thousands of times a frame.
-    let mut places: ByCopy<usize> = ByCopy::default();
-    let mut seen = std::collections::HashSet::<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>::default();
+    // (Looked up only: their order reaches nothing.)
+    let mut places: crate::fx::Map<usize, usize> = Default::default();
+    let mut seen: crate::fx::Set<(usize, usize, usize)> = Default::default();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::GpuWrite(shadow, address, len) = step {
@@ -4872,7 +4910,7 @@ impl Host {
             })
             .as_ref()?;
         WATCH.call_once(|| {
-            if let Err(e) = std::thread::Builder::new().name("victory-card-clock".into()).spawn(move || card_clock_watch(clock)) {
+            if let Err(e) = crate::named::spawn("victory-card-clock", move || card_clock_watch(clock)) {
                 tracing::warn!(error = %e, "no thread for the card's clock: the frame line's idle times stay 0");
             }
         });
@@ -6518,7 +6556,7 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        let mut batch = KeptBatch::take();
         #[cfg(feature = "diagnostics")]
         let split = Split::begin();
         // The time a settle of flights takes inside this preparing: the
@@ -8454,7 +8492,8 @@ fn split_line(frames: f64) {
     );
     tracing::info!(
         "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB ({:.1} ms, {:.0} pages of 4 KiB found \
-         written, {:.0} askings refused); {:.0} questions about holes; view ranges: {:.0} answered by their \
+         written, {:.0} askings refused; {:.0} of runs asked together, {:.0} of ranges those left alone, {:.0} of ranges on their \
+         own; {:.0} MB of them walked again in the same frame); {:.0} questions about holes; view ranges: {:.0} answered by their \
          bits, {:.0} by the guards whole, {:.0} block by block; {:.0} blocks made read-only, {:.0} opened by ourselves; {:.1} ms \
          waiting for the guards, {:.1} ms changing protections; pages taken for the card: {:.1} MB compared, {:.1} MB of them \
          as they were, {:.1} MB to go up in {:.0} runs (VICTORY_SEND_CHANGED)",
@@ -8463,6 +8502,10 @@ fn split_line(frames: f64) {
         a[11] / 1e6,
         a[12],
         a[10],
+        a[13],
+        a[14],
+        a[15],
+        a[16] / 1024.0,
         a[9],
         a[2],
         a[3],
@@ -8547,10 +8590,10 @@ struct Batch {
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
     /// comparisons a frame.
-    index: ByCopy<usize>,
+    index: crate::fx::Map<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write,
     /// or due to be.
-    textures: std::collections::HashSet<usize>,
+    textures: crate::fx::Set<usize>,
     /// Those due ([`Batch::refresh_textures`]).
     due: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// What copies at their place in the submission's lists put into title
@@ -8560,11 +8603,82 @@ struct Batch {
     fills: Vec<(usize, usize, usize)>,
     /// Copies (by address) brought up to date ahead of the steps, and the
     /// range (from, to) ([`Batch::refresh_ahead`]).
-    ahead: ByCopy<(usize, usize)>,
+    ahead: crate::fx::Map<usize, (usize, usize)>,
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
 }
+
+thread_local! {
+    /// The last submission's [`Batch`], emptied, with the room its tables and
+    /// lists grew to: each submission's grew from nothing (the profile of
+    /// 2026-11-27: 1.4 % of the submitting thread growing tables). The tables
+    /// are looked up only; their order reaches nothing.
+    static BATCH: std::cell::Cell<Option<Batch>> = const { std::cell::Cell::new(None) };
+}
+
+/// A submission's [`Batch`], given back to [`BATCH`] emptied when dropped.
+struct KeptBatch(Batch);
+
+impl KeptBatch {
+    /// An empty batch, in the room the last one on this thread left.
+    fn take() -> KeptBatch {
+        KeptBatch(BATCH.try_with(std::cell::Cell::take).ok().flatten().unwrap_or_default())
+    }
+}
+
+impl std::ops::Deref for KeptBatch {
+    type Target = Batch;
+    fn deref(&self) -> &Batch {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KeptBatch {
+    fn deref_mut(&mut self) -> &mut Batch {
+        &mut self.0
+    }
+}
+
+impl Drop for KeptBatch {
+    /// What a batch still holds here was left undone before as well: it is
+    /// dropped, and the room is kept.
+    fn drop(&mut self) {
+        let mut kept = std::mem::take(&mut self.0);
+        kept.empty();
+        // (Not while the thread ends: then it is let go.)
+        let _ = BATCH.try_with(|b| b.set(Some(kept)));
+    }
+}
+
+impl Batch {
+    /// Everything taken out; the room stays.
+    fn empty(&mut self) {
+        self.refreshes.clear();
+        self.index.clear();
+        self.textures.clear();
+        self.due.clear();
+        self.placed.clear();
+        self.fills.clear();
+        self.ahead.clear();
+        self.front = false;
+    }
+
+    /// Whether it holds nothing (what [`KeptBatch::take`] gives).
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.refreshes.is_empty()
+            && self.index.is_empty()
+            && self.textures.is_empty()
+            && self.due.is_empty()
+            && self.placed.is_empty()
+            && self.fills.is_empty()
+            && self.ahead.is_empty()
+            && !self.front
+    }
+}
+
+
 
 /// Whether the copies that a submission's shaders write are brought up to
 /// date together, on several threads, ahead of its steps
@@ -8603,7 +8717,7 @@ fn refresh_front() -> bool {
 /// stands: around what they write. What a later part refreshes is the
 /// title's bytes of before either.
 fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)> {
-    let mut at: ByCopy<usize> = ByCopy::default();
+    let mut at: crate::fx::Map<usize, usize> = Default::default();
     // (Copy, from, to), in the order they come, and the part that gave it to
     // shaders last.
     let mut spans: Vec<(usize, usize, usize)> = Vec::new();
@@ -8669,11 +8783,11 @@ struct ListFront {
 fn list_front(steps: &[Step], textures: bool) -> ListFront {
     let mut shadows: Vec<(usize, std::sync::Arc<crate::shadow::Shadow>)> = Vec::new();
     let mut staged: Vec<std::sync::Arc<crate::texture::Staging>> = Vec::new();
-    let mut refreshed: ByCopy<()> = ByCopy::default();
+    let mut refreshed: crate::fx::Set<usize> = Default::default();
     let touches = steps.iter().filter_map(|step| match step {
         Step::Refresh(shadow, from, len) => {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
-            if refreshed.insert(key, ()).is_none() {
+            if refreshed.insert(key) {
                 shadows.push((key, shadow.clone()));
             }
             Some(Touch::Refresh(key, *from, *from + *len))
@@ -8692,7 +8806,7 @@ fn list_front(steps: &[Step], textures: bool) -> ListFront {
 /// Touches of one list, per copy in the order of their first touch: the span
 /// of its refreshes before its first write, and whether it is written.
 fn fold_touches(touches: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize, bool)> {
-    let mut at: ByCopy<usize> = ByCopy::default();
+    let mut at: crate::fx::Map<usize, usize> = Default::default();
     let mut copies: Vec<(usize, usize, usize, bool)> = Vec::new();
     let mut last = usize::MAX;
     for touch in touches {
@@ -8725,7 +8839,7 @@ fn fold_touches(touches: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usiz
 /// new part of the submission beginning at each of `parts`: the same spans,
 /// in the same order (`front_tests`).
 fn join_keys<'a>(lists: impl Iterator<Item = &'a [(usize, usize, usize, bool)]>, parts: &[usize]) -> Vec<(usize, usize, usize)> {
-    let mut at: ByCopy<usize> = ByCopy::default();
+    let mut at: crate::fx::Map<usize, usize> = Default::default();
     let mut spans: Vec<(usize, usize, usize)> = Vec::new();
     let mut given: Vec<u32> = Vec::new();
     let mut part = 1;
@@ -8755,7 +8869,7 @@ fn join_keys<'a>(lists: impl Iterator<Item = &'a [(usize, usize, usize, bool)]>,
 
 /// [`join_keys`] of the lists' parts, with their copies.
 fn join_fronts(fronts: &[ListFront], parts: &[usize]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
-    let mut shadows: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
+    let mut shadows: crate::fx::Map<usize, std::sync::Arc<crate::shadow::Shadow>> = Default::default();
     for front in fronts {
         for (key, shadow) in &front.shadows {
             shadows.entry(*key).or_insert_with(|| shadow.clone());
@@ -9076,7 +9190,7 @@ impl Batch {
             self.refresh_spans(spans, due, planning);
             return;
         }
-        let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
+        let mut copies: crate::fx::Map<usize, std::sync::Arc<crate::shadow::Shadow>> = Default::default();
         let mut touches = Vec::new();
         for (n, list) in runs.iter().enumerate() {
             if parts.contains(&n) {
@@ -9153,6 +9267,12 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        if many {
+            // Copies in place copy nothing ([`crate::shadow::Shadow::nothing_new`]
+            // says so first of all): not handed to the threads. (After the
+            // asking above, which they were part of.)
+            drop_in_place(&mut spans);
+        }
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
@@ -9183,7 +9303,7 @@ impl Batch {
     /// Before the steps of `runs` ([`ahead_of_writes`]); copies and fills
     /// that `taken` names are not done on the CPU.
     fn refresh_ahead(&mut self, runs: &[&HostList], taken: impl Fn(&HostList, usize) -> bool) {
-        let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
+        let mut copies: crate::fx::Map<usize, std::sync::Arc<crate::shadow::Shadow>> = Default::default();
         let mut touches = Vec::new();
         'steps: for list in runs {
             for (i, step) in list.deferred().copies.iter().enumerate() {
@@ -9331,10 +9451,15 @@ impl Batch {
             FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
             if light {
                 // A number to a free thread, not a job to each copy.
-                let refreshes = std::mem::take(&mut self.refreshes);
+                let mut refreshes = std::mem::take(&mut self.refreshes);
+                // (Decided on all of them, before those in place go.)
+                let looked = refreshes.len() > FEW || beside;
+                if looked {
+                    drop_in_place(&mut refreshes);
+                }
                 crate::shadow::wide_each(refreshes.len(), move |i| {
                     let (shadow, from, to) = &refreshes[i];
-                    if (refreshes.len() > FEW || beside) && shadow.nothing_new(*from, *to - *from) {
+                    if looked && shadow.nothing_new(*from, *to - *from) {
                         #[cfg(feature = "diagnostics")]
                         FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                         return;
@@ -9360,6 +9485,18 @@ impl Batch {
             crate::watch::ask_ahead_done();
         }
     }
+}
+
+/// Takes out of a flush's refreshes those of copies in place, which copy
+/// nothing and know it without asking anything (`Shadow::nothing_new`'s first
+/// answer): counted as known to copy nothing, as the threads would have.
+/// Their order, and the others', stays.
+fn drop_in_place(refreshes: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) {
+    #[cfg(feature = "diagnostics")]
+    let all = refreshes.len();
+    refreshes.retain(|r| !r.0.in_place());
+    #[cfg(feature = "diagnostics")]
+    FLUSHES[2].fetch_add((all - refreshes.len()) as u64, Ordering::Relaxed);
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -10193,9 +10330,7 @@ impl Meter {
         static SETTER: std::sync::Once = std::sync::Once::new();
         *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some((hwnd.0 as usize, text));
         SETTER.call_once(|| {
-            let _ = std::thread::Builder::new()
-                .name("victory-caption".into())
-                .spawn(|| {
+            let _ = crate::named::spawn("victory-caption", || {
                     loop {
                         let next = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
                         match next {
@@ -10881,9 +11016,7 @@ pub(crate) fn transition(
 /// A window of the given client size, owned by its own message thread.
 fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("victory-window".into())
-        .spawn(move || {
+    crate::named::spawn("victory-window", move || {
             let made = make_window(width, height);
             let ok = made.is_ok();
             let _ = sender.send(made.map(|h| h.0 as usize));
@@ -11791,3 +11924,124 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+
+#[cfg(test)]
+mod under_tests {
+    use super::{AddressHash, Batch, KeptBatch, Under};
+    use std::sync::Arc;
+
+    type ByCopy<T> = std::collections::HashMap<usize, T, std::hash::BuildHasherDefault<AddressHash>>;
+
+    /// `stale_under_flights`' gathering as it was: a new table each time, every
+    /// refresh looked up.
+    fn old(steps: &[(Arc<u32>, usize, usize)], pending: impl Fn(&u32) -> bool) -> Vec<(Arc<u32>, usize, usize)> {
+        let mut spans: Vec<(Arc<u32>, usize, usize)> = Vec::new();
+        let mut places: ByCopy<Option<usize>> = ByCopy::default();
+        for (shadow, address, len) in steps {
+            let place = places.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| {
+                pending(shadow).then(|| {
+                    spans.push((shadow.clone(), *address, *address + *len));
+                    spans.len() - 1
+                })
+            });
+            if let Some(i) = *place {
+                let s = &mut spans[i];
+                (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+            }
+        }
+        spans
+    }
+
+    fn steps(seed: &mut u64, copies: &[Arc<u32>], n: usize) -> Vec<(Arc<u32>, usize, usize)> {
+        let mut next = |m: usize| {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (*seed >> 33) as usize % m
+        };
+        let mut out = Vec::with_capacity(n);
+        let mut at = 0;
+        for _ in 0..n {
+            // Most come several times on end, as a list's refreshes do.
+            if next(3) == 0 {
+                at = next(copies.len());
+            }
+            out.push((copies[at].clone(), next(1 << 20), 1 + next(4096)));
+        }
+        out
+    }
+
+    /// Fixed-seed refreshes: the same spans, copy for copy, in the same order,
+    /// with the table kept from one submission to the next.
+    #[test]
+    fn the_kept_table_gathers_what_a_new_one_did() {
+        let mut seed = 0x0dd5_eed5;
+        let mut places = crate::fx::Map::default();
+        for round in 0..300 {
+            let copies: Vec<Arc<u32>> = (0..1 + round % 50).map(|i| Arc::new(i as u32)).collect();
+            let all = steps(&mut seed, &copies, round * 7 % 900);
+            let pending = |v: &u32| (v + round as u32).is_multiple_of(3);
+            let want = old(&all, pending);
+            let mut under = Under::new(&mut places);
+            for (shadow, address, len) in &all {
+                under.step(shadow, *address, *len, pending);
+            }
+            let got = under.spans;
+            assert_eq!(got.len(), want.len());
+            for (g, w) in got.iter().zip(&want) {
+                assert!(Arc::ptr_eq(&g.0, &w.0) && (g.1, g.2) == (w.1, w.2), "round {round}");
+            }
+        }
+    }
+
+    /// The micro-benchmark (`cargo test --release -p victory-gpu --lib -- --nocapture
+    /// host::under_tests::what_gathering_costs`): 20,000 refreshes of 4,500 copies,
+    /// as in a frame's big submission.
+    #[test]
+    fn what_gathering_costs() {
+        let rounds = if cfg!(debug_assertions) { 3 } else { 100 };
+        let copies: Vec<Arc<u32>> = (0..4500).map(Arc::new).collect();
+        let mut seed = 99;
+        let all = steps(&mut seed, &copies, 20_000);
+        let pending = |v: &u32| v.is_multiple_of(5);
+        let (mut was, mut now) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let mut places = crate::fx::Map::default();
+        for _ in 0..rounds {
+            let began = std::time::Instant::now();
+            let want = old(&all, pending);
+            was += began.elapsed();
+            let began = std::time::Instant::now();
+            let mut under = Under::new(&mut places);
+            for (shadow, address, len) in &all {
+                under.step(shadow, *address, *len, pending);
+            }
+            let got = under.spans;
+            now += began.elapsed();
+            assert_eq!(got.len(), want.len());
+        }
+        println!(
+            "20,000 refreshes of 4,500 copies gathered: a new table {:.0} us, the kept table {:.0} us",
+            was.as_micros() as f64 / rounds as f64,
+            now.as_micros() as f64 / rounds as f64
+        );
+    }
+
+    /// A submission's batch is given back empty, with its room.
+    #[test]
+    fn a_kept_batch_comes_back_empty() {
+        std::thread::spawn(|| {
+            let shadow_free = KeptBatch::take();
+            assert!(shadow_free.is_empty());
+            let mut batch = shadow_free;
+            batch.fills.extend((0..1000).map(|i| (i, i, i)));
+            batch.index.extend((0..1000).map(|i| (i, i)));
+            batch.textures.insert(7);
+            batch.front = true;
+            drop(batch);
+            let again: KeptBatch = KeptBatch::take();
+            assert!(again.is_empty());
+            assert!(again.fills.capacity() >= 1000 && again.index.capacity() >= 1000);
+            let _: &Batch = &again;
+        })
+        .join()
+        .unwrap();
+    }
+}

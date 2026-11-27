@@ -179,7 +179,7 @@ fn workers() -> Option<&'static ID3D12CommandQueue> {
             };
             for n in 0..2 {
                 let worker = Worker::new(&host.device, queue.clone()).ok()?;
-                std::thread::Builder::new().name(format!("uploads ahead {n}")).spawn(move || worker.work()).ok()?;
+                crate::named::spawn(format!("uploads ahead {n}"), move || worker.work()).ok()?;
             }
             Some(Queue(queue))
         })

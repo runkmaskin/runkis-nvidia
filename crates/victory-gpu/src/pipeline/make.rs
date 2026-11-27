@@ -573,9 +573,7 @@ fn workers() -> bool {
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
             let screens_only = i >= workers;
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(move || {
+            let spawned = crate::named::spawn(format!("victory-pipelines-{i}"), move || {
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself
                     // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).

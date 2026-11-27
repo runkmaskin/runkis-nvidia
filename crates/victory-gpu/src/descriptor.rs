@@ -275,29 +275,18 @@ fn watch_round(mine: u64) {
         std::sync::OnceLock::new();
     let send = WATCH.get_or_init(|| {
         let (send, rounds) = std::sync::mpsc::channel::<(u64, std::time::Instant)>();
-        std::thread::Builder::new()
-            .name("victory-heap-sync-watch".into())
-            .spawn(move || {
-                for (mine, when) in rounds {
-                    let due = when + std::time::Duration::from_millis(400);
-                    loop {
-                        if SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner()).1 >= mine {
-                            break;
-                        }
-                        let now = std::time::Instant::now();
-                        if now >= due {
-                            tell_fence(mine);
-                            if SYNC_FORCED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-                                tracing::warn!(round = mine, "the heaps' records took over 400 ms: the card was let go on without them");
-                            }
-                            break;
-                        }
-                        std::thread::sleep((due - now).min(std::time::Duration::from_millis(5)));
+        crate::named::spawn("victory-heap-sync-watch", move || {
+            for (mine, when) in rounds {
+                if !round_done_by(&SYNC_ROUNDS, mine, when + std::time::Duration::from_millis(400)) {
+                    tell_fence(mine);
+                    if SYNC_FORCED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                        tracing::warn!(round = mine, "the heaps' records took over 400 ms: the card was let go on without them");
                     }
                 }
-            })
-            .ok()
-            .map(|_| std::sync::Mutex::new(send))
+            }
+        })
+        .ok()
+        .map(|_| std::sync::Mutex::new(send))
     });
     match send {
         Some(send) => {
@@ -308,6 +297,34 @@ fn watch_round(mine: u64) {
         // No watch: the card is not held at all.
         None => tell_fence(mine),
     }
+}
+
+/// Whether round `mine` of `rounds` (asked, done) is done by `due`: waits on
+/// the condition the round's end tells (the watch slept 5 ms at a time and
+/// looked, before). The same answer, without the polls.
+#[cfg(windows)]
+fn round_done_by(rounds: &(std::sync::Mutex<(u64, u64)>, std::sync::Condvar), mine: u64, due: std::time::Instant) -> bool {
+    let mut r = rounds.0.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if r.1 >= mine {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        if now >= due {
+            return false;
+        }
+        r = rounds.1.wait_timeout(r, due - now).unwrap_or_else(|e| e.into_inner()).0;
+    }
+}
+
+/// The priority the heaps' records thread is given, if any: above normal with
+/// `VICTORY_POOL_PRIORITY=1`, as the submitting thread that waits for it at
+/// the end of each submission (10.2 ms a frame, at most 25.5, in the profile
+/// of 2026-11-27, where it ran at normal beside the title's threads); off,
+/// none: normal, as before.
+#[cfg(windows)]
+fn heap_sync_priority(raised: bool) -> Option<i32> {
+    raised.then_some(windows_sys::Win32::System::Threading::THREAD_PRIORITY_ABOVE_NORMAL)
 }
 
 /// [`sync_heaps`], begun; done when it is dropped (with [`sync_aside`]), or
@@ -324,7 +341,12 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     static STARTED: std::sync::Once = std::sync::Once::new();
     static THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     STARTED.call_once(|| {
-        let made = std::thread::Builder::new().name("victory-heap-sync".into()).spawn(|| {
+        let made = crate::named::spawn("victory-heap-sync", || {
+            if let Some(priority) = heap_sync_priority(crate::land::raised()) {
+                use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+                // SAFETY: this thread's own priority.
+                unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+            }
             crate::cores::keep_on_fast_cores("victory-heap-sync");
             let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
             /// A round is over, however it ends.
@@ -2334,5 +2356,45 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod heap_sync_tests {
+    use super::{heap_sync_priority, round_done_by};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// Raised only with the switch, and to what the submitting thread has.
+    #[test]
+    fn the_records_thread_is_raised_only_with_the_pool_switch() {
+        use windows_sys::Win32::System::Threading::THREAD_PRIORITY_ABOVE_NORMAL;
+        assert_eq!(heap_sync_priority(true), Some(THREAD_PRIORITY_ABOVE_NORMAL));
+        assert_eq!(heap_sync_priority(false), None);
+    }
+
+    /// The watch's answer is the one its 5 ms polls gave: done if the round
+    /// ends before the time, not done if it does not; and it wakes when the
+    /// round ends, not at its next poll.
+    #[test]
+    fn the_watch_waits_for_the_round_or_its_time() {
+        let rounds = Arc::new((Mutex::new((3u64, 2u64)), Condvar::new()));
+        // Done already.
+        assert!(round_done_by(&rounds, 2, Instant::now()));
+        // Not done in time.
+        let began = Instant::now();
+        assert!(!round_done_by(&rounds, 3, began + Duration::from_millis(30)));
+        assert!(began.elapsed() >= Duration::from_millis(30));
+        // Done meanwhile: told by the round's end.
+        let other = rounds.clone();
+        let ender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            other.0.lock().unwrap().1 = 3;
+            other.1.notify_all();
+        });
+        let began = Instant::now();
+        assert!(round_done_by(&rounds, 3, began + Duration::from_secs(5)));
+        assert!(began.elapsed() < Duration::from_secs(4));
+        ender.join().unwrap();
     }
 }

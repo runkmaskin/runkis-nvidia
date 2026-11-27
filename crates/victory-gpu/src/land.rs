@@ -67,8 +67,9 @@ fn threads() -> usize {
 /// eight list threads, and 16 DirectStorage workers, on 16 processors. A
 /// helper the scheduler leaves waiting keeps the whole batch waiting. The
 /// views' pool (`victory-views`) is what the title's list threads wait for:
-/// it stays as it is. For a game A/B run; untested in game.
-fn raised() -> bool {
+/// it stays as it is. For a game A/B run; untested in game. The heaps'
+/// records thread (`crate::descriptor`) is raised with them.
+pub(crate) fn raised() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_PRIORITY").is_some_and(|v| v == "1"))
 }
@@ -314,7 +315,7 @@ impl Pool {
         }));
         for i in 1..threads {
             // (A helper that is not there is only missed.)
-            let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || {
+            let _ = crate::named::spawn(format!("{name}-{i}"), move || {
                 if let Some(priority) = priority {
                     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
                     // SAFETY: this thread's own priority.

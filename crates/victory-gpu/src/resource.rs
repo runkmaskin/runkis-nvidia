@@ -2041,7 +2041,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
         );
         WALKING.store(false, Relaxed);
     };
-    if std::thread::Builder::new().name("card accounting".into()).spawn(walk).is_err() {
+    if crate::named::spawn("card accounting", walk).is_err() {
         WALKING.store(false, Relaxed);
     }
 }

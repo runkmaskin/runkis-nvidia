@@ -71,6 +71,9 @@ pub(crate) fn keep_many_on_fast_cores(what: &str) {
 
 fn ask(what: &str, from: u32) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
+    // Every thread of ours that comes here is named for profilers too,
+    // whoever spawned it (the list threads among them).
+    crate::named::describe_current();
     if stage() < from {
         return;
     }

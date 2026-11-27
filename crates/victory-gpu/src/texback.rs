@@ -339,7 +339,7 @@ fn writer() -> Option<&'static Writer> {
     *WRITER.get_or_init(|| {
         let writer: &'static Writer =
             Box::leak(Box::new(Writer { waiting: Mutex::new(std::collections::HashMap::new()), more: std::sync::Condvar::new() }));
-        let started = std::thread::Builder::new().name("texture read-backs".into()).spawn(move || loop {
+        let started = crate::named::spawn("texture read-backs", move || loop {
             let batch: Vec<Landing> = {
                 let mut waiting = writer.waiting.lock().unwrap_or_else(|e| e.into_inner());
                 while waiting.is_empty() {
