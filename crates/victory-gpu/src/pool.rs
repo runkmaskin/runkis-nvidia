@@ -349,6 +349,11 @@ pub(crate) fn texture_room() -> u64 {
     (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
 }
 
+/// Bytes of the texture blocks that textures hold now, for the memory line.
+pub(crate) fn texture_held() -> u64 {
+    HELD.load(Ordering::Relaxed)
+}
+
 /// For the memory lines: blocks of textures and of staging buffers, in MiB.
 pub(crate) fn memory() -> [u64; 2] {
     [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]

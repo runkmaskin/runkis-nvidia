@@ -2103,8 +2103,17 @@ pub(crate) fn let_go_idle() {
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
-    let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    let mut went = Went::default();
     let all = textures();
+    // Copies of placed textures whose title memory is gone go first, room
+    // on the card or not (`VICTORY_TEXTURE_UNMAPPED_GO=1`).
+    if unmapped_go() {
+        static FROM_UNMAPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let from = FROM_UNMAPPED.load(Relaxed);
+        let picked = all.range(from..).take(UNMAPPED_LOOK).copied();
+        let last = let_go_unmapped(picked, |used| crate::host::long_ago(used, UNMAPPED_IDLE_MS, IDLE_FRAMES), UNMAPPED_ASKS, &mut went);
+        FROM_UNMAPPED.store(last.map_or(0, |at| at + 1), Relaxed);
+    }
     // With a limit, the longest idle first.
     let mut by_age: Vec<(u64, usize)> = Vec::new();
     if most != u64::MAX {
@@ -2136,7 +2145,7 @@ pub(crate) fn let_go_idle() {
     let mut looked = 0;
     let began = std::time::Instant::now();
     for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
-        if bytes >= most {
+        if went.bytes >= most {
             break;
         }
         looked += 1;
@@ -2151,47 +2160,166 @@ pub(crate) fn let_go_idle() {
         if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
             continue;
         }
-        let gone = {
-            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
-            });
-            if idle {
-                // Under the lock: the next use must not find the staging
-                // state of the texture let go (it says "uploaded").
-                crate::texture::unstage(at as This);
-                r.host.wanted.store(u32::MAX, Relaxed);
-                made.take()
-            } else {
-                None
-            }
-        };
-        if let Some((host, _)) = gone {
-            r.host.gone.store(true, Relaxed);
-            KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
-            went += 1;
-            bytes += host.bytes;
-            if first.is_none() {
-                first = Some(at);
-            }
-            crate::host::retire(host);
+        if let Some((host, _)) = take_idle(r, at, |used| crate::host::long_ago(used, idle_ms, IDLE_FRAMES)) {
+            went.add(r, at, host);
         }
     }
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
-    if went > 0 {
+    if went.n > 0 {
         crate::host::trail(|| {
             format!(
-                "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
-                bytes >> 10,
-                first.unwrap_or(0)
+                "sweep: {} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
+                went.n,
+                went.bytes >> 10,
+                went.first.unwrap_or(0)
             )
         });
     }
+}
+
+/// What a sweep let go: how many host copies, their bytes, and the first.
+#[cfg(windows)]
+#[derive(Default)]
+struct Went {
+    n: u64,
+    bytes: u64,
+    first: Option<usize>,
+}
+
+#[cfg(windows)]
+impl Went {
+    /// Counts `host`, the copy of title texture `r` at `at` just taken out,
+    /// and retires it.
+    fn add(&mut self, r: &Resource, at: usize, host: std::sync::Arc<HostTexture>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        r.host.gone.store(true, Relaxed);
+        KINDS[2].fetch_add(1, Relaxed);
+        KINDS[3].fetch_add(host.bytes, Relaxed);
+        self.n += 1;
+        self.bytes += host.bytes;
+        if self.first.is_none() {
+            self.first = Some(at);
+        }
+        crate::host::retire(host);
+    }
+}
+
+/// Takes the host copy of title texture `r` (at `at`) out, if its last use
+/// is idle by `idle` and only `r` holds it: no list, no slot.
+#[cfg(windows)]
+fn take_idle(r: &Resource, at: usize, idle: impl Fn(u64) -> bool) -> Option<Made> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    let idle = made.as_ref().is_some_and(|(host, _)| {
+        idle(r.host.used.load(Relaxed))
+            && std::sync::Arc::strong_count(host) == 1
+            && crate::host::references(&host.texture) == 1
+    });
+    if idle {
+        // Under the lock: the next use must not find the staging
+        // state of the texture let go (it says "uploaded").
+        crate::texture::unstage(at as This);
+        r.host.wanted.store(u32::MAX, Relaxed);
+        made.take()
+    } else {
+        None
+    }
+}
+
+/// `VICTORY_TEXTURE_UNMAPPED_GO=1`: the sweep lets go of the host copies of
+/// placed textures whose title memory is not mapped any more after
+/// [`UNMAPPED_IDLE_MS`], whatever room the card has. Off by default: they
+/// stay for ten minutes while the card has room, as before. The title has
+/// given such a texture up, and the card's copy is dead weight in the
+/// system's commit charge: 2,312 MB of them after six minutes of a run on a
+/// 32 GB PC that had 1,388 MB left to commit (measured in game,
+/// 2026-11-27). A texture whose memory comes back is made and uploaded
+/// anew from it, as after any sweep.
+#[cfg(windows)]
+fn unmapped_go() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_TEXTURE_UNMAPPED_GO"))
+}
+
+/// How long such a copy must have been idle: as under pressure on the card.
+#[cfg(windows)]
+const UNMAPPED_IDLE_MS: u64 = 2_500;
+/// Textures looked at in one sweep, and questions to Windows about their
+/// memory at most (a sweep is once a second, on the submitting thread).
+#[cfg(windows)]
+const UNMAPPED_LOOK: usize = 4096;
+#[cfg(windows)]
+const UNMAPPED_ASKS: u32 = 512;
+
+/// Host copies [`let_go_unmapped`] let go since the start, and their bytes.
+#[cfg(windows)]
+pub(crate) static UNMAPPED_GONE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether no byte of `[at, at + len)` is mapped, by its first and last
+/// page: a streamed texture's smaller levels lie at its start and are
+/// mapped first and unmapped last.
+#[cfg(windows)]
+fn unmapped(at: *const u8, len: u64, asks: &mut u32) -> bool {
+    *asks = asks.saturating_sub(1);
+    if crate::texture::committed(at, 1) {
+        return false;
+    }
+    if len <= 4096 {
+        return true;
+    }
+    *asks = asks.saturating_sub(1);
+    // SAFETY: only the address is formed; nothing is read through it here.
+    !crate::texture::committed(unsafe { at.add(len as usize - 1) }, 1)
+}
+
+/// Lets go of the host copies of the placed textures among `candidates`
+/// that the title fills, whose title memory is not mapped, and that are
+/// idle by `idle` and held by nothing else ([`take_idle`]). Stops when
+/// `asks` questions about memory are used up. Returns the last texture
+/// looked at if it stopped early, `None` if it went through them all.
+#[cfg(windows)]
+fn let_go_unmapped(
+    candidates: impl Iterator<Item = usize>,
+    idle: impl Fn(u64) -> bool,
+    mut asks: u32,
+    went: &mut Went,
+) -> Option<usize> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut looked = 0;
+    let mut last = None;
+    for at in candidates {
+        if asks == 0 {
+            return last;
+        }
+        looked += 1;
+        last = Some(at);
+        // SAFETY: a texture leaves the table before it is freed, under the
+        // lock the caller holds (`Drop for Resource`).
+        let r = unsafe { &*(at as *const Resource) };
+        let used = r.host.used.load(Relaxed);
+        if used == 0
+            || !r.host.placed.load(Relaxed)
+            || !fills(&r.desc)
+            || !idle(used)
+            || crate::texture::host_wrote(at)
+            || r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+        {
+            continue;
+        }
+        let len = footprint(&r.desc).map_or(0, |f| f.size);
+        if !unmapped(r.data().cast_const(), len, &mut asks) {
+            continue;
+        }
+        if let Some((host, _)) = take_idle(r, at, &idle) {
+            UNMAPPED_GONE[0].fetch_add(1, Relaxed);
+            UNMAPPED_GONE[1].fetch_add(host.bytes, Relaxed);
+            went.add(r, at, host);
+        }
+    }
+    // Fewer than a whole look: the next one starts from the beginning.
+    if looked < UNMAPPED_LOOK { None } else { last }
 }
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
@@ -4637,5 +4765,387 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// Bytes from a fixed seed (xorshift).
+    #[cfg(windows)]
+    fn seeded(seed: u64, len: usize) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// The first and the last page say whether a texture's memory is gone:
+    /// all of it decommitted, or only its start or its end.
+    #[cfg(windows)]
+    #[test]
+    fn memory_is_unmapped_only_with_its_first_and_last_page_gone() {
+        use windows_sys::Win32::System::Memory::*;
+        const SIZE: usize = 0x4_0000;
+        // SAFETY: a private reservation of our own, only asked about.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            let mut asks = 100;
+            assert!(unmapped(base, SIZE as u64, &mut asks), "nothing committed");
+            assert_eq!(asks, 98, "two questions");
+            assert_eq!(VirtualAlloc(base.cast(), 0x1000, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            assert!(!unmapped(base, SIZE as u64, &mut asks), "its first page is there");
+            assert_eq!(asks, 97, "one question");
+            assert_ne!(VirtualFree(base.cast(), 0x1000, MEM_DECOMMIT), 0);
+            let end = base.add(SIZE - 0x1000);
+            assert_eq!(VirtualAlloc(end.cast(), 0x1000, MEM_COMMIT, PAGE_READWRITE), end.cast());
+            assert!(!unmapped(base, SIZE as u64, &mut asks), "its last page is there");
+            assert!(unmapped(base, 0x1000, &mut asks), "a texture of one page");
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// A title's queue, allocator and list, and the buffer its copies out
+    /// of textures of `footprint` go into.
+    #[cfg(windows)]
+    struct TitleRig {
+        queue: This,
+        allocator: This,
+        list: This,
+        target: This,
+        footprint: PlacedFootprint,
+    }
+
+    #[cfg(windows)]
+    #[repr(C)]
+    struct Location {
+        resource: This,
+        kind: u32,
+        footprint: PlacedFootprint,
+    }
+
+    #[cfg(windows)]
+    impl TitleRig {
+        /// For textures of four-halves texels (format 10).
+        fn new(width: u32, height: u32) -> TitleRig {
+            let null = std::ptr::null();
+            let queue_iid = guid(0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]);
+            let allocator_iid = guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
+            let list_iid = guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
+            let (mut queue, mut allocator, mut list, mut target) = (null, null, null, null);
+            assert_eq!(crate::queue::create(null, [0u32; 4].as_ptr().cast(), &queue_iid, &mut queue), S_OK);
+            assert_eq!(crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator), S_OK);
+            assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list), S_OK);
+            assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+            let footprint = PlacedFootprint { offset: 0, format: 10, width, height, depth: 1, row_pitch: width * 8 };
+            let bytes = u64::from(width * 8 * height);
+            assert_eq!(create_committed(null, &PROPERTIES, 0, &buffer(bytes), 0, null.cast(), &RESOURCE_IIDS[0], &mut target), S_OK);
+            TitleRig { queue, allocator, list, target, footprint }
+        }
+
+        /// The title resets its list, as at each frame: what the last one
+        /// named is let go once its submission has run.
+        fn reset(&self) {
+            assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(self.allocator, 0x40)(self.allocator), S_OK);
+            let reset = slot::<extern "system" fn(This, This, This) -> HRESULT>(self.list, 0x50);
+            assert_eq!(reset(self.list, self.allocator, std::ptr::null()), S_OK);
+        }
+
+        /// A list that copies out of `textures` (each uploads its title
+        /// memory first), sent on the title's queue.
+        fn copy_out(&self, textures: &[This]) {
+            type Copy = extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+            self.reset();
+            for &source in textures {
+                let from = Location { resource: source, kind: 0, footprint: PlacedFootprint { offset: 0, ..self.footprint } };
+                let to = Location { resource: self.target, kind: 1, footprint: self.footprint };
+                slot::<Copy>(self.list, 0x80)(self.list, &to, 0, 0, 0, &from, std::ptr::null());
+            }
+            assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(self.list, 0x48)(self.list), S_OK);
+            slot::<extern "system" fn(This, u32, *const This)>(self.queue, 0x50)(self.queue, 1, &self.list);
+        }
+
+        /// The title's list reset and closed with nothing in it.
+        fn done(&self) {
+            self.reset();
+            assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(self.list, 0x48)(self.list), S_OK);
+        }
+    }
+
+    /// An empty host submission, which settles what ran before it.
+    #[cfg(windows)]
+    fn settle(host: &crate::host::Host) {
+        let empty = host.new_list().expect("a list");
+        empty.close();
+        host.execute(&[&empty]);
+    }
+
+    /// `VICTORY_TEXTURE_UNMAPPED_GO`: the same bytes reach the card on every
+    /// path a placed texture takes. A title list's copy out of the texture
+    /// uploads it (the first upload); the title writes it and the next copy
+    /// uploads the new bytes (a refresh); its memory is decommitted and the
+    /// pass lets its host copy go, not while a list holds it, nor the copy
+    /// of a texture whose memory is still there; the memory comes back with
+    /// other bytes and the next copy makes the host copy anew, with the
+    /// same description (levels kept or dropped as the first time), and
+    /// uploads them. Each time the host copy is read back and compared with
+    /// the title's bytes detiled on the CPU (a fixed seed for each stage).
+    #[cfg(windows)]
+    #[test]
+    fn an_unmapped_texture_let_go_comes_back_with_the_titles_bytes() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+        use windows_sys::Win32::System::Memory::*;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        // 64x64 four-halves texels (format 10) in the console's tiled
+        // layout 0x100, one level, as the title places such textures.
+        let words: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 10, 1, 0, 0x100, 0x30_0000, 0];
+        // SAFETY: fourteen words are a description.
+        let desc: ResourceDesc = unsafe { std::mem::transmute(words) };
+        let layout = texture_layout(&desc).expect("a console layout").planes[0].layout.clone();
+        let size = layout.size as usize;
+        let (pitch, rows) = (64 * 8usize, 64usize);
+        let span = size.next_multiple_of(0x1_0000);
+        // SAFETY: memory of our own that stays reserved; written while no
+        // list reads it.
+        let (memory, other) = unsafe {
+            let memory = VirtualAlloc(std::ptr::null(), span, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            let other = VirtualAlloc(std::ptr::null(), span, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!memory.is_null() && !other.is_null());
+            (memory, other)
+        };
+        let write = |at: *mut u8, seed: u64| {
+            let bytes = seeded(seed, size);
+            // SAFETY: committed memory of `size` bytes or more.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at, size) };
+            let mut linear = vec![0u8; pitch * rows];
+            layout.detile(&bytes, 0, 0, &mut linear, pitch, pitch * rows).expect("detiled");
+            linear
+        };
+        let mut want = write(memory, 0x5eed_0001);
+        let _ = write(other, 0x5eed_00ff);
+        let texture = texture_at(memory as u64, &words).expect("a placed texture");
+        let kept = texture_at(other as u64, &words).expect("another");
+        let at = texture as usize;
+        let rig = TitleRig::new(64, 64);
+        let footprint = rig.footprint;
+        // What the card holds of the texture: its host copy read back.
+        let readback = {
+            let mut readback: Option<ID3D12Resource> = None;
+            let rd = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: (pitch * rows) as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            // SAFETY: plain creation.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &rd,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut readback,
+                    )
+                    .expect("a readback buffer");
+            }
+            readback.expect("a readback buffer")
+        };
+        let card_bytes = || -> Vec<u8> {
+            let image = host_resource(texture).expect("a host copy");
+            let back = host.new_list().expect("a list");
+            let moved = host_transition(texture, 0x800);
+            let out_to = Location { resource: readback.as_raw().cast_const().cast(), kind: 1, footprint };
+            let out_from =
+                Location { resource: image.as_raw().cast_const().cast(), kind: 0, footprint: PlacedFootprint { offset: 0, ..footprint } };
+            // SAFETY: an open list, live resources, locations in the host layout.
+            unsafe {
+                if let Some((_, before)) = moved {
+                    back.list.ResourceBarrier(&[crate::host::transition(
+                        image,
+                        D3D12_RESOURCE_STATES(before as i32),
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                }
+                back.list.CopyTextureRegion((&raw const out_to).cast(), 0, 0, 0, (&raw const out_from).cast(), None);
+            }
+            back.close();
+            host.execute(&[&back]);
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: the copy finished (execute waits).
+            unsafe {
+                readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: pitch * rows }), Some(&mut mapped)).expect("mapped");
+                let bytes = std::slice::from_raw_parts(mapped.cast::<u8>(), pitch * rows).to_vec();
+                readback.Unmap(0, None);
+                bytes
+            }
+        };
+        let rows_of = |bytes: &[u8]| bytes.chunks(pitch).map(<[u8]>::to_vec).collect::<Vec<_>>();
+        // The first upload.
+        rig.copy_out(&[texture, kept]);
+        assert_eq!(rows_of(&card_bytes()), rows_of(&want), "first upload");
+        let first = made_copy(texture).expect("made");
+        // SAFETY: a live texture.
+        let first_desc = unsafe { first.texture.GetDesc() };
+        let (first_serial, first_base) = (first.serial, first.base);
+        // The title writes it: the next use uploads the new bytes.
+        want = write(memory, 0x5eed_0002);
+        rig.copy_out(&[texture, kept]);
+        assert_eq!(rows_of(&card_bytes()), rows_of(&want), "refresh after a title write");
+        // The pass leaves a texture whose memory is there.
+        let idle = |_: u64| true;
+        let mut went = Went::default();
+        let _ = let_go_unmapped([kept as usize].into_iter(), idle, 64, &mut went);
+        assert_eq!(went.n, 0, "memory still mapped");
+        // Not while something holds the host copy (here: we do).
+        // SAFETY: our own committed range.
+        assert_ne!(unsafe { VirtualFree(memory.cast(), span, MEM_DECOMMIT) }, 0);
+        let _ = let_go_unmapped([at].into_iter(), idle, 64, &mut went);
+        assert_eq!(went.n, 0, "held");
+        drop(first);
+        // Not when it is not idle.
+        let _ = let_go_unmapped([at].into_iter(), |_| false, 64, &mut went);
+        assert_eq!(went.n, 0, "used lately");
+        // Once the lists that named it are done with: let go.
+        rig.done();
+        let began = std::time::Instant::now();
+        while went.n == 0 && began.elapsed() < std::time::Duration::from_secs(10) {
+            settle(host);
+            let _ = let_go_unmapped([at].into_iter(), idle, 64, &mut went);
+        }
+        assert_eq!(went.n, 1, "the copy of the texture whose memory went");
+        assert!(made_copy(texture).is_none() && made_copy(kept).is_some());
+        // The memory comes back with other bytes: made anew, uploaded.
+        // SAFETY: our own reservation.
+        assert_eq!(unsafe { VirtualAlloc(memory.cast(), span, MEM_COMMIT, PAGE_READWRITE) }, memory.cast());
+        want = write(memory, 0x5eed_0003);
+        rig.copy_out(&[texture, kept]);
+        assert_eq!(rows_of(&card_bytes()), rows_of(&want), "upload after the host copy was let go");
+        let again = made_copy(texture).expect("made again");
+        // SAFETY: a live texture.
+        let again_desc = unsafe { again.texture.GetDesc() };
+        assert_ne!(again.serial, first_serial);
+        assert_eq!(
+            (again.base, again_desc.Width, again_desc.Height, again_desc.MipLevels, again_desc.Format),
+            (first_base, first_desc.Width, first_desc.Height, first_desc.MipLevels, first_desc.Format)
+        );
+    }
+
+    /// The card memory a streaming title leaves behind, offline: rounds in
+    /// which the title places 64 textures of 1 MiB in fresh memory, a list
+    /// of its copies out of them uploads them all, and then it takes their
+    /// memory away (decommits it) and moves on. `UNMAPPED_BENCH=old`: the
+    /// host copies stay, as while the card has room; `new`: the pass of
+    /// `VICTORY_TEXTURE_UNMAPPED_GO` runs after each round. Prints, after
+    /// each round, the texture blocks, what textures hold of them, the host
+    /// textures' bytes and the private bytes, in MB, and with `new` the
+    /// pass's time. One mode a process (the pool keeps its blocks):
+    /// `cargo test --release -p victory-gpu --lib -- --ignored --nocapture
+    /// unmapped_textures_memory`, once with each.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "measures; one mode a process"]
+    fn unmapped_textures_memory() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::System::Memory::*;
+        let Some(host) = crate::host::host() else { return };
+        let new = std::env::var("UNMAPPED_BENCH").is_ok_and(|v| v == "new");
+        // 256x512 four-halves texels, tiled: 1 MiB each.
+        let words: [u32; 14] = [3, 0, 0, 0, 256, 0, 512, 0x1_0001, 10, 1, 0, 0x100, 0x30_0000, 0];
+        // SAFETY: fourteen words are a description.
+        let desc: ResourceDesc = unsafe { std::mem::transmute(words) };
+        let size = texture_layout(&desc).expect("a console layout").planes[0].layout.size as usize;
+        let rig = TitleRig::new(256, 512);
+        let figures = || {
+            format!(
+                "blocks {} held {} host_textures {} private {}",
+                crate::pool::memory()[0],
+                crate::pool::texture_held() >> 20,
+                HOST_TEXTURES[1].load(Relaxed) >> 20,
+                crate::host::private_bytes() >> 20
+            )
+        };
+        println!("mode {}: at the start {}", if new { "new" } else { "old" }, figures());
+        // (A use in the first tenth of a second of the run notes the moment 0,
+        // which the sweep reads as never used.)
+        let _ = crate::host::moment();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        const ROUNDS: usize = 12;
+        const EACH: usize = 64;
+        // Microseconds a texture of a look: all mapped, and the first look
+        // after the memory went.
+        let (mut mapped_us, mut gone_us) = (Vec::new(), Vec::new());
+        for round in 0..ROUNDS {
+            let mut placed = Vec::new();
+            for i in 0..EACH {
+                // SAFETY: fresh memory of our own, written before any list
+                // reads it, decommitted after.
+                let at = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>() };
+                assert!(!at.is_null());
+                let bytes = seeded((round * EACH + i) as u64 + 1, size);
+                // SAFETY: as above.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at, size) };
+                placed.push((at, texture_at(at as u64, &words).expect("a placed texture")));
+            }
+            let textures: Vec<This> = placed.iter().map(|&(_, t)| t).collect();
+            rig.copy_out(&textures);
+            // The title is done with them: the list is reset, the memory goes.
+            rig.done();
+            settle(host);
+            let candidates = || textures.iter().map(|&t| t as usize);
+            if new {
+                // (Asked before the memory goes: nothing is let go.)
+                let mut went = Went::default();
+                let timed = std::time::Instant::now();
+                let _ = let_go_unmapped(candidates(), |_| true, 4 * EACH as u32, &mut went);
+                mapped_us.push(timed.elapsed().as_secs_f64() * 1e6 / EACH as f64);
+                assert_eq!(went.n, 0, "all mapped");
+            }
+            for &(at, _) in &placed {
+                // SAFETY: our own memory, read by no list any more.
+                assert_ne!(unsafe { VirtualFree(at.cast(), 0, MEM_DECOMMIT) }, 0);
+            }
+            if new {
+                let mut went = Went::default();
+                let began = std::time::Instant::now();
+                let mut looks = 0;
+                while (went.n as usize) < EACH && began.elapsed() < std::time::Duration::from_secs(5) {
+                    let timed = std::time::Instant::now();
+                    let _ = let_go_unmapped(candidates(), |_| true, 4 * EACH as u32, &mut went);
+                    if looks == 0 {
+                        gone_us.push(timed.elapsed().as_secs_f64() * 1e6 / EACH as f64);
+                    }
+                    looks += 1;
+                    settle(host);
+                }
+                assert_eq!(went.n as usize, EACH, "every copy let go");
+            }
+            // What is let go is dropped 64 submissions later (`bury_lag`), and
+            // pieces given back rest before they are cut again.
+            for _ in 0..70 {
+                settle(host);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2_700));
+            settle(host);
+            println!("round {:>2}: {}", round + 1, figures());
+        }
+        if new {
+            let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+            println!(
+                "the pass: {:.2} us a texture still mapped, {:.2} us a texture at the first look after its memory went",
+                mean(&mapped_us),
+                mean(&gone_us)
+            );
+        }
     }
 }

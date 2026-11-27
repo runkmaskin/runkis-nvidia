@@ -641,4 +641,78 @@ void main(uint3 id : SV_DispatchThreadID) {
             }
         }
     }
-}
+
+    fn private_now() -> u64 {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+        // SAFETY: our own process and a sized structure.
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+        c.PagefileUsage as u64
+    }
+
+    /// Which D3D12 objects count in the private bytes (`PagefileUsage`) the
+    /// memory line's `private=` reads. `cargo test -p victory-gpu --lib --
+    /// --ignored --nocapture what_counts_as_private`.
+    #[test]
+    #[ignore = "measures; prints"]
+    fn what_counts_as_private() {
+        let Some((device, name)) = device() else { return };
+        const G: u64 = 1 << 30;
+        let report = |what: &str, before: u64| {
+            println!("{what}: private {:+} MB", (private_now() as i64 - before as i64) / (1 << 20));
+        };
+        println!("card: {name}");
+        let mut kept: Vec<windows::core::IUnknown> = Vec::new();
+        // SAFETY: plain object creation on a live device.
+        unsafe {
+            for (what, kind, flags) in [
+                ("default heap of textures 1 GiB", D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES),
+                ("default heap of buffers 1 GiB", D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS),
+                ("upload heap 1 GiB", D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS),
+            ] {
+                let before = private_now();
+                let mut heap: Option<ID3D12Heap> = None;
+                device
+                    .CreateHeap(
+                        &D3D12_HEAP_DESC {
+                            SizeInBytes: G,
+                            Properties: D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() },
+                            Alignment: 0,
+                            Flags: flags,
+                        },
+                        &mut heap,
+                    )
+                    .expect("a heap");
+                report(what, before);
+                kept.push(heap.expect("a heap").cast().expect("unknown"));
+            }
+            let before = private_now();
+            let tex = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 8192,
+                Height: 8192,
+                DepthOrArraySize: 4,
+                MipLevels: 1,
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let mut t: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &tex,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut t,
+                )
+                .expect("a texture");
+            report("committed texture 1 GiB", before);
+            kept.push(t.expect("a texture").cast().expect("unknown"));
+            let before = private_now();
+            drop(kept);
+            report("all let go", before);
+        }
+    }}

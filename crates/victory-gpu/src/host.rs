@@ -787,7 +787,7 @@ pub(crate) static LISTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync:
 
 /// The process's private bytes (around the making of lists, diagnostics;
 /// for the line of memory by subsystem).
-fn private_bytes() -> u64 {
+pub(crate) fn private_bytes() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut c = PROCESS_MEMORY_COUNTERS {
@@ -10019,7 +10019,7 @@ fn frame_log(presented: [u64; 2]) {
 }
 
 /// The highest value so far of each field of [`memory_line`].
-static MEMORY_PEAKS: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+static MEMORY_PEAKS: [std::sync::atomic::AtomicU64; 20] = [const { std::sync::atomic::AtomicU64::new(0) }; 20];
 
 /// What holds memory, by who holds it, in one line with the frame-rate
 /// lines every five seconds, for a launcher to read: `memory by subsystem:`
@@ -10033,7 +10033,8 @@ fn memory_line(host: &Host) {
     let [texture_blocks, staging_blocks] = crate::pool::memory();
     let kept = crate::pipeline::kept();
     let video = host.video_memory().unwrap_or_default();
-    let fields: [(&str, u64); 16] = [
+    let system = system_memory();
+    let fields: [(&str, u64); 20] = [
         ("private", private_bytes()),
         ("list_allocators", HELD_CALLS.load(Ordering::Relaxed) * CALL_BYTES),
         ("list_scratch", alive(2)),
@@ -10050,8 +10051,33 @@ fn memory_line(host: &Host) {
         ("gpu_used", video[1]),
         ("gpu_budget", video[0]),
         ("gpu_shared_used", video[3]),
+        // Of `host_textures`, the bytes that lie in `texture_blocks`: the
+        // two overlap, and the card's memory for textures is the blocks
+        // plus `host_textures` less this.
+        ("texture_blocks_held", crate::pool::texture_held()),
+        // Host copies of placed textures let go as their title memory was
+        // not mapped (`VICTORY_TEXTURE_UNMAPPED_GO=1`), since the start.
+        ("textures_unmapped_gone", crate::resource::UNMAPPED_GONE[1].load(Ordering::Relaxed)),
+        // The system's: what can still be committed (card memory counts
+        // there too), and the physical memory free.
+        ("commit_left", system[0]),
+        ("ram_free", system[1]),
     ];
     tracing::info!("{}", memory_text(&fields, &MEMORY_PEAKS));
+}
+
+/// The bytes the system can still commit and its free physical memory
+/// (`GlobalMemoryStatusEx`); zeros if it does not say.
+fn system_memory() -> [u64; 2] {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return [0, 0];
+    }
+    [m.ullAvailPageFile, m.ullAvailPhys]
 }
 
 /// The text of [`memory_line`] for `fields` (name, bytes), raising each
