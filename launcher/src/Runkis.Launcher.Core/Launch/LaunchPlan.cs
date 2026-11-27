@@ -156,6 +156,13 @@ public sealed class PlanBuilder(RepoLayout repo)
             o["VICTORY_PRESENT_SCALE"] = "1";
             o["VICTORY_PRESENT_SHARPEN"] = Num(p.PresentSharpen);
         }
+        if (p.Mouse)
+        {
+            o["VICTORY_MOUSE"] = "1";
+            o["VICTORY_MOUSE_SENSE"] = Num(p.MouseSense);
+        }
+        else
+            o["VICTORY_MOUSE"] = "0"; // the script turns it on
         o["VICTORY_LOG"] = p.LogFilter.Trim();
         return o;
     }

@@ -56,6 +56,10 @@ public sealed class LaunchProfile
     public bool PresentScale { get; set; }
     /// <summary>VICTORY_PRESENT_SHARPEN (0..1), with <see cref="PresentScale"/> only.</summary>
     public double PresentSharpen { get; set; } = 0.3;
+    /// <summary>VICTORY_MOUSE=1 (gameinput.rs): the mouse turns the camera (right stick), left button fires, right aims.</summary>
+    public bool Mouse { get; set; } = true;
+    /// <summary>VICTORY_MOUSE_SENSE, with <see cref="Mouse"/> only (1: 12 pixels in 8 ms is a full stick).</summary>
+    public double MouseSense { get; set; } = 1.0;
 
     // ---- Performance overrides (null: what the script sets) ----
     /// <summary>VICTORY_PIPELINE_WAIT_MS (pipeline/make.rs).</summary>

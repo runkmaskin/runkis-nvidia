@@ -332,6 +332,16 @@
                 </Grid>
                 <Grid Style="{StaticResource Row}">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                  <StackPanel><TextBlock Text="Mouse camera"/><TextBlock Style="{StaticResource Hint}" Text="The mouse turns the camera; left button fires, right aims, middle clicks the stick. The cursor is held in the game's window while it has focus (Alt+Tab to leave). VICTORY_MOUSE"/></StackPanel>
+                  <CheckBox Grid.Column="1" IsChecked="{Binding Profile.Mouse}" VerticalAlignment="Center"/>
+                </Grid>
+                <Grid Style="{StaticResource Row}">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition Width="140"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                  <StackPanel><TextBlock Text="Mouse sensitivity"/><TextBlock Style="{StaticResource Hint}" Text="0.1-10; 1 is the default. Higher turns faster."/></StackPanel>
+                  <TextBox Grid.Column="1" Text="{Binding Profile.MouseSense, UpdateSourceTrigger=LostFocus}" VerticalAlignment="Center"/>
+                </Grid>
+                <Grid Style="{StaticResource Row}">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
                   <StackPanel><TextBlock Text="Graphics card"/><TextBlock Style="{StaticResource Hint}" Text="Numbered in the order Windows lists them; the emulator uses the same order (VICTORY_ADAPTER)."/></StackPanel>
                   <ComboBox Grid.Column="1" ItemsSource="{Binding AdapterChoices}" DisplayMemberPath="Label" SelectedValuePath="Value"
                             SelectedValue="{Binding Profile.Adapter}" Width="420" HorizontalAlignment="Left"/>

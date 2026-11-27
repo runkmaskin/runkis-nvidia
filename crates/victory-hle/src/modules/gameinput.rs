@@ -113,6 +113,25 @@ trait Source: Send {
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// The mouse as a pad (right stick, triggers), `None` when it is not used.
+    fn mouse(&mut self) -> Option<PadState> {
+        None
+    }
+}
+
+/// The mouse's movement in one poll as the right stick: `dx`, `dy` pixels (down positive), `sense` the
+/// stick's travel per pixel. Titles ignore a stick near its centre (a dead zone), which ate slow mouse
+/// moves, so any movement starts past it.
+fn mouse_stick(dx: f32, dy: f32, sense: f32) -> (f32, f32) {
+    const DEAD: f32 = 0.18;
+    let axis = |d: f32| {
+        if d == 0.0 {
+            0.0
+        } else {
+            d.signum() * (DEAD + (1.0 - DEAD) * (d.abs() * sense).min(1.0))
+        }
+    };
+    (axis(dx), -axis(dy))
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -432,7 +451,13 @@ impl Hub {
     fn poll(&self) {
         let (pads, keys) = {
             let mut source = lock(&self.source);
-            let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
+            let mut pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
+            // The mouse joins the one pad (it has no device of its own here).
+            if self.one_pad
+                && let Some(mouse) = source.mouse()
+            {
+                pads[0] = Some(pads[0].map_or(mouse, |pad| merged(pad, mouse)));
+            }
             (pads, source.keys())
         };
         let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
@@ -1239,6 +1264,52 @@ mod host {
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
         }
+
+        /// `VICTORY_MOUSE=1` (off unless asked for): while the title's window has focus the cursor
+        /// is held at the window's centre, and how far it moved since the last poll is the right
+        /// stick; left button the right trigger (fire), right button the left trigger (aim),
+        /// middle button the right stick's click. `VICTORY_MOUSE_SENSE` scales the movement (1:
+        /// 12 pixels in one poll is a full stick).
+        fn mouse(&mut self) -> Option<PadState> {
+            use windows_sys::Win32::Foundation::{POINT, RECT};
+            use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect, SetCursorPos};
+            static SENSE: LazyLock<Option<f32>> = LazyLock::new(|| {
+                if std::env::var_os("VICTORY_MOUSE").is_none_or(|v| v != "1") {
+                    return None;
+                }
+                let sense = std::env::var("VICTORY_MOUSE_SENSE")
+                    .ok()
+                    .and_then(|v| v.trim().replace(',', ".").parse::<f32>().ok())
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .unwrap_or(1.0);
+                Some(sense / 12.0)
+            });
+            let sense = (*SENSE)?;
+            if !focused() {
+                // Let go of the cursor: the user is elsewhere.
+                return Some(PadState::default());
+            }
+            let mut window = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            let mut at = POINT { x: 0, y: 0 };
+            // SAFETY: plain queries and our own window's centre.
+            unsafe {
+                if GetWindowRect(GetForegroundWindow(), &mut window) == 0 || GetCursorPos(&mut at) == 0 {
+                    return Some(PadState::default());
+                }
+                let centre = ((window.left + window.right) / 2, (window.top + window.bottom) / 2);
+                SetCursorPos(centre.0, centre.1);
+                let (x, y) = mouse_stick((at.x - centre.0) as f32, (at.y - centre.1) as f32, sense);
+                let held = |vk: i32| GetAsyncKeyState(vk) < 0;
+                Some(PadState {
+                    buttons: if held(0x04) { RIGHT_STICK } else { 0 },
+                    right_trigger: if held(0x01) { 1.0 } else { 0.0 },
+                    left_trigger: if held(0x02) { 1.0 } else { 0.0 },
+                    right_x: x,
+                    right_y: y,
+                    ..Default::default()
+                })
+            }
+        }
     }
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
@@ -1290,6 +1361,17 @@ mod host {
             GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
             process == GetCurrentProcessId()
         }
+    }
+
+    #[test]
+    fn mouse_moves_are_the_right_stick_past_the_dead_zone() {
+        let sense = 1.0 / 12.0;
+        assert_eq!(super::mouse_stick(0.0, 0.0, sense), (0.0, 0.0));
+        // One pixel already moves the stick past the titles' dead zone.
+        let (x, y) = super::mouse_stick(1.0, -1.0, sense);
+        assert!(x > 0.18 && x < 0.3 && y > 0.18 && y < 0.3, "{x} {y}");
+        // Twelve pixels or more is all the way; down on the screen is down on the stick.
+        assert_eq!(super::mouse_stick(-40.0, 12.0, sense), (-1.0, -1.0));
     }
 
     #[test]
