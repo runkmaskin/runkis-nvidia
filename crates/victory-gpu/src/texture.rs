@@ -95,6 +95,10 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
+    /// A list recorded its upload for a draw of the title's bake
+    /// ([`bake_wait`]): its refreshes wait for title memory to hold still,
+    /// whatever [`no_wait`] says.
+    exact: std::sync::atomic::AtomicBool,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -443,6 +447,39 @@ fn recheck() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_RECHECK").is_some_and(|v| v == "1"))
 }
+
+/// Whether the uploads recorded for a draw of the title's decoration bake
+/// wait for title memory to hold still when they are read, even with
+/// [`no_wait`] (`VICTORY_BAKE_WAIT=1`; off by default).
+///
+/// Why: the bake draws each character's skin decorations (tattoos, marks)
+/// into a texture of its own, once, from textures it picks by index. Those
+/// are read at the list's submission, and with [`no_wait`] a read that meets
+/// the runtime remapping goes through the kernel: it can hold pages from
+/// before and after the change, or the pages that were there at that moment
+/// and zeros for the rest. A texture picked by index is not read again, and
+/// what the bake drew from it stays for the run: blocks of compressed colour
+/// read as rainbow noise on an arm or a face. The pass before a bake
+/// (`crate::draw` `bake_exact`) said its uploads waited; they did not, as the
+/// read comes later, on the submitting thread. With the switch the upload
+/// marks its staging buffer, and the read at submission waits for the lock
+/// as it does without [`no_wait`]. A bake is rare (while characters load), so
+/// the wait is too. Off: as before.
+fn bake_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_WAIT").is_some_and(|v| v == "1"))
+}
+
+/// Whether a refresh waits for title memory to hold still: always without
+/// [`no_wait`], and with it for a staging buffer a bake reads from
+/// ([`bake_wait`]).
+fn waits_for_remap(no_wait: bool, exact: bool) -> bool {
+    !no_wait || exact
+}
+
+/// Since the last frame-rate line, with [`bake_wait`]: refreshes for a bake
+/// that waited for title memory to hold still.
+pub(crate) static BAKE_WAITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether a read that began with the runtime's count of mapping changes at
 /// `before` and ended with it at `after` may have met a change: one was under
@@ -841,6 +878,11 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         staging.once.store(false, Relaxed);
     }
     staging.used.store(crate::host::moment(), Relaxed);
+    // A bake draws from it: its read at this list's submission waits for
+    // title memory to hold still (`bake_wait`).
+    if bake_wait() && no_wait() && BAKING.get() {
+        staging.exact.store(true, Relaxed);
+    }
     // Levels on demand: a view of the texture now starts at another
     // level, or another texture now starts inside its span, with no byte
     // of its memory changed. The levels are judged anew: detiled again at
@@ -1342,7 +1384,10 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        // (Once: a texture the bake reads that is also drawn through tables
+        // goes back to not waiting after this read.)
+        let exact = self.exact.swap(false, std::sync::atomic::Ordering::Relaxed);
+        let _mapped = if !waits_for_remap(no_wait(), exact) {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
@@ -1351,6 +1396,9 @@ impl Staging {
             };
             mapped
         } else {
+            if exact && no_wait() {
+                BAKE_WAITED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             waited(2, crate::watch::title_memory_reading)
         };
         if !committed(self.memory, size) {
@@ -1978,6 +2026,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        exact: std::sync::atomic::AtomicBool::new(false),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
@@ -1985,7 +2034,20 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
 
 #[cfg(test)]
 mod recheck_tests {
-    use super::{Last, after_unlocked_read, met_change};
+    use super::{Last, after_unlocked_read, met_change, waits_for_remap};
+
+    /// A read for a bake waits for the runtime's remapping even with the
+    /// speed set's no-wait; every other read does as the switch says. Before
+    /// `VICTORY_BAKE_WAIT` there was no such case: a bake's read went
+    /// through the kernel across a change like any other.
+    #[test]
+    fn a_read_for_a_bake_waits_for_the_remapping() {
+        // (no_wait, read for a bake, waits)
+        let cases = [(false, false, true), (false, true, true), (true, false, false), (true, true, true)];
+        for (no_wait, exact, waits) in cases {
+            assert_eq!(waits_for_remap(no_wait, exact), waits, "{no_wait} {exact}");
+        }
+    }
 
     /// A read through the kernel is read again exactly when the change count
     /// says a change of mapping was under way or happened during it, and
