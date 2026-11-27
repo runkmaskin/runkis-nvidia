@@ -148,6 +148,55 @@ public class PresetTests
     }
 }
 
+public class ThisPcPresetTests
+{
+    private const ulong GB = 1UL << 30;
+    private static GpuAdapter Card(int i, string name, double gb, uint vendor = 0x10DE) =>
+        new(i, name, vendor, 1, (ulong)(gb * GB), 0, i, false, "32.0.16.2114");
+    private static SystemSnapshot Pc(int threads, double ramGb) =>
+        new("cpu", threads / 2, threads, (ulong)(ramGb * GB), 0, (ulong)(ramGb * 2 * GB), 0, "win", true, "Balanced", false);
+
+    [Fact]
+    public void A_12_gb_card_and_16_threads_lift_the_8_gb_limits()
+    {
+        var preset = Presets.ForThisPc([Card(0, "NVIDIA GeForce RTX 4070 SUPER", 12)], Pc(16, 32), null);
+        var p = Presets.Make(preset, new LaunchProfile { GameExe = "x.exe" });
+        Assert.Equal(0, p.MipDrop);
+        Assert.Equal(3072, p.TargetRoomMb);
+        Assert.Equal(8, p.WideThreads);
+        Assert.Equal(540, p.Resolution);
+        Assert.Contains("12 GB", preset.Description);
+    }
+
+    [Fact]
+    public void The_measured_hardware_gets_the_measured_set()
+    {
+        var p = Presets.Make(Presets.ForThisPc([Card(0, "NVIDIA GeForce RTX 2070 SUPER", 8)], Pc(12, 32), null), new LaunchProfile());
+        Assert.Null(p.MipDrop);
+        Assert.Null(p.TargetRoomMb);
+        Assert.Null(p.WideThreads);
+    }
+
+    [Fact]
+    public void A_small_card_gets_480p_and_smaller_textures()
+    {
+        var p = Presets.Make(Presets.ForThisPc([Card(0, "NVIDIA GeForce RTX 3050", 6)], Pc(8, 16), null), new LaunchProfile());
+        Assert.Equal(480, p.Resolution);
+        Assert.Equal(1, p.MipDrop);
+        Assert.Equal(1024, p.MipDropMinSize);
+        Assert.Equal(4, p.WideThreads);
+    }
+
+    [Fact]
+    public void The_nvidia_card_is_picked_over_an_integrated_default()
+    {
+        var cards = new[] { Card(0, "AMD Radeon(TM) Graphics", 0.5, 0x1002), Card(1, "NVIDIA GeForce RTX 4070 SUPER", 12) };
+        var preset = Presets.ForThisPc(cards, Pc(16, 32), null);
+        Assert.Equal("#1", Presets.Make(preset, new LaunchProfile()).Adapter);
+        Assert.Equal("#0", Presets.Make(preset, new LaunchProfile { Adapter = "#0" }).Adapter);   // a card the user chose stays
+    }
+}
+
 public class PlanTests
 {
     [Fact]

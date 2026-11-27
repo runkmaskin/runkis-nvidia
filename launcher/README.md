@@ -24,6 +24,21 @@ the .NET 8 SDK). Afterwards `launcher\dist\RunkisLauncher.exe` runs on the .NET 
 6. **Self-restart.** If the title restarts itself (a new victory process, while the first one exits 0), the
    launcher follows the new process.
 
+## Presets ("Start as" on the Play page)
+
+Each preset is applied over the script's tuned set. It keeps your game, folders, card and build, and it can be
+saved as a profile.
+
+| Preset | What it sets |
+|---|---|
+| **Recommended for this PC** (the default) | Worked out from this PC, starting from the measured set (RTX 2070 SUPER 8 GB, 12 threads). Changes only what that set chose for its own hardware. **10 GB or more of VRAM:** full-size textures and the layer's 3 GB render-target reserve. **Under 7.5 GB:** 480p, with large textures dropped from 1024 px. **CPU threads:** half of them, at most 8, kept for memory compares (the measured set kept 6 of 12). **Card:** if Windows' default card isn't the NVIDIA one, the NVIDIA card with the most memory is picked. The description lists each step. The result is not measured on your PC: compare it with Standard |
+| Standard | The measured PLAY.bat set |
+| Max FPS | 480p; hair physics, decal defragmentation and heat haze left out |
+| Sharp (10 GB+ VRAM) | 720p, full-size textures, 3 GB render-target reserve |
+| Fewer glitches | Quality mode (about −29 % fps) |
+| Series X | The Series X profile at 1080p |
+| Troubleshoot | Quality mode, every shader waited for, DRED light (diag build) |
+
 ## Where the numbers come from
 
 Nothing is estimated. A figure that is not available shows "—", and its tooltip says why.

@@ -145,7 +145,7 @@
             <ListBox ItemsSource="{Binding StartChoices}" SelectedItem="{Binding SelectedStart}" Margin="0,0,-10,0"
                      ScrollViewer.HorizontalScrollBarVisibility="Disabled">
               <ListBox.ItemsPanel>
-                <ItemsPanelTemplate><UniformGrid Columns="7"/></ItemsPanelTemplate>
+                <ItemsPanelTemplate><UniformGrid Columns="4"/></ItemsPanelTemplate>
               </ListBox.ItemsPanel>
               <ListBox.ItemContainerStyle>
                 <Style TargetType="ListBoxItem">
@@ -154,7 +154,7 @@
                     <Setter.Value>
                       <ControlTemplate TargetType="ListBoxItem">
                         <Border x:Name="b" Background="{StaticResource Card}" BorderBrush="{StaticResource Line}" BorderThickness="1"
-                                CornerRadius="9" Padding="12,11" Margin="0,0,10,0">
+                                CornerRadius="9" Padding="12,11" Margin="0,0,10,10">
                           <TextBlock Text="{Binding Label}" FontWeight="SemiBold" TextWrapping="Wrap" TextAlignment="Center"/>
                         </Border>
                         <ControlTemplate.Triggers>

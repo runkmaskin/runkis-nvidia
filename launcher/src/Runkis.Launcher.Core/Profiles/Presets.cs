@@ -33,6 +33,63 @@ public static class Presets
     public static Preset? ById(string? id) => All.FirstOrDefault(p => p.Id == id);
 
     /// <summary>
+    /// A preset worked out from this PC's card, CPU and RAM. Every rule starts from the measured set (RTX 2070 SUPER
+    /// 8 GB, 12 threads) and only moves what that set chose for its own hardware; the description says each step.
+    /// Not measured on the PC it is made for: compare it with Standard.
+    /// </summary>
+    public static Preset ForThisPc(IReadOnlyList<GpuAdapter> adapters, SystemSnapshot sys, string? adapterSetting)
+    {
+        var why = new List<string>();
+        var (chosen, _) = Dxgi.Resolve(adapters, adapterSetting);
+        // The card: the NVIDIA card with the most memory, where Windows' default would be another one.
+        var best = adapters.Where(a => !a.Software && a.IsNvidia).OrderByDescending(a => a.DedicatedVideoMemory).FirstOrDefault();
+        string? pick = null;
+        if (string.IsNullOrWhiteSpace(adapterSetting) && best != null && chosen?.Index != best.Index)
+        {
+            pick = $"#{best.Index}";
+            chosen = best;
+            why.Add($"runs on {best.Name} (#{best.Index}), not Windows' default card");
+        }
+        var gb = (chosen?.DedicatedVideoMemory ?? 0) / (double)(1UL << 30);
+        int? resolution = null, mipDrop = null, mipMin = null, targetRoom = null;
+        if (gb >= 9.5)
+        {
+            // The mip drop and the 1.5 GB reserve were chosen because an 8 GB card ran out of texture room.
+            (mipDrop, targetRoom) = (0, 3072);
+            why.Add($"{gb:0} GB of video memory: full-size textures and the layer's own 3 GB render-target reserve (the 8 GB limits are not needed)");
+        }
+        else if (gb > 0 && gb < 7.5)
+        {
+            // README: a mip drop from 1024 px "removes VRAM overflow completely, but visibly blurrier".
+            (resolution, mipDrop, mipMin) = (480, 1, 1024);
+            why.Add($"{gb:0.#} GB of video memory: 480p and smaller large textures, so the card does not run out");
+        }
+        else if (gb > 0)
+            why.Add($"{gb:0} GB of video memory: the 8 GB set as measured");
+        // The measured set kept 6 of 12 threads for the big memory compares: half of them, at most 8 here.
+        var wide = Math.Clamp(sys.LogicalProcessors / 2, 2, 8);
+        if (wide != 6) why.Add($"{sys.LogicalProcessors} CPU threads: {wide} kept for memory compares (the measured set kept 6 of 12)");
+        if (sys.LogicalProcessors < 12)
+            why.Add("fewer than 12 CPU threads: expect lower fps than the README's figures; the game is CPU-bound");
+        if (chosen != null && !chosen.IsNvidia)
+            why.Add($"{chosen.Name} is not an NVIDIA card: this build is tuned for NVIDIA");
+        if (sys.TotalRam < 29.5 * (1UL << 30))
+            why.Add($"{sys.TotalRam / (double)(1UL << 30):0} GB RAM: freed game memory is dropped early (pool discard), as in the measured set");
+
+        var description = "Worked out for this PC from the measured set (not measured here; compare it with Standard): "
+                          + (why.Count > 0 ? string.Join("; ", why) + "." : "the measured set fits it as it is.");
+        return new("pc", "Recommended for this PC", description, p =>
+        {
+            if (pick != null && string.IsNullOrWhiteSpace(p.Adapter)) p.Adapter = pick;
+            if (resolution is int r) p.Resolution = r;
+            if (mipDrop is int m) p.MipDrop = m;
+            if (mipMin is int mm) p.MipDropMinSize = mm;
+            if (targetRoom is int t) p.TargetRoomMb = t;
+            if (wide != 6) p.WideThreads = wide;
+        });
+    }
+
+    /// <summary>
     /// The preset as a profile: the user's game, folders, card, build and log filter kept from <paramref name="basis"/>,
     /// everything else from the script's defaults and the preset.
     /// </summary>

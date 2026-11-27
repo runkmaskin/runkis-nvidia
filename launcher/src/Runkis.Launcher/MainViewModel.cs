@@ -151,12 +151,15 @@ public sealed class MainViewModel : Observable, IDisposable
 
     // ---------------------------------------------------------------- presets
     /// <summary>"Start as": the selected profile, or a preset over it (game, folders, card and build kept).</summary>
-    public List<Choice> StartChoices { get; } =
-        [new("My profile", null), .. Presets.All.Select(p => new Choice(p.Name, p))];
+    public List<Choice> StartChoices => startChoices ??=
+        [new("My profile", null), new("Recommended for this PC", Presets.ForThisPc(adapters, Machine, null)),
+         .. Presets.All.Select(p => new Choice(p.Name, p))];
+    private List<Choice>? startChoices;
     private Choice? selectedStart;
     public Choice? SelectedStart
     {
-        get => selectedStart ??= StartChoices[0];
+        // The preset worked out for this PC unless the user picks otherwise.
+        get => selectedStart ??= StartChoices[1];
         set
         {
             if (!Set(ref selectedStart, value)) return;
