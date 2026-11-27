@@ -42,6 +42,7 @@ public static partial class ProfileValidator
         Range(issues, nameof(p.Air), p.Air, 0, 3);
         Range(issues, nameof(p.Steady), p.Steady, 0, 1);
         Range(issues, nameof(p.Ambient), p.Ambient, 0, 2);
+        Range(issues, nameof(p.PresentSharpen), p.PresentSharpen, 0, 1);
         Range(issues, nameof(p.PipelineWaitMs), p.PipelineWaitMs, 0, 20000);
         Range(issues, nameof(p.MipDrop), p.MipDrop, 0, 3);
         Range(issues, nameof(p.MipDropMinSize), p.MipDropMinSize, 1, 16384);

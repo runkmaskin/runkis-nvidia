@@ -150,6 +150,12 @@ public sealed class PlanBuilder(RepoLayout repo)
         Bool("VICTORY_PIPELINE_BOOK", p.PipelineBook);
         if (p.D3D12BackgroundOff) o["VICTORY_D3D12_BACKGROUND"] = "0";
         if (p.Panel) o["VICTORY_PANEL"] = "1";
+        // Off: nothing set, so the layer's default (off) holds.
+        if (p.PresentScale)
+        {
+            o["VICTORY_PRESENT_SCALE"] = "1";
+            o["VICTORY_PRESENT_SHARPEN"] = Num(p.PresentSharpen);
+        }
         o["VICTORY_LOG"] = p.LogFilter.Trim();
         return o;
     }

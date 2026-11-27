@@ -241,6 +241,28 @@ public class PlanTests
     }
 
     [Fact]
+    public void Upscale_to_the_window_sets_its_switches_only_when_on()
+    {
+        var off = PlanBuilder.Overrides(new LaunchProfile());
+        Assert.False(off.ContainsKey("VICTORY_PRESENT_SCALE"));
+        Assert.False(off.ContainsKey("VICTORY_PRESENT_SHARPEN"));
+        var on = PlanBuilder.Overrides(new LaunchProfile { PresentScale = true, PresentSharpen = 0.45 });
+        Assert.Equal("1", on["VICTORY_PRESENT_SCALE"]);
+        Assert.Equal("0.45", on["VICTORY_PRESENT_SHARPEN"]);   // invariant: a point, also on a Swedish PC
+        Assert.Contains(ProfileValidator.Validate(new LaunchProfile { PresentSharpen = 1.5 }), i => i.Field == nameof(LaunchProfile.PresentSharpen));
+    }
+
+    [Fact]
+    public void Upscale_to_the_window_is_not_in_the_pc_preset()
+    {
+        var preset = Presets.ForThisPc([new GpuAdapter(0, "NVIDIA GeForce RTX 4070 SUPER", 0x10DE, 1, 12UL << 30, 0, 0, false, "32.0.16.2114")],
+            new SystemSnapshot("cpu", 8, 16, 32UL << 30, 0, 64UL << 30, 0, "win", true, "Balanced", false), null);
+        var p = Presets.Make(preset, new LaunchProfile { GameExe = "x.exe", PresentScale = true });
+        Assert.False(p.PresentScale);   // the user turns it on in a profile
+        Assert.All(Presets.All, x => Assert.False(Presets.Make(x, new LaunchProfile()).PresentScale));
+    }
+
+    [Fact]
     public void Smooth_motion_starts_the_renamed_copy()
     {
         var preset = new ScriptPreset { Victory = @"C:\r\target\diag\victory.exe", SmoothMotion = true, Args = ["warm"], Settings = new() { ["A"] = "1" } };

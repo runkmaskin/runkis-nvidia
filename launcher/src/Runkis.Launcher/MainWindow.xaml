@@ -322,6 +322,16 @@
                 </Grid>
                 <Grid Style="{StaticResource Row}">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                  <StackPanel><TextBlock Text="Upscale to the window (sharp)"/><TextBlock Style="{StaticResource Hint}" Text="Scales the 1080p frame to the window with a sharp filter, instead of Windows' blurry stretch. For screens above 1080p (VICTORY_PRESENT_SCALE)."/></StackPanel>
+                  <CheckBox Grid.Column="1" IsChecked="{Binding Profile.PresentScale}" VerticalAlignment="Center"/>
+                </Grid>
+                <Grid Style="{StaticResource Row}">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition Width="140"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                  <StackPanel><TextBlock Text="Upscale sharpening"/><TextBlock Style="{StaticResource Hint}" Text="0-1, with the upscale only. 0: none; 0.3: light (default)."/></StackPanel>
+                  <TextBox Grid.Column="1" Text="{Binding Profile.PresentSharpen, UpdateSourceTrigger=LostFocus}" VerticalAlignment="Center"/>
+                </Grid>
+                <Grid Style="{StaticResource Row}">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
                   <StackPanel><TextBlock Text="Graphics card"/><TextBlock Style="{StaticResource Hint}" Text="Numbered in the order Windows lists them; the emulator uses the same order (VICTORY_ADAPTER)."/></StackPanel>
                   <ComboBox Grid.Column="1" ItemsSource="{Binding AdapterChoices}" DisplayMemberPath="Label" SelectedValuePath="Value"
                             SelectedValue="{Binding Profile.Adapter}" Width="420" HorizontalAlignment="Left"/>

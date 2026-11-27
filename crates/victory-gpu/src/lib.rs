@@ -102,6 +102,8 @@ pub mod titlewrite;
 #[cfg(windows)]
 mod upload;
 #[cfg(windows)]
+mod upscale;
+#[cfg(windows)]
 mod watch;
 #[cfg(all(windows, test))]
 mod watch_bench;

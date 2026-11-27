@@ -10410,20 +10410,29 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
-        if (p.width, p.height, p.format) != (width, height, format) {
+        // LOCAL: with `VICTORY_PRESENT_SCALE=1` the swap chain has the
+        // window's size and the frame is scaled into it (`crate::upscale`);
+        // else it has the texture's size, as before.
+        let scaling = crate::upscale::on() && crate::upscale::ready(&self.device, desc.Format, format);
+        let (swap_width, swap_height) = if scaling {
+            crate::upscale::target((width, height), client_size(p.hwnd), (p.width, p.height), true)
+        } else {
+            (width, height)
+        };
+        if (p.width, p.height, p.format) != (swap_width, swap_height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(pacing::buffers(BUFFERS), width, height, format, pacing::flags())
+                    .ResizeBuffers(pacing::buffers(BUFFERS), swap_width, swap_height, format, pacing::flags())
             };
             match resized {
                 Ok(()) => {
-                    (p.width, p.height, p.format) = (width, height, format);
+                    (p.width, p.height, p.format) = (swap_width, swap_height, format);
                     tracing::info!(
-                        width,
-                        height,
+                        width = swap_width,
+                        height = swap_height,
                         format = format.0,
                         frame,
                         "the swap chain's buffers were made again for another size or format"
@@ -10431,7 +10440,7 @@ impl Host {
                     self.log_video_memory("right after the swap chain's buffers were made again");
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, width, height, "swap chain not resized");
+                    tracing::warn!(error = %e, width = swap_width, height = swap_height, "swap chain not resized");
                     return None;
                 }
             }
@@ -10484,7 +10493,13 @@ impl Host {
             if let Some(laid) = &laid {
                 copy.keep(laid);
             }
-            list.CopyResource(&back, laid.as_ref().unwrap_or(texture));
+            let shown = laid.as_ref().unwrap_or(texture);
+            if crate::upscale::copies((width, height), (p.width, p.height)) {
+                list.CopyResource(&back, shown);
+            } else if !crate::upscale::record(&self.device, list, shown, &back, (p.width, p.height), format, crate::upscale::sharpness()) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!("present scale: a frame was not scaled; the window shows an old buffer"));
+            }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -10494,7 +10509,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             let watched = crate::popwatch::take(&self.device, list, texture);
             #[cfg(feature = "diagnostics")]
-            p.panel.draw(self, copy, &back, (width, height), format);
+            p.panel.draw(self, copy, &back, (p.width, p.height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             list.ResourceBarrier(&[
@@ -10598,6 +10613,15 @@ impl Host {
             })
         }
     }
+}
+
+/// The window's client size, for `VICTORY_PRESENT_SCALE`. Read at each
+/// present: one call, and maximising or leaving full screen shows at once.
+fn client_size(hwnd: HWND) -> Option<(u32, u32)> {
+    let mut rect = RECT::default();
+    // SAFETY: a window handle and a rectangle of ours.
+    unsafe { GetClientRect(hwnd, &mut rect) }.ok()?;
+    Some(((rect.right - rect.left).max(0) as u32, (rect.bottom - rect.top).max(0) as u32))
 }
 
 /// A visible top-level window of this process: the one the title made, if

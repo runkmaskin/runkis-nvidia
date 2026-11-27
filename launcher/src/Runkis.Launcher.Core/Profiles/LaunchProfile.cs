@@ -52,6 +52,10 @@ public sealed class LaunchProfile
     public bool SkipBvh { get; set; } = true;
     public bool SkipHairSim { get; set; }
     public bool LeaveOut { get; set; }
+    /// <summary>VICTORY_PRESENT_SCALE=1 (upscale.rs): the 1080p frame scaled to the window with a sharp filter, not stretched by Windows.</summary>
+    public bool PresentScale { get; set; }
+    /// <summary>VICTORY_PRESENT_SHARPEN (0..1), with <see cref="PresentScale"/> only.</summary>
+    public double PresentSharpen { get; set; } = 0.3;
 
     // ---- Performance overrides (null: what the script sets) ----
     /// <summary>VICTORY_PIPELINE_WAIT_MS (pipeline/make.rs).</summary>
