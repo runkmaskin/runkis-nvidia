@@ -24,7 +24,9 @@ param(
     [string]$Adapter,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{},
-    [switch]$Precompile   # local: translate every shader with these exact settings (cache warm), no run
+    [switch]$Precompile,  # local: translate every shader with these exact settings (cache warm), no run
+    [switch]$Warm,        # local: build every recorded pipeline into the driver's cache (victory warm), no run
+    [int]$WarmLimit = 0   # local: with -Warm, at most this many pipelines (0: all)
 )
 $settings = @{
     # This fork's play set (scripts\play.ps1, not -Safe): the speed set.
@@ -48,7 +50,17 @@ $settings = @{
     # Wait for new shaders rather than skip their draws (a hitch the first time a place is seen). Each pipeline is
     # waited for at most once (VICTORY_PIPELINE_WAIT_ONCE, on by default): one that takes longer no longer stops the
     # picture in every frame it is in view (pipeline/make.rs).
-    VICTORY_PIPELINE_WAIT_MS = '10000'
+    # local: 0.5 s, not 10 s: a pipeline that takes longer (up to 5 s measured) shows a moment later instead of
+    # freezing the picture (as Yaekai/victory-scarlett-3070 does with 20 ms). Test run 2026-11-27: looked right.
+    VICTORY_PIPELINE_WAIT_MS = '500'
+    # local: 8 GB card: the top level of textures 2048 px and larger stays off the card (Yaekai 707d7d9 port);
+    # 1024 removed the card-full churn entirely but was visibly blurrier. Test run T1: 1 % low 7.2 fps (best).
+    VICTORY_TEXTURE_MIP_DROP = '1'; VICTORY_TEXTURE_MIP_DROP_MIN_SIZE = '2048'
+    # local: 6 threads for the big memory compares on a 12-thread CPU, not 3 (foxhound f502018)
+    VICTORY_WIDE_THREADS = '6'
+    # local: write down every pipeline the title creates (pipeline/known.rs), so -Warm can build them all into the
+    # driver's cache before play: fewer hitches the first time a place is seen.
+    VICTORY_PIPELINE_BOOK = '1'
     # NVIDIA caps the shader-visible view heap at 1,000,000: without more dynamic slots thousands of draws a frame
     # are dropped (descriptor/host.rs dynamic_slots).
     VICTORY_DYNAMIC_SLOTS = '524288'
@@ -125,5 +137,6 @@ $Exe = (Resolve-Path $Exe).Path
 $runArgs = @('run', $Exe, '--execute')
 if (-not $SeriesX) { $runArgs += @('--console', 'series-s') }
 if ($Precompile) { $runArgs = @('shaders', (Split-Path $Exe)) }
+if ($Warm) { $runArgs = @('warm'); if ($WarmLimit -gt 0) { $runArgs += @('--limit', "$WarmLimit") } }
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try { & $victory @runArgs } finally { Pop-Location }

@@ -1482,9 +1482,18 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`] (`VICTORY_WIDE_THREADS=<n>`, 1 to
+/// 16; by default a quarter of the logical processors, 2 to 6: 3 on a
+/// 12-thread processor, where the submitting thread waits on them for its
+/// refreshes and snapshots).
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let asked = std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok());
+        let n = asked.map_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6), |n| n.clamp(1, 16));
+        tracing::info!(threads = n, "threads kept for work spread over threads (VICTORY_WIDE_THREADS)");
+        n
+    })
 }
 
 fn workers() -> &'static Workers {
@@ -3459,7 +3468,9 @@ impl Shadow {
                 return to;
             }
             let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
+            // (saturating: near the copy's start, the piece `at` lies in may
+            // begin before the copy does; Yaekai b4e351c, fxceless#1407)
+            at.saturating_sub((start + at) % PIECE).max(from)
         };
         let scan = &scan;
         std::thread::scope(|s| {
