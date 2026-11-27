@@ -22,7 +22,7 @@ param(
     [switch]$RayTracing,
     [ValidateSet('2160', '1440', '1080', '720', '540', '480')][string]$Resolution,
     [string]$Adapter,
-    [ValidateSet('diag', 'release')][string]$Build = 'diag',
+    [ValidateSet('diag', 'release', 'ab')][string]$Build = 'diag',
     [hashtable]$More = @{},
     [switch]$Precompile,  # local: translate every shader with these exact settings (cache warm), no run
     [switch]$Warm,        # local: build every recorded pipeline into the driver's cache (victory warm), no run
