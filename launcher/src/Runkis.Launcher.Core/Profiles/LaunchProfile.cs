@@ -7,6 +7,8 @@ public enum ConsoleModel { SeriesS, SeriesX }
 public enum BuildKind { Diag, Release }
 public enum DredMode { Off, Light, Full }
 public enum RunMode { Play, Warm, Precompile }
+/// <summary>VICTORY_WINDOW (display.rs): a framed window, a borderless one covering the monitor, or full screen (borderless too).</summary>
+public enum WindowMode { Windowed, Borderless, Fullscreen }
 
 /// <summary>
 /// One saved way to start the title. The base settings come from scripts\play-nvidia.ps1 (its switches are the
@@ -56,6 +58,13 @@ public sealed class LaunchProfile
     public bool PresentScale { get; set; }
     /// <summary>VICTORY_PRESENT_SHARPEN (0..1), with <see cref="PresentScale"/> only.</summary>
     public double PresentSharpen { get; set; } = 0.3;
+    // ---- Display (display.rs; the defaults set nothing, so the window is made as before) ----
+    /// <summary>VICTORY_WINDOW: set only when not <see cref="WindowMode.Windowed"/>.</summary>
+    public WindowMode Window { get; set; } = WindowMode.Windowed;
+    /// <summary>VICTORY_WINDOW_SIZE ("1600x900", the client area) for a framed window; empty: the game's own size, fitted to the screen.</summary>
+    public string WindowSize { get; set; } = "";
+    /// <summary>VICTORY_MONITOR: 1 for the first monitor Windows lists; 0: the main monitor.</summary>
+    public int Monitor { get; set; }
     /// <summary>VICTORY_MOUSE=1 (gameinput.rs): the mouse turns the camera (right stick), left button fires, right aims.</summary>
     public bool Mouse { get; set; } = true;
     /// <summary>VICTORY_MOUSE_SENSE, with <see cref="Mouse"/> only (1: 12 pixels in 8 ms is a full stick).</summary>

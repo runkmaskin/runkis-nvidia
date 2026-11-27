@@ -10715,6 +10715,11 @@ impl Host {
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            // LOCAL: with display settings Alt+Enter is ours (framed or
+            // borderless); DXGI's own would try exclusive full screen.
+            if crate::display::settings().is_some() {
+                let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+            }
             let latency = pacing::latency().and_then(|frames| pacing::Latency::new(&swap_chain, frames));
             let copy = self.new_list()?;
             copy.close();
@@ -11215,6 +11220,12 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if crate::display::settings().is_some()
+        && crate::display::is_alt_enter(message, wparam.0, lparam.0)
+    {
+        crate::display::toggle(hwnd.0 as isize);
+        return LRESULT(0);
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
@@ -11240,15 +11251,26 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+        let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+        // LOCAL: the display settings place it; unset, as before.
+        let (ex_style, style, x, y, w, h) = match crate::display::place_now(
+            0,
+            (WS_OVERLAPPEDWINDOW | WS_VISIBLE).0,
+            (w, h),
+            crate::display::fit_into,
+        ) {
+            Some(p) => (p.ex_style, p.style, p.rect.left, p.rect.top, p.rect.width(), p.rect.height()),
+            None => (0, (WS_OVERLAPPEDWINDOW | WS_VISIBLE).0, CW_USEDEFAULT, CW_USEDEFAULT, w, h),
+        };
         CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            WINDOW_EX_STYLE(ex_style),
             CLASS,
             w!("VIctory"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
+            WINDOW_STYLE(style),
+            x,
+            y,
+            w,
+            h,
             None,
             None,
             Some(instance.into()),

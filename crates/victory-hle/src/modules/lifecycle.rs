@@ -110,7 +110,7 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (ex_style, style, x, y, width, height) = place(parent, ex_style, style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -136,7 +136,7 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (ex_style, style, x, y, width, height) = place(parent, ex_style, style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -145,6 +145,43 @@ pub extern "system" fn CreateWindowExA(
     };
     hook(hwnd);
     hwnd
+}
+
+/// LOCAL: a top-level window placed by the display settings
+/// (`victory_gpu::display`), or as [`fit`] places it when none are set.
+#[allow(clippy::too_many_arguments)]
+fn place(
+    parent: HWND,
+    ex_style: u32,
+    style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (u32, u32, i32, i32, i32, i32) {
+    let top_level = parent.is_null() && style & wm::WS_CHILD == 0;
+    if top_level && victory_gpu::display::settings().is_some() {
+        // A framed window asking for CW_USEDEFAULT, with no size set, has no
+        // rectangle to centre: it is made as before (the check below).
+        let outer = (width, height);
+        let fit = |work: victory_gpu::display::Area, w: i32, h: i32| {
+            let area = RECT {
+                left: work.left,
+                top: work.top,
+                right: work.right,
+                bottom: work.bottom,
+            };
+            fit_with_limit(&area, w, h, window_limit())
+        };
+        if let Some(p) = victory_gpu::display::place_now(ex_style, style, outer, fit)
+            && p.rect.width() > 0
+            && p.rect.height() > 0
+        {
+            return (p.ex_style, p.style, p.rect.left, p.rect.top, p.rect.width(), p.rect.height());
+        }
+    }
+    let (x, y, width, height) = fit(parent, x, y, width, height);
+    (ex_style, style, x, y, width, height)
 }
 
 /// A console title sizes its window to its render target (
@@ -260,6 +297,18 @@ extern "system" fn window_proc(
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
+    }
+    // LOCAL: with display settings, Alt+Enter switches between a framed
+    // and a borderless window. The title never sees the key.
+    if victory_gpu::display::settings().is_some() {
+        if victory_gpu::display::is_alt_enter(message, wparam, lparam) {
+            victory_gpu::display::toggle(hwnd as isize);
+            return 0;
+        }
+        // The Enter of Alt+Enter as a character would only beep.
+        if message == wm::WM_SYSCHAR && wparam == usize::from(b'\r') {
+            return 0;
+        }
     }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {

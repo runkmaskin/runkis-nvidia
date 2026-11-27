@@ -156,6 +156,10 @@ public sealed class PlanBuilder(RepoLayout repo)
             o["VICTORY_PRESENT_SCALE"] = "1";
             o["VICTORY_PRESENT_SHARPEN"] = Num(p.PresentSharpen);
         }
+        // Display: the defaults (a framed window of the game's size on the main monitor) set nothing.
+        if (p.Window != WindowMode.Windowed) o["VICTORY_WINDOW"] = p.Window.ToString().ToLowerInvariant();
+        else if (Displays.TryParseSize(p.WindowSize, out var w, out var h)) o["VICTORY_WINDOW_SIZE"] = Displays.Size(w, h);
+        if (p.Monitor > 0) Int("VICTORY_MONITOR", p.Monitor);
         if (p.Mouse)
         {
             o["VICTORY_MOUSE"] = "1";

@@ -31,6 +31,9 @@ mod faultbook;
 mod cores;
 pub mod descriptor;
 pub mod device;
+// LOCAL: VICTORY_WINDOW, VICTORY_WINDOW_SIZE, VICTORY_MONITOR.
+#[cfg(windows)]
+pub mod display;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;

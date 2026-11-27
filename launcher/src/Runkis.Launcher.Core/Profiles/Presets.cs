@@ -108,6 +108,10 @@ public static class Presets
             Mouse = basis.Mouse,
             MouseSense = basis.MouseSense,
             KeyMap = basis.KeyMap == null ? null : new(basis.KeyMap),
+            // So is the window: its mode, size and monitor.
+            Window = basis.Window,
+            WindowSize = basis.WindowSize,
+            Monitor = basis.Monitor,
         };
         preset.Apply(p);
         return p;

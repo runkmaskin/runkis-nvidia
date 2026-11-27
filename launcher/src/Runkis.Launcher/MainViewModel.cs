@@ -59,6 +59,9 @@ public sealed class MainViewModel : Observable, IDisposable
         AdapterChoices = [new("Windows' default card (#0)", "")];
         foreach (var a in adapters.Where(a => !a.Software)) AdapterChoices.Add(new($"#{a.Index}  {a.Name}", $"#{a.Index}"));
         ResolutionChoices = [new("Half of the output (default)", null), .. ProfileValidator.Resolutions.Select(r => new Choice($"{r}p", (int?)r))];
+        Monitors = Displays.List();
+        MonitorChoices = [new(Displays.Pick(Monitors, 0) is { } main ? $"Main monitor ({main.Width} x {main.Height})" : "Main monitor", 0),
+                          .. Monitors.Select(m => new Choice(m.Label, m.Number))];
 
         repo = RepoLayout.Find(settings.RepoRoot) ?? RepoLayout.Find(AppContext.BaseDirectory) ?? RepoLayout.Find(Environment.CurrentDirectory);
         LogView = CollectionViewSource.GetDefaultView(LogLines);
@@ -92,6 +95,7 @@ public sealed class MainViewModel : Observable, IDisposable
         CopyLog = new Command(() => Clipboard.SetText(string.Join(Environment.NewLine, LogView.Cast<LogLine>().Select(l => l.Text))));
         ClearLog = new Command(() => LogLines.Clear());
         Go = new Command(p => Page = p as string ?? "Play");
+        ToggleDevMode = new Command(() => DevMode = !DevMode);
         SavePreset = new Command(DoSavePreset, () => UsingPreset);
         WarmUp = new Command(() => { warmUpNext = true; _ = StartAsync(RunMode.Precompile); }, () => CanStart);
 
@@ -107,8 +111,85 @@ public sealed class MainViewModel : Observable, IDisposable
     }
 
     // ---------------------------------------------------------------- navigation and state
-    public string Page { get => page; set { if (Set(ref page, value)) { Raise(nameof(PageIndex)); Controls.CancelCapture(); if (value == "Benchmark") Bench.RefreshSources(); } } }
+    public string Page { get => page; set { if (!DevMode && DevPages.Contains(value)) value = "Play"; if (Set(ref page, value)) { Raise(nameof(PageIndex)); Controls.CancelCapture(); if (value == "Benchmark") Bench.RefreshSources(); } } }
     public int PageIndex => Page switch { "Settings" => 1, "Diagnostics" => 2, "Logs" => 3, "System" => 4, "Benchmark" => 5, "Controls" => 6, _ => 0 };
+    // ---------------------------------------------------------------- play mode and dev mode
+    /// <summary>The pages only Dev mode shows.</summary>
+    private static readonly string[] DevPages = ["Benchmark", "Diagnostics", "Logs", "System"];
+    /// <summary>Dev mode: every page and field. Play mode (false, the default): the game, PLAY and the settings a player needs.</summary>
+    public bool DevMode
+    {
+        get => settings.DevMode;
+        set
+        {
+            if (settings.DevMode == value) return;
+            settings.DevMode = value;
+            settings.Save();
+            Raise();
+            Raise(nameof(ModeLabel));
+            if (!value && DevPages.Contains(Page)) Page = "Play";
+        }
+    }
+    public string ModeLabel => DevMode ? "Dev mode" : "Play mode";
+    public Command ToggleDevMode { get; }
+
+    // ---------------------------------------------------------------- display
+    public List<DisplayMonitor> Monitors { get; }
+    public List<Choice> MonitorChoices { get; }
+    public List<Choice> WindowModeChoices { get; } =
+        [new("Windowed", WindowMode.Windowed), new("Borderless window", WindowMode.Borderless), new("Fullscreen", WindowMode.Fullscreen)];
+    private DisplayMonitor? ChosenMonitor => Displays.Pick(Monitors, profile.Monitor);
+    /// <summary>The display mode; borderless or full screen on a monitor above 1080p ticks the sharp upscale.</summary>
+    public WindowMode DisplayMode
+    {
+        get => profile.Window;
+        set
+        {
+            if (profile.Window == value) return;
+            profile.Window = value;
+            SuggestUpscale();
+            Raise();
+            Raise(nameof(IsWindowed));
+        }
+    }
+    public bool IsWindowed => profile.Window == WindowMode.Windowed;
+    public int DisplayMonitorNumber
+    {
+        get => profile.Monitor;
+        set
+        {
+            if (profile.Monitor == value) return;
+            profile.Monitor = value;
+            SuggestUpscale();
+            Raise();
+            Raise(nameof(WindowSizeChoices));
+        }
+    }
+    /// <summary>The sizes for a framed window on the chosen monitor; a size typed into the profile file is kept in the list.</summary>
+    public List<Choice> WindowSizeChoices
+    {
+        get
+        {
+            var monitor = ChosenMonitor;
+            var list = new List<Choice> { new("The game's own size, fitted to the screen", "") };
+            foreach (var s in Displays.WindowSizes(monitor))
+                list.Add(new(monitor != null && s == Displays.Size(monitor.Width, monitor.Height) ? $"{s.Replace("x", " x ")} (the monitor's own)" : s.Replace("x", " x "), s));
+            if (!string.IsNullOrWhiteSpace(profile.WindowSize) && list.All(c => (string?)c.Value != profile.WindowSize))
+                list.Add(new(profile.WindowSize, profile.WindowSize));
+            return list;
+        }
+    }
+
+    private void SuggestUpscale()
+    {
+        if (Displays.SuggestPresentScale(profile.Window, ChosenMonitor) && !profile.PresentScale)
+        {
+            profile.PresentScale = true;
+            Raise(nameof(Profile));
+            Toast("Upscale to the window (sharp) is on: the game draws 1080p, and this monitor is larger.");
+        }
+    }
+
     /// <summary>The Controls page: keys of the stand-in pad and the mouse camera.</summary>
     public ControlsViewModel Controls { get; }
     public string RepoText => repo?.Root ?? "Not found: choose the runkis-nvidia folder";
@@ -156,7 +237,7 @@ public sealed class MainViewModel : Observable, IDisposable
         $"Series {(profile.Console == ConsoleModel.SeriesX ? "X" : "S")} · {(profile.Resolution is int r ? $"{r}p" : "half scale")} · "
         + $"{(profile.Quality ? "Quality" : "Speed")} · {RepoLayout.BuildFolder(profile.Build)} build · "
         + (Dxgi.Resolve(adapters, profile.Adapter).Adapter?.Name ?? "no card");
-    public string ValidationText => string.Join("\n", ProfileValidator.Validate(profile, repo).Select(i => (i.Blocking ? "✕ " : "! ") + i.Message));
+    public string ValidationText => string.Join("\n", ProfileValidator.Validate(profile, repo, Monitors).Select(i => (i.Blocking ? "✕ " : "! ") + i.Message));
 
     public Array Consoles { get; } = Enum.GetValues<ConsoleModel>();
     public Array Builds { get; } = Enum.GetValues<BuildKind>();
@@ -224,6 +305,10 @@ public sealed class MainViewModel : Observable, IDisposable
         Raise(nameof(ProfileSummary));
         Raise(nameof(ValidationText));
         Raise(nameof(StartDescription));
+        Raise(nameof(DisplayMode));
+        Raise(nameof(IsWindowed));
+        Raise(nameof(DisplayMonitorNumber));
+        Raise(nameof(WindowSizeChoices));
         Controls.Load();
     }
 
@@ -603,6 +688,9 @@ public sealed class MainViewModel : Observable, IDisposable
     public bool ChecksRunning { get => checksRunning; private set => Set(ref checksRunning, value); }
     private string checksSummary = "";
     public string ChecksSummary { get => checksSummary; private set => Set(ref checksSummary, value); }
+    private string checkIssues = "";
+    /// <summary>The checks that did not pass, one per line, for the Play page in Play mode (Dev mode has the Diagnostics page).</summary>
+    public string CheckIssues { get => checkIssues; private set => Set(ref checkIssues, value); }
 
     private async Task RunChecksAsync()
     {
@@ -616,6 +704,8 @@ public sealed class MainViewModel : Observable, IDisposable
             Checks.Clear();
             foreach (var c in results.OrderByDescending(c => c.Status)) Checks.Add(c);
             int fails = results.Count(c => c.Status == CheckStatus.Fail), warns = results.Count(c => c.Status == CheckStatus.Warning);
+            CheckIssues = string.Join("\n", results.Where(c => c.Status != CheckStatus.Pass).OrderByDescending(c => c.Status)
+                .Select(c => (c.Status == CheckStatus.Fail ? "✕ " : "! ") + c.Title + (string.IsNullOrWhiteSpace(c.Fix) ? "" : ": " + c.Fix)));
             ChecksSummary = fails > 0 ? $"{fails} problem(s) will stop a run, {warns} warning(s)" : warns > 0 ? $"Ready, with {warns} warning(s)" : "Everything checked is ready";
             Machine = SystemInfo.Read();
             Raise(nameof(Machine));

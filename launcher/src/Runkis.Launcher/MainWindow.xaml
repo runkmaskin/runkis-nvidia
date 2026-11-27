@@ -69,14 +69,23 @@
                          Visibility="{Binding WarmBarVisible, Converter={StaticResource Vis}}"/>
           </StackPanel>
         </Border>
+        <!-- Play mode / Dev mode: remembered in launcher.json -->
+        <Border DockPanel.Dock="Bottom" Background="{StaticResource Card}" CornerRadius="10" Padding="14,10" Margin="0,0,0,10"
+                BorderBrush="{StaticResource Line}" BorderThickness="1"
+                ToolTip="Play mode shows the game, PLAY and the settings a player needs. Dev mode shows every page and setting: Benchmark, Diagnostics, Logs, System, performance and log settings.">
+          <StackPanel>
+            <TextBlock Text="{Binding ModeLabel}" FontWeight="SemiBold"/>
+            <CheckBox IsChecked="{Binding DevMode}" Content="Developer pages and settings" Margin="0,6,0,0"/>
+          </StackPanel>
+        </Border>
         <StackPanel>
           <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Play" Command="{Binding Go}" CommandParameter="Play" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=0}"/>
-          <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Benchmark" Command="{Binding Go}" CommandParameter="Benchmark" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=5}"/>
+          <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Benchmark" Visibility="{Binding DevMode, Converter={StaticResource Vis}}" Command="{Binding Go}" CommandParameter="Benchmark" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=5}"/>
           <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Settings" Command="{Binding Go}" CommandParameter="Settings" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=1}"/>
           <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Controls" Command="{Binding Go}" CommandParameter="Controls" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=6}"/>
-          <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Diagnostics" Command="{Binding Go}" CommandParameter="Diagnostics" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=2}"/>
-          <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Logs" Command="{Binding Go}" CommandParameter="Logs" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=3}"/>
-          <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="System" Command="{Binding Go}" CommandParameter="System" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=4}"/>
+          <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Diagnostics" Visibility="{Binding DevMode, Converter={StaticResource Vis}}" Command="{Binding Go}" CommandParameter="Diagnostics" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=2}"/>
+          <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Logs" Visibility="{Binding DevMode, Converter={StaticResource Vis}}" Command="{Binding Go}" CommandParameter="Logs" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=3}"/>
+          <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="System" Visibility="{Binding DevMode, Converter={StaticResource Vis}}" Command="{Binding Go}" CommandParameter="System" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=4}"/>
         </StackPanel>
       </DockPanel>
     </Border>
@@ -205,6 +214,8 @@
               <ContentControl Content="{Binding FrameTime}" ContentTemplate="{StaticResource TileTemplate}"/>
               <ContentControl Content="{Binding Low}" ContentTemplate="{StaticResource TileTemplate}"/>
               <ContentControl Content="{Binding Hitches}" ContentTemplate="{StaticResource TileTemplate}"/>
+            </UniformGrid>
+            <UniformGrid Columns="4" Margin="0,0,-12,0" Visibility="{Binding DevMode, Converter={StaticResource Vis}}">
               <ContentControl Content="{Binding CpuTile}" ContentTemplate="{StaticResource TileTemplate}"/>
               <ContentControl Content="{Binding Ram}" ContentTemplate="{StaticResource TileTemplate}"/>
               <ContentControl Content="{Binding Gpu}" ContentTemplate="{StaticResource TileTemplate}"/>
@@ -229,13 +240,19 @@
                 </Grid.ColumnDefinitions>
                 <StackPanel>
                   <TextBlock Text="Before you play" Style="{StaticResource H2}"/>
-                  <TextBlock Style="{StaticResource Hint}" Margin="0">
+                  <TextBlock Style="{StaticResource Hint}" Margin="0" Visibility="{Binding DevMode, Converter={StaticResource Vis}}">
                     Translate shaders once per new build, and build the pipeline cache after a session that met new places
                     (needs about 23 GB free on C:). Both cut the hitches of the first visit.
                   </TextBlock>
+                  <TextBlock Style="{StaticResource Hint}" Margin="0" Visibility="{Binding DevMode, Converter={StaticResource Vis}, ConverterParameter=not}">
+                    Press Warm up shaders once after a new build, and again after playing new places (needs about 23 GB free on C:).
+                    It cuts the hitches of the first visit.
+                  </TextBlock>
                   <TextBlock Text="{Binding ChecksSummary}" Margin="0,10,0,0" Foreground="{StaticResource Muted}"/>
+                  <TextBlock Text="{Binding CheckIssues}" Margin="0,6,0,0" Foreground="{StaticResource Warn}" TextWrapping="Wrap"
+                             Visibility="{Binding DevMode, Converter={StaticResource Vis}, ConverterParameter=not}"/>
                 </StackPanel>
-                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Visibility="{Binding DevMode, Converter={StaticResource Vis}}">
                   <Button Content="Translate shaders" Command="{Binding Precompile}" Margin="0,0,8,0"/>
                   <Button Content="Build pipeline cache" Command="{Binding Warm}" Margin="0,0,8,0"/>
                   <Button Content="Check setup" Command="{Binding Go}" CommandParameter="Diagnostics"/>
@@ -286,19 +303,19 @@
                   <TextBox Grid.Column="1" Text="{Binding Profile.GameExe, UpdateSourceTrigger=LostFocus}" VerticalAlignment="Center"/>
                   <Button Grid.Column="2" Content="Browse…" Command="{Binding BrowseGame}" Margin="8,0,0,0" VerticalAlignment="Center"/>
                 </Grid>
-                <Grid Style="{StaticResource Row}">
+                <Grid Style="{StaticResource Row}" Visibility="{Binding DevMode, Converter={StaticResource Vis}}">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                   <StackPanel><TextBlock Text="Cache folder"/><TextBlock Style="{StaticResource Hint}" Text="Translated shaders and pipelines. Empty: %LOCALAPPDATA%\victory\cache. Never inside the source tree."/></StackPanel>
                   <TextBox Grid.Column="1" Text="{Binding Profile.CacheDir, UpdateSourceTrigger=LostFocus, TargetNullValue=''}" VerticalAlignment="Center"/>
                   <Button Grid.Column="2" Content="Browse…" Command="{Binding BrowseCache}" Margin="8,0,0,0" VerticalAlignment="Center"/>
                 </Grid>
-                <Grid Style="{StaticResource Row}">
+                <Grid Style="{StaticResource Row}" Visibility="{Binding DevMode, Converter={StaticResource Vis}}">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                   <StackPanel><TextBlock Text="Data folder"/><TextBlock Style="{StaticResource Hint}" Text="Saves and crashes.log. Empty: %LOCALAPPDATA%\victory\data."/></StackPanel>
                   <TextBox Grid.Column="1" Text="{Binding Profile.DataDir, UpdateSourceTrigger=LostFocus, TargetNullValue=''}" VerticalAlignment="Center"/>
                   <Button Grid.Column="2" Content="Browse…" Command="{Binding BrowseData}" Margin="8,0,0,0" VerticalAlignment="Center"/>
                 </Grid>
-                <Grid>
+                <Grid Visibility="{Binding DevMode, Converter={StaticResource Vis}}">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                   <StackPanel><TextBlock Text="Project folder"/><TextBlock Style="{StaticResource Hint}" Text="The runkis-nvidia source tree with target\ and scripts\."/></StackPanel>
                   <TextBlock Grid.Column="1" Text="{Binding RepoText}" VerticalAlignment="Center" Foreground="{StaticResource Muted}" TextTrimming="CharacterEllipsis"/>
@@ -309,8 +326,41 @@
 
             <Border Style="{StaticResource CardBorder}" Margin="0,0,0,16">
               <StackPanel>
-                <TextBlock Text="Console, picture size and graphics card" Style="{StaticResource H2}"/>
+                <TextBlock Text="Display" Style="{StaticResource H2}"/>
                 <Grid Style="{StaticResource Row}">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                  <StackPanel><TextBlock Text="Display mode"/><TextBlock Style="{StaticResource Hint}" Text="Windowed: a window with a frame. Borderless window and Fullscreen: no frame, covering the whole monitor (full screen is borderless too, so Alt+Tab is instant). Alt+Enter switches while you play."/></StackPanel>
+                  <ComboBox Grid.Column="1" ItemsSource="{Binding WindowModeChoices}" DisplayMemberPath="Label" SelectedValuePath="Value"
+                            SelectedValue="{Binding DisplayMode}" Width="260" HorizontalAlignment="Left" VerticalAlignment="Center"/>
+                </Grid>
+                <Grid Style="{StaticResource Row}" Visibility="{Binding IsWindowed, Converter={StaticResource Vis}}">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                  <StackPanel><TextBlock Text="Window size"/><TextBlock Style="{StaticResource Hint}" Text="The picture area of the window. A size larger than the screen shrinks to fit, with the frame."/></StackPanel>
+                  <ComboBox Grid.Column="1" ItemsSource="{Binding WindowSizeChoices}" DisplayMemberPath="Label" SelectedValuePath="Value"
+                            SelectedValue="{Binding Profile.WindowSize}" Width="360" HorizontalAlignment="Left" VerticalAlignment="Center"/>
+                </Grid>
+                <Grid Style="{StaticResource Row}">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                  <StackPanel><TextBlock Text="Monitor"/><TextBlock Style="{StaticResource Hint}" Text="Which monitor the game opens on, numbered in the order Windows lists them."/></StackPanel>
+                  <ComboBox Grid.Column="1" ItemsSource="{Binding MonitorChoices}" DisplayMemberPath="Label" SelectedValuePath="Value"
+                            SelectedValue="{Binding DisplayMonitorNumber}" Width="360" HorizontalAlignment="Left" VerticalAlignment="Center"/>
+                </Grid>
+                <Grid Style="{StaticResource Row}">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                  <StackPanel><TextBlock Text="Upscale to the window (sharp)"/><TextBlock Style="{StaticResource Hint}" Text="Scales the 1080p frame to the window with a sharp filter, instead of Windows' blurry stretch. For screens above 1080p; turned on when you pick borderless or full screen on such a monitor."/></StackPanel>
+                  <CheckBox Grid.Column="1" IsChecked="{Binding Profile.PresentScale}" VerticalAlignment="Center"/>
+                </Grid>
+                <Grid>
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition Width="140"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                  <StackPanel><TextBlock Text="Upscale sharpening"/><TextBlock Style="{StaticResource Hint}" Text="0-1, with the upscale only. 0: none; 0.3: light (default)."/></StackPanel>
+                  <TextBox Grid.Column="1" Text="{Binding Profile.PresentSharpen, UpdateSourceTrigger=LostFocus}" VerticalAlignment="Center"/>
+                </Grid>
+              </StackPanel>
+            </Border>
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,16">
+              <StackPanel>
+                <TextBlock Text="Console, picture size and graphics card" Style="{StaticResource H2}"/>
+                <Grid Style="{StaticResource Row}" Visibility="{Binding DevMode, Converter={StaticResource Vis}}">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
                   <StackPanel><TextBlock Text="Console model"/><TextBlock Style="{StaticResource Hint}" Text="Series S outputs 1080p and is what this build is tuned for; Series X (2160p) is much slower."/></StackPanel>
                   <ComboBox Grid.Column="1" ItemsSource="{Binding Consoles}" SelectedItem="{Binding Profile.Console}" Width="260" HorizontalAlignment="Left"/>
@@ -321,16 +371,6 @@
                   <ComboBox Grid.Column="1" ItemsSource="{Binding ResolutionChoices}" DisplayMemberPath="Label" SelectedValuePath="Value"
                             SelectedValue="{Binding Profile.Resolution}" Width="260" HorizontalAlignment="Left"/>
                 </Grid>
-                <Grid Style="{StaticResource Row}">
-                  <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
-                  <StackPanel><TextBlock Text="Upscale to the window (sharp)"/><TextBlock Style="{StaticResource Hint}" Text="Scales the 1080p frame to the window with a sharp filter, instead of Windows' blurry stretch. For screens above 1080p (VICTORY_PRESENT_SCALE)."/></StackPanel>
-                  <CheckBox Grid.Column="1" IsChecked="{Binding Profile.PresentScale}" VerticalAlignment="Center"/>
-                </Grid>
-                <Grid Style="{StaticResource Row}">
-                  <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition Width="140"/><ColumnDefinition/></Grid.ColumnDefinitions>
-                  <StackPanel><TextBlock Text="Upscale sharpening"/><TextBlock Style="{StaticResource Hint}" Text="0-1, with the upscale only. 0: none; 0.3: light (default)."/></StackPanel>
-                  <TextBox Grid.Column="1" Text="{Binding Profile.PresentSharpen, UpdateSourceTrigger=LostFocus}" VerticalAlignment="Center"/>
-                </Grid>
 
                 <Grid Style="{StaticResource Row}">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
@@ -338,12 +378,12 @@
                   <ComboBox Grid.Column="1" ItemsSource="{Binding AdapterChoices}" DisplayMemberPath="Label" SelectedValuePath="Value"
                             SelectedValue="{Binding Profile.Adapter}" Width="420" HorizontalAlignment="Left"/>
                 </Grid>
-                <Grid Style="{StaticResource Row}">
+                <Grid Style="{StaticResource Row}" Visibility="{Binding DevMode, Converter={StaticResource Vis}}">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
                   <StackPanel><TextBlock Text="Build"/><TextBlock Style="{StaticResource Hint}" Text="Diag: the build every measurement is of (DRED, debug logs). Release: same speed, fewer tools."/></StackPanel>
                   <ComboBox Grid.Column="1" ItemsSource="{Binding Builds}" SelectedItem="{Binding Profile.Build}" Width="260" HorizontalAlignment="Left"/>
                 </Grid>
-                <Grid>
+                <Grid Visibility="{Binding DevMode, Converter={StaticResource Vis}}">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
                   <StackPanel><TextBlock Text="Smooth Motion copy"/><TextBlock Style="{StaticResource Hint}" Text="Start victory_sm.exe, so an NVIDIA App Smooth Motion profile set for that name applies (RTX 40/50)."/></StackPanel>
                   <CheckBox Grid.Column="1" IsChecked="{Binding Profile.SmoothMotionCopy}" VerticalAlignment="Center"/>
@@ -359,34 +399,34 @@
                   <StackPanel><TextBlock Text="Quality mode"/><TextBlock Style="{StaticResource Hint}" Text="Fixes bodies and textures flying through walls and rainbow skin, at about −29 % fps."/></StackPanel>
                   <CheckBox Grid.Column="1" IsChecked="{Binding Profile.Quality}" VerticalAlignment="Center"/>
                 </Grid>
-                <Grid Style="{StaticResource Row}">
+                <Grid Style="{StaticResource Row}" Visibility="{Binding DevMode, Converter={StaticResource Vis}}">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
                   <StackPanel><TextBlock Text="Ray-tracing passes"/><TextBlock Style="{StaticResource Hint}" Text="Keep the title's ray-traced passes. Off by default: on NVIDIA every ray misses and rooms turn white."/></StackPanel>
                   <CheckBox Grid.Column="1" IsChecked="{Binding Profile.RayTracing}" VerticalAlignment="Center"/>
                 </Grid>
-                <Grid Style="{StaticResource Row}">
+                <Grid Style="{StaticResource Row}" Visibility="{Binding DevMode, Converter={StaticResource Vis}}">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition Width="140"/><ColumnDefinition/></Grid.ColumnDefinitions>
                   <StackPanel><TextBlock Text="Indoor haze"/><TextBlock Style="{StaticResource Hint}" Text="How much light the air scatters (0-3). Lower: less brown haze indoors. Developer value 1.5."/></StackPanel>
                   <TextBox Grid.Column="1" Text="{Binding Profile.Air, UpdateSourceTrigger=LostFocus}" VerticalAlignment="Center"/>
                 </Grid>
-                <Grid Style="{StaticResource Row}">
+                <Grid Style="{StaticResource Row}" Visibility="{Binding DevMode, Converter={StaticResource Vis}}">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition Width="140"/><ColumnDefinition/></Grid.ColumnDefinitions>
                   <StackPanel><TextBlock Text="Steady light"/><TextBlock Style="{StaticResource Hint}" Text="0-1: how much of each pixel's light is the slow mean. Higher stops pulsing in crowds."/></StackPanel>
                   <TextBox Grid.Column="1" Text="{Binding Profile.Steady, UpdateSourceTrigger=LostFocus}" VerticalAlignment="Center"/>
                 </Grid>
-                <Grid Style="{StaticResource Row}">
+                <Grid Style="{StaticResource Row}" Visibility="{Binding DevMode, Converter={StaticResource Vis}}">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition Width="140"/><ColumnDefinition/></Grid.ColumnDefinitions>
                   <StackPanel><TextBlock Text="Stand-in light level"/><TextBlock Style="{StaticResource Hint}" Text="0-2: the light used instead of ray-traced light."/></StackPanel>
                   <TextBox Grid.Column="1" Text="{Binding Profile.Ambient, UpdateSourceTrigger=LostFocus}" VerticalAlignment="Center"/>
                 </Grid>
-                <CheckBox IsChecked="{Binding Profile.SkipBvh}" Content="Skip ray-tracing skinning passes (they only feed structures never built here)"/>
+                <CheckBox Visibility="{Binding DevMode, Converter={StaticResource Vis}}" IsChecked="{Binding Profile.SkipBvh}" Content="Skip ray-tracing skinning passes (they only feed structures never built here)"/>
                 <CheckBox IsChecked="{Binding Profile.SkipHairSim}" Content="Skip hair physics (hair does not sway; saves GPU time)"/>
                 <CheckBox IsChecked="{Binding Profile.LeaveOut}" Content="Leave out decal defragmentation and heat haze (saves ~12 ms of GPU; removes brown smears)"/>
-                <TextBlock Style="{StaticResource Hint}" Text="The three skip lists apply when ray-tracing passes are off."/>
+                <TextBlock Style="{StaticResource Hint}" Text="The skips apply when ray-tracing passes are off (the default)."/>
               </StackPanel>
             </Border>
 
-            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,16">
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,16" Visibility="{Binding DevMode, Converter={StaticResource Vis}}">
               <StackPanel>
                 <TextBlock Text="Performance (empty: the script's tuned value)" Style="{StaticResource H2}"/>
                 <Grid Style="{StaticResource Row}">
@@ -420,7 +460,7 @@
               </StackPanel>
             </Border>
 
-            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,16">
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,16" Visibility="{Binding DevMode, Converter={StaticResource Vis}}">
               <StackPanel>
                 <TextBlock Text="Diagnostics" Style="{StaticResource H2}"/>
                 <Grid Style="{StaticResource Row}">
@@ -442,7 +482,7 @@
               </StackPanel>
             </Border>
 
-            <Border Style="{StaticResource CardBorder}">
+            <Border Style="{StaticResource CardBorder}" Visibility="{Binding DevMode, Converter={StaticResource Vis}}">
               <StackPanel>
                 <DockPanel Margin="0,0,0,10">
                   <TextBlock Text="Effective settings" Style="{StaticResource H2}" Margin="0"/>

@@ -253,6 +253,110 @@ public class PlanTests
     }
 
     [Fact]
+    public void Display_defaults_set_no_variable()
+    {
+        var o = PlanBuilder.Overrides(new LaunchProfile());
+        Assert.False(o.ContainsKey("VICTORY_WINDOW"));
+        Assert.False(o.ContainsKey("VICTORY_WINDOW_SIZE"));
+        Assert.False(o.ContainsKey("VICTORY_MONITOR"));
+    }
+
+    [Theory]
+    [InlineData(WindowMode.Borderless, "", 0, "borderless", null, null)]
+    [InlineData(WindowMode.Fullscreen, "1600x900", 2, "fullscreen", null, "2")]   // a size is for a framed window only
+    [InlineData(WindowMode.Windowed, " 1600 X 900 ", 0, null, "1600x900", null)]
+    [InlineData(WindowMode.Windowed, "", 1, null, null, "1")]
+    public void Display_choices_map_to_the_layers_variables(WindowMode mode, string size, int monitor, string? window, string? windowSize, string? monitorVar)
+    {
+        var o = PlanBuilder.Overrides(new LaunchProfile { Window = mode, WindowSize = size, Monitor = monitor });
+        Assert.Equal(window, o.GetValueOrDefault("VICTORY_WINDOW"));
+        Assert.Equal(windowSize, o.GetValueOrDefault("VICTORY_WINDOW_SIZE"));
+        Assert.Equal(monitorVar, o.GetValueOrDefault("VICTORY_MONITOR"));
+    }
+
+    [Fact]
+    public void Display_choices_are_checked()
+    {
+        static List<ValidationIssue> Check(LaunchProfile p, int connected = 2) =>
+            ProfileValidator.Validate(p, null, Enumerable.Range(1, connected).Select(n => new DisplayMonitor(n, 0, 0, 1920, 1080, 1920, 1040, n == 1)).ToList());
+        Assert.Contains(Check(new LaunchProfile { WindowSize = "big" }), i => i.Field == nameof(LaunchProfile.WindowSize) && i.Blocking);
+        Assert.Contains(Check(new LaunchProfile { WindowSize = "0x900" }), i => i.Field == nameof(LaunchProfile.WindowSize) && i.Blocking);
+        Assert.Contains(Check(new LaunchProfile { Window = WindowMode.Borderless, WindowSize = "1600x900" }),
+            i => i.Field == nameof(LaunchProfile.WindowSize) && !i.Blocking);
+        Assert.DoesNotContain(Check(new LaunchProfile { WindowSize = "1600x900", Monitor = 2 }),
+            i => i.Field is nameof(LaunchProfile.WindowSize) or nameof(LaunchProfile.Monitor));
+        Assert.Contains(Check(new LaunchProfile { Monitor = 3 }), i => i.Field == nameof(LaunchProfile.Monitor) && !i.Blocking);
+        Assert.Contains(Check(new LaunchProfile { Monitor = -1 }), i => i.Field == nameof(LaunchProfile.Monitor) && i.Blocking);
+        Assert.Contains(Check(new LaunchProfile { Window = (WindowMode)7 }), i => i.Field == nameof(LaunchProfile.Window));
+    }
+
+    [Fact]
+    public void Display_parsing_matches_the_layer()
+    {
+        Assert.True(Displays.TryParseSize("1280x720", out var w, out var h));
+        Assert.Equal((1280, 720), (w, h));
+        Assert.True(Displays.TryParseSize(" 1280 X 720 ", out _, out _));
+        foreach (var bad in new[] { "", "1280", "0x720", "-1x720", "1x2x3", "99999x720", "+5x5", "a x b" })
+            Assert.False(Displays.TryParseSize(bad, out _, out _), bad);
+    }
+
+    private static readonly List<DisplayMonitor> TwoMonitors =
+    [
+        new(1, -1920, 0, 1920, 1080, 1920, 1040, false),
+        new(2, 0, 0, 2560, 1440, 2560, 1392, true),
+    ];
+
+    [Fact]
+    public void A_monitor_is_picked_as_the_layer_picks_it()
+    {
+        Assert.Equal(1, Displays.Pick(TwoMonitors, 1)!.Number);
+        Assert.Equal(2, Displays.Pick(TwoMonitors, 0)!.Number);   // the main monitor
+        Assert.Equal(2, Displays.Pick(TwoMonitors, 5)!.Number);   // not connected: the main monitor
+        Assert.Null(Displays.Pick([], 0));
+    }
+
+    [Fact]
+    public void Window_sizes_are_the_common_ones_that_fit_then_the_monitors_own()
+    {
+        Assert.Equal(["1280x720", "1600x900", "1920x1080"], Displays.WindowSizes(TwoMonitors[1]).Take(3));
+        Assert.Equal("2560x1440", Displays.WindowSizes(TwoMonitors[1]).Last());
+        Assert.Equal(["1280x720", "1600x900", "1920x1080"], Displays.WindowSizes(TwoMonitors[0]));
+        Assert.Equal(5, Displays.WindowSizes(null).Count);
+    }
+
+    [Fact]
+    public void The_sharp_upscale_is_suggested_for_a_covered_monitor_above_1080p()
+    {
+        Assert.True(Displays.SuggestPresentScale(WindowMode.Borderless, TwoMonitors[1]));
+        Assert.True(Displays.SuggestPresentScale(WindowMode.Fullscreen, TwoMonitors[1]));
+        Assert.False(Displays.SuggestPresentScale(WindowMode.Windowed, TwoMonitors[1]));
+        Assert.False(Displays.SuggestPresentScale(WindowMode.Fullscreen, TwoMonitors[0]));
+        Assert.False(Displays.SuggestPresentScale(WindowMode.Fullscreen, null));
+    }
+
+    [Fact]
+    public void Presets_keep_the_players_window()
+    {
+        var mine = new LaunchProfile { Window = WindowMode.Borderless, WindowSize = "1600x900", Monitor = 2 };
+        Assert.All(Presets.All, x =>
+        {
+            var p = Presets.Make(x, mine);
+            Assert.Equal((WindowMode.Borderless, "1600x900", 2), (p.Window, p.WindowSize, p.Monitor));
+        });
+    }
+
+    [Fact]
+    public void Display_choices_survive_the_profile_file()
+    {
+        using var d = new TempDir();
+        var store = new ProfileStore(d.Path);
+        store.Save(new LaunchProfile { Name = "screen", Window = WindowMode.Fullscreen, WindowSize = "1280x720", Monitor = 2 });
+        Assert.Contains("\"Fullscreen\"", File.ReadAllText(store.PathOf("screen")));
+        var back = store.Load("screen");
+        Assert.Equal((WindowMode.Fullscreen, "1280x720", 2), (back.Window, back.WindowSize, back.Monitor));
+    }
+
+    [Fact]
     public void Upscale_to_the_window_is_not_in_the_pc_preset()
     {
         var preset = Presets.ForThisPc([new GpuAdapter(0, "NVIDIA GeForce RTX 4070 SUPER", 0x10DE, 1, 12UL << 30, 0, 0, false, "32.0.16.2114")],

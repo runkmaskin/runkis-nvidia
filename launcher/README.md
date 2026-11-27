@@ -26,8 +26,8 @@ the .NET 8 SDK). Afterwards `launcher\dist\RunkisLauncher.exe` runs on the .NET 
 
 ## Presets ("Start as" on the Play page)
 
-Each preset is applied over the script's tuned set. It keeps your game, folders, card and build, and it can be
-saved as a profile.
+Each preset is applied over the script's tuned set. It keeps your game, folders, card, build, controls and window
+(display mode, size, monitor), and it can be saved as a profile.
 
 | Preset | What it sets |
 |---|---|
@@ -179,6 +179,35 @@ a target left out keeps its default (with `VICTORY_MOUSE=1`, the mouse's roles i
 understand is skipped with a warning in the log, and one info line gives the mapping in force. The tests check
 the launcher's names and defaults against the layer's own lists.
 
+## Play mode and Dev mode
+
+A switch at the bottom of the sidebar, remembered in `%APPDATA%\RunkisLauncher\launcher.json` (`DevMode`).
+
+- **Play mode** (the default) shows the pages a player needs: Play, Settings and Controls. The Play page has the
+  game, Start as, PLAY, Warm up shaders, the fps, frame time, 1 % low and hitch tiles, the frame-time graph, and
+  the setup checks that did not pass, one line each. Settings shows the profile, the game, Display (mode, window
+  size, monitor, upscale, sharpening), render height, graphics card, and the picture fixes as checkboxes
+  (Quality mode, hair physics, decals and heat haze).
+- **Dev mode** shows everything as before: Benchmark, Diagnostics, Logs, System, the CPU/RAM/GPU/VRAM tiles,
+  Translate shaders and Build pipeline cache, folders, console model, build, Smooth Motion copy, ray tracing, the
+  light values, Performance, Diagnostics (DRED, log filter, panel, warm-up limit) and the effective settings.
+
+Hidden fields keep their values; Play mode only hides them.
+
+## Display (Settings page)
+
+| Field | Variable (crates/victory-gpu/src/display.rs) | Default |
+|---|---|---|
+| Display mode: Windowed, Borderless window, Fullscreen | `VICTORY_WINDOW=borderless` or `fullscreen` | Windowed: not set |
+| Window size (Windowed only): common sizes below the monitor's, and the monitor's own | `VICTORY_WINDOW_SIZE=WxH` (client area) | the game's own size fitted to the screen: not set |
+| Monitor: numbered in Windows' order, with its resolution | `VICTORY_MONITOR=n` (1 = first) | the main monitor: not set |
+
+Borderless and Fullscreen are the same window: no frame, covering the whole monitor. There is no exclusive full
+screen. Alt+Enter switches between a framed and a borderless window while the game runs (only with one of the
+variables set). Picking Borderless or Fullscreen on a monitor above 1080p ticks **Upscale to the window (sharp)**
+(`VICTORY_PRESENT_SCALE=1`): the game draws 1080p, and Windows' own stretch is blurry. It can be unticked again.
+The checks warn when a window size is given for a borderless mode, or when the monitor is not connected (the
+game then opens on the main monitor).
 ## Profiles
 
 Profiles are JSON files in `%APPDATA%\RunkisLauncher\profiles`.

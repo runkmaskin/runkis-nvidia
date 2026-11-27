@@ -13,6 +13,8 @@ public sealed class LauncherSettings
     public string? LastStart { get; set; }
     /// <summary>How many shaders the last full translation looked at: the next one's total for its progress bar.</summary>
     public long? LastShaderTotal { get; set; }
+    /// <summary>Dev mode shows every page and field; false (the default) is Play mode, the player's pages only.</summary>
+    public bool DevMode { get; set; }
 
     public static LauncherSettings Load()
     {

@@ -17,7 +17,8 @@ public static partial class ProfileValidator
     [GeneratedRegex(@"^#\d+$")]
     private static partial Regex AdapterIndex();
 
-    public static List<ValidationIssue> Validate(LaunchProfile p, RepoLayout? repo = null)
+    /// <param name="monitors">The monitors connected now, to warn about a monitor number past them; null: not checked.</param>
+    public static List<ValidationIssue> Validate(LaunchProfile p, RepoLayout? repo = null, IReadOnlyList<DisplayMonitor>? monitors = null)
     {
         var issues = new List<ValidationIssue>();
         void Add(string f, string m, bool blocking = true) => issues.Add(new(f, m, blocking));
@@ -61,6 +62,18 @@ public static partial class ProfileValidator
             Add(nameof(p.Dred), "Device-removed data (DRED) exists only in the diag build; the release build ignores it.", blocking: false);
         if (p.Dred == DredMode.Full)
             Add(nameof(p.Dred), "Full DRED cost an RTX 2070 SUPER 2-4x GPU time; use it only to find a device loss.", blocking: false);
+
+        if (!string.IsNullOrWhiteSpace(p.WindowSize))
+        {
+            if (!Displays.TryParseSize(p.WindowSize, out _, out _))
+                Add(nameof(p.WindowSize), "A window size is written WIDTHxHEIGHT, like 1600x900.");
+            else if (p.Window != WindowMode.Windowed)
+                Add(nameof(p.WindowSize), "The window size applies to Windowed only; borderless and full screen cover the monitor.", blocking: false);
+        }
+        if (!Enum.IsDefined(p.Window)) Add(nameof(p.Window), "Display mode is Windowed, Borderless or Fullscreen.");
+        if (p.Monitor is < 0 or > 16) Add(nameof(p.Monitor), "Must be between 0 (the main monitor) and 16.");
+        else if (p.Monitor > 0 && monitors is { Count: > 0 } && p.Monitor > monitors.Count)
+            Add(nameof(p.Monitor), $"Monitor {p.Monitor} is not connected ({monitors.Count} found): the game opens on the main monitor.", blocking: false);
 
         issues.AddRange(KeyMap.Check(p));
 
