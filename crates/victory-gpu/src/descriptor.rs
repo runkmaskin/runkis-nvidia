@@ -203,6 +203,113 @@ fn sync_early() -> Option<std::time::Duration> {
 #[cfg(windows)]
 static SYNC_ROUNDS: (std::sync::Mutex<(u64, u64)>, std::sync::Condvar) = (std::sync::Mutex::new((0, 0)), std::sync::Condvar::new());
 
+/// LOCAL: whether the card, not the submitting thread, waits for a submission's round
+/// (`VICTORY_HEAP_SYNC_GPU=1`; off). The submitting thread stood 10-12 ms a frame at the end
+/// of its preparing for the round (RTX 2070 SUPER / Ryzen 5 5500X3D, 2026-11-27). With the
+/// switch the drawing queue waits for a fence the round signals from the CPU
+/// ([`SyncedHeaps::defer`]), and the thread goes on with the next submission. A round that is
+/// not done 400 ms after its submission went is signalled anyway (a hitch, not a hang).
+#[cfg(windows)]
+pub(crate) fn sync_on_card() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| sync_aside() && std::env::var_os("VICTORY_HEAP_SYNC_GPU").is_some_and(|v| v == "1"))
+}
+
+#[cfg(windows)]
+struct SyncFence(windows::Win32::Graphics::Direct3D12::ID3D12Fence);
+// SAFETY: D3D12 fences are free-threaded.
+#[cfg(windows)]
+unsafe impl Send for SyncFence {}
+#[cfg(windows)]
+unsafe impl Sync for SyncFence {}
+
+/// The fence that holds the rounds done ([`sync_on_card`]).
+#[cfg(windows)]
+fn sync_fence() -> Option<&'static windows::Win32::Graphics::Direct3D12::ID3D12Fence> {
+    static FENCE: std::sync::OnceLock<Option<SyncFence>> = std::sync::OnceLock::new();
+    FENCE
+        .get_or_init(|| {
+            let host = crate::host::host()?;
+            // SAFETY: plain object creation.
+            unsafe {
+                host.device
+                    .CreateFence::<windows::Win32::Graphics::Direct3D12::ID3D12Fence>(
+                        0,
+                        windows::Win32::Graphics::Direct3D12::D3D12_FENCE_FLAG_NONE,
+                    )
+                    .ok()
+                    .map(SyncFence)
+            }
+        })
+        .as_ref()
+        .map(|f| &f.0)
+}
+
+/// Rounds signalled to the fence ahead of their end by the watch, since the start.
+#[cfg(windows)]
+pub(crate) static SYNC_FORCED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Submissions whose round the card waited for, since the start.
+#[cfg(windows)]
+pub(crate) static SYNC_DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The fence is at least `value` (never lowered).
+#[cfg(windows)]
+fn tell_fence(value: u64) {
+    static TELLING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let Some(fence) = sync_fence() else {
+        return;
+    };
+    let _one = TELLING.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: our fence.
+    unsafe {
+        if fence.GetCompletedValue() < value {
+            let _ = fence.Signal(value);
+        }
+    }
+}
+
+/// Signals round `mine` 400 ms after its submission went if it is not done by then.
+#[cfg(windows)]
+fn watch_round(mine: u64) {
+    static WATCH: std::sync::OnceLock<Option<std::sync::Mutex<std::sync::mpsc::Sender<(u64, std::time::Instant)>>>> =
+        std::sync::OnceLock::new();
+    let send = WATCH.get_or_init(|| {
+        let (send, rounds) = std::sync::mpsc::channel::<(u64, std::time::Instant)>();
+        std::thread::Builder::new()
+            .name("victory-heap-sync-watch".into())
+            .spawn(move || {
+                for (mine, when) in rounds {
+                    let due = when + std::time::Duration::from_millis(400);
+                    loop {
+                        if SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner()).1 >= mine {
+                            break;
+                        }
+                        let now = std::time::Instant::now();
+                        if now >= due {
+                            tell_fence(mine);
+                            if SYNC_FORCED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                                tracing::warn!(round = mine, "the heaps' records took over 400 ms: the card was let go on without them");
+                            }
+                            break;
+                        }
+                        std::thread::sleep((due - now).min(std::time::Duration::from_millis(5)));
+                    }
+                }
+            })
+            .ok()
+            .map(|_| std::sync::Mutex::new(send))
+    });
+    match send {
+        Some(send) => {
+            if send.lock().unwrap_or_else(|e| e.into_inner()).send((mine, std::time::Instant::now())).is_err() {
+                tell_fence(mine);
+            }
+        }
+        // No watch: the card is not held at all.
+        None => tell_fence(mine),
+    }
+}
+
 /// [`sync_heaps`], begun; done when it is dropped (with [`sync_aside`]), or
 /// when this returns.
 #[cfg(windows)]
@@ -224,7 +331,13 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
             struct Over;
             impl Drop for Over {
                 fn drop(&mut self) {
-                    SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner()).1 += 1;
+                    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+                    rounds.1 += 1;
+                    let done = rounds.1;
+                    drop(rounds);
+                    if sync_on_card() {
+                        tell_fence(done);
+                    }
                     SYNC_ROUNDS.1.notify_all();
                 }
             }
@@ -268,6 +381,35 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     drop(rounds);
     SYNC_ROUNDS.1.notify_all();
     SyncedHeaps(Some(mine))
+}
+
+#[cfg(windows)]
+impl SyncedHeaps {
+    /// [`sync_on_card`]: `queue` waits for this round instead of the caller; `false` if the
+    /// caller is to wait (the switch is off, or the queue cannot wait).
+    pub(crate) fn defer(&mut self, queue: &windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue) -> bool {
+        let Some(mine) = self.0 else {
+            return false;
+        };
+        if !sync_on_card() {
+            return false;
+        }
+        let Some(fence) = sync_fence() else {
+            return false;
+        };
+        if SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner()).1 >= mine {
+            self.0 = None;
+            return true;
+        }
+        // SAFETY: our fence and the host's queue.
+        if unsafe { queue.Wait(fence, mine) }.is_err() {
+            return false;
+        }
+        self.0 = None;
+        SYNC_DEFERRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        watch_round(mine);
+        true
+    }
 }
 
 #[cfg(windows)]
@@ -733,6 +875,13 @@ pub(crate) fn sync_line(frames: f64) {
         split[3] / 1e6 / frames,
         split[4] / 1e6 / frames
     );
+    if sync_on_card() {
+        tracing::info!(
+            "the heaps' records waited for by the card (VICTORY_HEAP_SYNC_GPU=1), since the start: {} submissions, {} let go after 400 ms",
+            SYNC_DEFERRED.load(std::sync::atomic::Ordering::Relaxed),
+            SYNC_FORCED.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
 }
 
 /// Title descriptor slots in a changed byte range that have host counterparts.

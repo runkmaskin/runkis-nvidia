@@ -5713,7 +5713,11 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
-        drop(heaps_synced);
+        // LOCAL (`VICTORY_HEAP_SYNC_GPU=1`): the queue waits for the round, not this thread.
+        let mut heaps_synced = heaps_synced;
+        if !(late && heaps_synced.defer(&self.queue)) {
+            drop(heaps_synced);
+        }
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
