@@ -3694,6 +3694,71 @@ const CROSS_WHOLE: usize = 16 << 20;
 /// such a read, and the microseconds they waited.
 static CROSS_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// The copies in the card's memory the landing of `flights` went through,
+/// each once.
+fn landed_copies(flights: &[&Flight]) -> Vec<std::sync::Arc<crate::shadow::Shadow>> {
+    let mut copies: Vec<std::sync::Arc<crate::shadow::Shadow>> = Vec::new();
+    for flight in flights {
+        for (shadow, _) in flight.back.iter().filter(|(shadow, _)| shadow.carded()) {
+            if !copies.iter().any(|c| std::sync::Arc::ptr_eq(c, shadow)) {
+                copies.push(shadow.clone());
+            }
+        }
+    }
+    copies
+}
+
+/// `crate::shadow::land_held`: each of `copies` says which of the blocks a
+/// landing put shaders' writes into through it it holds. One kernel asking
+/// for each run of blocks close together, whatever copies they are of (an
+/// asking costs some 50-100 us); the looks in jobs of a few blocks of one
+/// copy, on the landing's threads.
+pub(crate) fn relay_hold_landed(copies: &[std::sync::Arc<crate::shadow::Shadow>]) {
+    use crate::shadow::{HELD, HELD_GAP};
+    const EACH: usize = 8;
+    let started = std::time::Instant::now();
+    let (mut looked, mut not_held) = (0, 0);
+    let taken: Vec<Vec<(usize, u64)>> = copies
+        .iter()
+        .map(|copy| {
+            let (taken, n) = copy.landed_blocks();
+            looked += n;
+            not_held += n - taken.len() as u64;
+            taken
+        })
+        .collect();
+    let mut blocks: Vec<usize> = taken.iter().flatten().map(|t| t.0).collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    // (first, last, the asking's number if it was made)
+    let runs: Vec<(usize, usize, Option<u64>)> = blocks
+        .chunk_by(|a, b| b - a <= HELD_GAP)
+        .map(|run| {
+            let (first, last) = (run[0], run[run.len() - 1] + 1);
+            (first, last, crate::watch::ask_blocks(first, last))
+        })
+        .collect();
+    let now_of = |block: usize| runs.get(runs.partition_point(|r| r.1 <= block)).and_then(|r| r.2);
+    let mut jobs: Vec<(usize, Vec<(usize, u64, u64)>)> = Vec::new();
+    for (i, taken) in taken.iter().enumerate() {
+        let asked: Vec<(usize, u64, u64)> = taken.iter().filter_map(|&(b, t)| Some((b, t, now_of(b)?))).collect();
+        not_held += (taken.len() - asked.len()) as u64;
+        jobs.extend(asked.chunks(EACH).map(|c| (i, c.to_vec())));
+    }
+    let counts: [std::sync::atomic::AtomicU64; 3] = Default::default();
+    crate::land::each(jobs.len(), &|j| {
+        let (i, blocks) = &jobs[j];
+        for (count, n) in counts.iter().zip(copies[*i].hold_blocks(blocks)) {
+            count.fetch_add(n, Ordering::Relaxed);
+        }
+    });
+    let [held, not, bytes] = counts.map(std::sync::atomic::AtomicU64::into_inner);
+    for (at, n) in [looked, held, not_held + not, bytes, runs.len() as u64].into_iter().enumerate() {
+        HELD[at].fetch_add(n, Ordering::Relaxed);
+    }
+    HELD[5].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
 /// What the flights of `items` write in title memory, into `out`: the host
 /// copy it goes through (its address; 0: none, a read-back or a texture's
 /// copy-back), from, to.
@@ -5856,6 +5921,9 @@ impl Host {
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
         let mut stage = crate::timeline::span("landing: what is to be looked through");
+        // With `VICTORY_LAND_HELD=2`: the copies that say what they hold once
+        // the title is told.
+        let mut held_later = Vec::new();
         {
             let flights: Vec<&Flight> = items
                 .iter()
@@ -5897,6 +5965,14 @@ impl Host {
                 });
                 stage.next("landing: copies in the PC's memory");
                 hand_back.merge();
+                match crate::shadow::land_held_mode() {
+                    1 => {
+                        stage.next("landing: what the copies hold of it");
+                        relay_hold_landed(&landed_copies(&flights));
+                    }
+                    2 => held_later = landed_copies(&flights),
+                    _ => {}
+                }
                 stage.next("landing: ranges done with");
                 let finishing = std::time::Instant::now();
                 // Only now, and flight by flight: a range another flight
@@ -5990,6 +6066,11 @@ impl Host {
         }
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
+        // Last: nothing that waits for the landing waits for this.
+        if !held_later.is_empty() {
+            let _looking = crate::timeline::span("landing: what the copies hold of it");
+            relay_hold_landed(&held_later);
+        }
     }
 
     /// After a submission ran, for copies in the card's memory: the pieces

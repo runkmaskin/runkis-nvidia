@@ -2129,6 +2129,38 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
     (noted, before)
 }
 
+/// A landing put shaders' writes into write-watched title memory through the
+/// title's own address (`crate::shadow::land_held`): blocks `[first, last)`
+/// are asked about now, as [`writes`] asks, and the answer noted. Returns the
+/// asking's number; `None` for memory the kernel is not asked about (views),
+/// or refuses (memory not write-watched, a range over two reservations).
+///
+/// Noted as any answer is: every other copy of these blocks takes them as
+/// written, as it did when the next refresh asked.
+pub(crate) fn ask_blocks(first: usize, last: usize) -> Option<u64> {
+    if first >= last || PROTECTED.any(first, last) || VIEWS.any(first, last) {
+        return None;
+    }
+    let _range = Asking::hold(first, last);
+    let pages = kernel_written(first, last, Asker::One)?;
+    let mut j = journal_mut();
+    let now = next_asking();
+    for &(page, parts) in &pages {
+        j.note(page, parts, now);
+    }
+    Some(now)
+}
+
+/// The parts of block `block` (a bit for each 4 KiB) written by an asking
+/// after `taken`, as the journal has them now.
+pub(crate) fn written_parts(block: usize, taken: u64) -> u16 {
+    let j = journal();
+    match j.written.get(&block) {
+        Some(&write) if write > taken => j.parts_since(block, taken),
+        _ => 0,
+    }
+}
+
 /// Whether every write of the title's to 64 KiB block `block` so far is in
 /// the journal ([`PUBLISHED`]).
 pub(crate) fn block_published(block: usize) -> bool {

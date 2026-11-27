@@ -32,6 +32,10 @@ pub(crate) struct Shadow {
     landings: Mutex<Vec<u64>>,
     /// Whether any is.
     landing: std::sync::atomic::AtomicBool,
+    /// With [`land_held`]: the 64 KiB blocks of title memory (by number) a
+    /// landing put shaders' writes into through the title's own address since
+    /// [`Shadow::hold_landed`] last looked.
+    direct: Mutex<Vec<usize>>,
     /// The bytes of `buffer`, once asked.
     width: std::sync::OnceLock<u64>,
     pub(crate) buffer: ID3D12Resource,
@@ -2487,6 +2491,85 @@ fn land_echo() -> bool {
 /// bytes a landing was noted in that were the title's too.
 pub(crate) static ECHO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Whether the landing tells a copy in the card's memory that it holds the
+/// private title memory it was landed through (`VICTORY_LAND_HELD=1`; off by
+/// default: the next refresh reads those pages back and compares them, as
+/// [`land_echo`] does).
+///
+/// Why: in private memory the kernel's write watch cannot tell the landing's
+/// writes from the title's, so every page a landing put shaders' writes into
+/// counted as written, and the next refresh read it from title memory and
+/// compared it with the copy, only to find what the copy held (18.3 MB a frame
+/// "held already and left" on a 7800X3D, of 39 MB of refreshes). The census
+/// (`crate::land::census`) saw the same: of landed private pages, our own
+/// threads touched 98.8 % first.
+///
+/// What it does ([`Shadow::hold_landed`]): before the landing's ranges are
+/// done with, the kernel is asked about the landed blocks as any refresh asks,
+/// and the answer goes into the journal; then the parts written since the copy
+/// took each block are compared with its CPU side, as the refresh would have.
+/// A block that holds nothing else is noted taken as of that asking. A write
+/// of the title's after the asking has a later number and is taken as before.
+/// Only where the refresh would have compared and left (the parts are pages a
+/// landing of this copy noted, whole), so the refresh's result is the same:
+/// the CPU side, what goes up to the card, and the landing notes.
+///
+/// `1`: before the landing's ranges are done with, so no refresh reads them
+/// first; the title's fences wait for it. `2`: after the title is told, so they
+/// do not; a refresh that comes first reads its blocks back as before.
+pub(crate) fn land_held() -> bool {
+    land_held_mode() != 0
+}
+
+/// [`land_held`]'s `1` or `2`; 0 off.
+pub(crate) fn land_held_mode() -> u8 {
+    #[cfg(test)]
+    if HELD_FOR_TEST.get() {
+        return 1;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_LAND_HELD").ok().as_deref().map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`land_held`] for this thread's tests.
+    pub(crate) static HELD_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Since the last frame-rate line, with [`land_held`]: blocks looked at, those
+/// noted held, those that held something else (or could not be told), bytes
+/// compared, kernel askings, microseconds.
+pub(crate) static HELD: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// [`land_held`] asks about blocks this close together at once: a kernel
+/// asking that resets costs 30-70 us whatever the range (`crate::watch`).
+pub(crate) const HELD_GAP: usize = 32;
+
+/// For the frame-rate line.
+pub(crate) fn log_held(frames: f64) {
+    if !land_held() {
+        return;
+    }
+    let h: Vec<f64> = HELD.iter().map(|h| h.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "landed private blocks per frame (VICTORY_LAND_HELD={}): {:.0} looked at by the copy they were landed through, {:.0} of them \
+         held (the next refresh reads them back no more), {:.0} held other bytes or could not be told; {:.2} MB compared, \
+         {:.1} kernel askings, {:.2} ms on the relay",
+        land_held_mode(),
+        h[0],
+        h[1],
+        h[2],
+        h[3] / (1 << 20) as f64,
+        h[4],
+        h[5] / 1000.0,
+    );
+}
+
 /// Whether a refresh of a copy in the card's memory takes, and sends up,
 /// the dwords that title memory changed and no others
 /// (`VICTORY_SEND_CHANGED=1`; off: the 64 KiB pages written since it last
@@ -3845,6 +3928,7 @@ impl Shadow {
         Shadow {
             landings: Mutex::default(),
             landing: Default::default(),
+            direct: Mutex::default(),
             width: Default::default(),
             buffer,
             data,
@@ -5419,6 +5503,7 @@ impl Shadow {
                 continue;
             }
             skip.of(lo, hi, &mut parts);
+            let beside = notes.beside();
             // SAFETY: inside the mapping (checked above), in a range
             // declared and not done with, which no refresh writes; the
             // title's bytes are kept out by the lock; the caller's.
@@ -5429,6 +5514,11 @@ impl Shadow {
             self.walls_merged(hi - lo, merged as usize);
             if merged > 0 {
                 self.note_landing(lo, hi);
+                // Put through the title's own address (a view of ours was
+                // not used): the guards cannot say it was ours.
+                if notes.beside() == beside && land_held() {
+                    self.note_direct((self.start as usize + lo) / PAGE);
+                }
             }
             put += merged;
         }
@@ -5485,6 +5575,495 @@ impl Shadow {
             *at = (*at).max(now);
         }
         held
+    }
+
+    /// [`land_held`]: a landing put shaders' writes into title block `block`
+    /// through the title's own address.
+    fn note_direct(&self, block: usize) {
+        let mut direct = self.direct.lock().unwrap_or_else(|e| e.into_inner());
+        // (Nothing looks if the relay does not land: kept short.)
+        if direct.len() >= 1 << 14 {
+            direct.clear();
+        }
+        if direct.last() != Some(&block) {
+            direct.push(block);
+        }
+    }
+
+    /// [`land_held`]: the blocks a landing put shaders' writes into through
+    /// the title's own address since the last look, each with the asking
+    /// after which the copy took it, in order; and how many there were.
+    /// Blocks the copy never took are left to the refresh, and so is all of
+    /// a copy whose refresh would not compare and leave: one that copies, or
+    /// sends the dwords that changed, or checks what it sends.
+    pub(crate) fn landed_blocks(&self) -> (Vec<(usize, u64)>, u64) {
+        let mut blocks = std::mem::take(&mut *self.direct.lock().unwrap_or_else(|e| e.into_inner()));
+        let compares = self.card.is_some()
+            && self.place.is_none()
+            && !self.changes_only.load(Ordering::Relaxed)
+            && !send_changed()
+            && land_echo()
+            && !crate::host::upcheck::on();
+        if blocks.is_empty() || !compares {
+            return (Vec::new(), 0);
+        }
+        blocks.sort_unstable();
+        blocks.dedup();
+        let base = self.start as usize / PAGE;
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = blocks.iter().filter_map(|&b| Some((b, *copied.get(b.checked_sub(base)?)?))).filter(|t| t.1 != 0).collect();
+        (taken, blocks.len() as u64)
+    }
+
+    /// [`land_held`], once the kernel was asked about `blocks` (block, the
+    /// asking after which the copy took it, the asking about it made after
+    /// the landing's bytes were in): a block whose parts written since the
+    /// copy took it are, on the CPU's side, what title memory holds now is
+    /// noted taken as of that asking. The landing's writes, and any of the
+    /// title's before that asking, are under its number; a write of the
+    /// title's after it has a later one, and the refresh takes it as before.
+    ///
+    /// Only parts the refresh would have compared and left as they are:
+    /// whole 4 KiB pages of the copy that a landing of this copy noted
+    /// ([`Shadow::take_landed`]), whose notes go as the refresh's look would
+    /// have taken them. A block with any other part written is left to the
+    /// refresh. Returns blocks held, not held, bytes compared.
+    pub(crate) fn hold_blocks(&self, blocks: &[(usize, u64, u64)]) -> [u64; 3] {
+        let mut out = [0u64; 3];
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (base, first_page) = (start / PAGE, start / KERNEL_PAGE);
+        let noted = |landings: &[u64], page: usize| landings.get(page / 64).is_some_and(|word| word >> (page % 64) & 1 != 0);
+        let mut title = vec![0u8; KERNEL_PAGE];
+        // As in `merge_under_writes`: nothing puts the title's bytes in under
+        // shader writes meanwhile. A refresh may take some of these bytes
+        // meanwhile: it puts title memory's in, so the look below finds them
+        // alike only if the copy holds what title memory holds then.
+        let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
+        for &(block, taken, now) in blocks {
+            let mask = crate::watch::written_parts(block, taken);
+            let mut looked: Vec<usize> = Vec::new();
+            let mut held = true;
+            for k in (0..PAGE / KERNEL_PAGE).filter(|k| mask >> k & 1 != 0) {
+                let (a, b) = (block * PAGE + k * KERNEL_PAGE, block * PAGE + (k + 1) * KERNEL_PAGE);
+                // Partly the copy's: the refresh looks at it again. Not
+                // noted by a landing of this copy: the refresh copies and
+                // sends it.
+                if a < start || b > end || !noted(&self.landings.lock().unwrap_or_else(|e| e.into_inner()), a / KERNEL_PAGE - first_page) {
+                    held = false;
+                    break;
+                }
+                out[2] += KERNEL_PAGE as u64;
+                // SAFETY: inside the copy's mapping (checked above). What
+                // else writes it puts title memory's bytes there.
+                let side = unsafe { std::slice::from_raw_parts(self.data.add(a - start).cast_const(), KERNEL_PAGE) };
+                if !crate::host::read_into(a as *const u8, &mut title) || side != &title[..] {
+                    held = false;
+                    break;
+                }
+                looked.push(a / KERNEL_PAGE - first_page);
+            }
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            let mut landings = self.landings.lock().unwrap_or_else(|e| e.into_inner());
+            // (A refresh that looked meanwhile took the notes: it is left
+            // to the next one.)
+            let held = held && looked.iter().all(|&page| noted(&landings, page));
+            let Some(at) = copied.get_mut(block - base).filter(|at| **at != 0 && held) else {
+                out[1] += 1;
+                continue;
+            };
+            *at = (*at).max(now);
+            out[0] += 1;
+            // As the refresh's look would have: those pages are not noted
+            // any more.
+            for page in looked {
+                landings[page / 64] &= !(1 << (page % 64));
+            }
+        }
+        out
+    }
+
+    /// [`Shadow::landed_blocks`], an asking per run of them and
+    /// [`Shadow::hold_blocks`], as the relay does them for the copies of a
+    /// landing: blocks looked at, held, not held, bytes compared, askings.
+    #[cfg(test)]
+    pub(crate) fn hold_landed(&self) -> [u64; 5] {
+        self.hold_landed_with(&mut || {})
+    }
+
+    /// [`Shadow::hold_landed`]; `between` is called after each asking and
+    /// before the look (tests put the title's writes there).
+    #[cfg(test)]
+    fn hold_landed_with(&self, between: &mut dyn FnMut()) -> [u64; 5] {
+        let (taken, looked) = self.landed_blocks();
+        let mut out = [looked, 0, looked - taken.len() as u64, 0, 0];
+        for run in taken.chunk_by(|a, b| b.0 - a.0 <= HELD_GAP) {
+            out[4] += 1;
+            let Some(now) = crate::watch::ask_blocks(run[0].0, run[run.len() - 1].0 + 1) else {
+                out[2] += run.len() as u64;
+                continue;
+            };
+            between();
+            let blocks: Vec<(usize, u64, u64)> = run.iter().map(|&(b, t)| (b, t, now)).collect();
+            let [held, not, bytes] = self.hold_blocks(&blocks);
+            out[1] += held;
+            out[2] += not;
+            out[3] += bytes;
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod held_tests {
+    //! [`super::land_held`]: what a landing tells the copy it went through, in
+    //! write-watched private memory, against the refresh reading it back.
+    use super::{HELD_FOR_TEST, PAGE, Shadow};
+    use std::sync::Arc;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// Title memory, write-watched (never given back: the journal remembers it).
+    fn title(len: usize) -> usize {
+        // SAFETY: a plain allocation.
+        unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize }
+    }
+
+    /// Memory for a copy's CPU side.
+    fn side(len: usize) -> *mut u8 {
+        // SAFETY: a plain allocation.
+        unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast() }
+    }
+
+    struct Random(u64);
+
+    impl Random {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) as usize % n
+        }
+    }
+
+    /// Title memory, a copy in the card's memory of all of it, and the card's
+    /// side as the card holds it (what went up, and what shaders wrote).
+    struct World {
+        title: usize,
+        copy: Arc<Shadow>,
+        card: Vec<u8>,
+        len: usize,
+    }
+
+    impl World {
+        fn new(len: usize, fill: u8) -> World {
+            let title = title(len);
+            // SAFETY: the test's own memory.
+            unsafe { std::ptr::write_bytes(title as *mut u8, fill, len) };
+            let copy = Shadow::unbacked(title as u64, side(len), len as u64, true);
+            let mut world = World { title, copy, card: vec![0; len], len };
+            world.refresh(0, len);
+            world
+        }
+
+        fn bytes(&self, at: usize) -> &[u8] {
+            // SAFETY: the test's own memory, `len` bytes.
+            unsafe { std::slice::from_raw_parts(at as *const u8, self.len) }
+        }
+
+        fn cpu(&self) -> &[u8] {
+            self.bytes(self.copy.data as usize)
+        }
+
+        /// The title writes `value` at offset `at` (a dword).
+        fn write(&self, at: usize, value: u32) {
+            // SAFETY: the test's own memory.
+            unsafe { ((self.title + at) as *mut u32).write_volatile(value) };
+        }
+
+        /// A refresh of `[from, to)` (offsets), and what it sends going up.
+        /// Returns the bytes it copied.
+        fn refresh(&mut self, from: usize, to: usize) -> usize {
+            let copied = self.copy.update(self.title + from, to - from);
+            self.send();
+            copied
+        }
+
+        fn send(&mut self) {
+            for (a, b) in self.copy.take_dirty() {
+                let cpu = self.cpu()[a..b].to_vec();
+                self.card[a..b].copy_from_slice(&cpu);
+            }
+        }
+
+        /// Shaders write `writes` (offset, value) on the card's side, and a
+        /// landing puts them into title memory through the copy; `after` is
+        /// called once the bytes are in.
+        fn land(&mut self, writes: &[(usize, u32)], after: &mut dyn FnMut(&World)) {
+            self.send();
+            for &(at, value) in writes {
+                self.card[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            let mut blocks: Vec<usize> = writes.iter().map(|w| w.0 / PAGE).collect();
+            blocks.sort_unstable();
+            blocks.dedup();
+            let pieces: Vec<(usize, usize, usize)> =
+                blocks.iter().map(|&b| (b * PAGE, ((b + 1) * PAGE).min(self.len), self.card.as_ptr() as usize + b * PAGE)).collect();
+            let mut notes = crate::land::Notes::default();
+            // SAFETY: the card's side is ours and stays as it is meanwhile.
+            unsafe { self.copy.land_card(&pieces, 0, &mut notes) };
+            notes.flush();
+            after(self);
+        }
+    }
+
+    /// One fixed-seed run of a frame's kinds of work on a copy of 8 blocks:
+    /// the title's writes (some of the same value), landings (with the
+    /// title's writes after the bytes are in, and with the switch after the
+    /// asking and before the look), refreshes of parts and of all of it.
+    /// After each refresh: title memory, the CPU's side and the card's side.
+    fn run(seed: u64, held: bool) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>, usize)> {
+        HELD_FOR_TEST.set(held);
+        const LEN: usize = 8 * PAGE;
+        let mut random = Random(seed);
+        let mut world = World::new(LEN, (seed & 0xff) as u8);
+        let mut trace = Vec::new();
+        for _ in 0..60 {
+            match random.below(4) {
+                0 => {
+                    for _ in 0..random.below(6) {
+                        let at = random.below(LEN / 4) * 4;
+                        // Half of them the value that is there.
+                        let value = if random.below(2) == 0 {
+                            u32::from_le_bytes(world.bytes(world.title)[at..at + 4].try_into().unwrap())
+                        } else {
+                            random.below(1 << 30) as u32
+                        };
+                        world.write(at, value);
+                    }
+                }
+                1 => {
+                    // The shaders' writes: a few dwords in one or two blocks,
+                    // some in pages next to each other.
+                    let blocks = [random.below(8), random.below(8)];
+                    let writes: Vec<(usize, u32)> = (0..1 + random.below(40))
+                        .map(|_| (blocks[random.below(2)] * PAGE + random.below(PAGE / 4) * 4, random.below(1 << 30) as u32))
+                        .collect();
+                    // The title's writes around the landing, drawn the same
+                    // whether the switch is on or not.
+                    let after: Vec<(usize, u32)> = (0..random.below(3))
+                        .map(|_| (blocks[random.below(2)] * PAGE + random.below(PAGE / 4) * 4, random.below(1 << 30) as u32))
+                        .collect();
+                    let between: Vec<(usize, u32)> = (0..random.below(3))
+                        .map(|_| (blocks[random.below(2)] * PAGE + random.below(PAGE / 4) * 4, random.below(1 << 30) as u32))
+                        .collect();
+                    world.land(&writes, &mut |w| after.iter().for_each(|&(at, v)| w.write(at, v)));
+                    if held {
+                        let (title, copy) = (world.title, world.copy.clone());
+                        HELD_SEEN.fetch_add(copy.hold_landed_with(&mut || {
+                            for &(at, v) in &between {
+                                // SAFETY: the test's own memory.
+                                unsafe { ((title + at) as *mut u32).write_volatile(v) };
+                            }
+                        })[1], std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        between.iter().for_each(|&(at, v)| world.write(at, v));
+                    }
+                }
+                _ => {
+                    let (from, to) = if random.below(3) == 0 {
+                        (0, LEN)
+                    } else {
+                        let a = random.below(LEN);
+                        (a, (a + 1 + random.below(3 * PAGE)).min(LEN))
+                    };
+                    world.refresh(from, to);
+                    trace.push((world.bytes(world.title).to_vec(), world.cpu().to_vec(), world.card.clone(), from));
+                }
+            }
+        }
+        world.refresh(0, LEN);
+        assert!(world.cpu() == world.bytes(world.title), "seed {seed:#x}: the copy is not title memory after a refresh of all of it");
+        assert!(world.card == world.cpu(), "seed {seed:#x}: the card's side is not the CPU's");
+        HELD_FOR_TEST.set(false);
+        trace
+    }
+
+    /// Blocks [`run`] found held.
+    static HELD_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// With the switch, every refresh leaves title memory, the copy's CPU side
+    /// and what went up to the card as they were without it (fixed seeds).
+    #[test]
+    fn held_landings_leave_every_refresh_as_it_was() {
+        assert!(crate::safecopy::on());
+        for seed in 0..48u64 {
+            let seed = 0x5eed_0000_0000_0001 ^ seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let (old, new) = (run(seed, false), run(seed, true));
+            assert_eq!(old.len(), new.len());
+            for (i, (a, b)) in old.iter().zip(&new).enumerate() {
+                assert!(a.0 == b.0, "seed {seed:#x}, refresh {i} (from {:#x}): title memory differs", a.3);
+                assert!(a.1 == b.1, "seed {seed:#x}, refresh {i} (from {:#x}): the CPU's side differs", a.3);
+                assert!(a.2 == b.2, "seed {seed:#x}, refresh {i} (from {:#x}): the card's side differs", a.3);
+            }
+        }
+        assert!(HELD_SEEN.load(std::sync::atomic::Ordering::Relaxed) > 100, "too few blocks held to say anything");
+    }
+
+    /// A held block is not read back; a write of the title's after the asking
+    /// is taken; one before the look keeps the block unheld; another copy of
+    /// the same memory takes what was landed.
+    #[test]
+    fn held_blocks_are_read_back_only_where_the_title_wrote() {
+        assert!(crate::safecopy::on());
+        HELD_FOR_TEST.set(true);
+        let mut world = World::new(4 * PAGE, 7);
+        let other = Shadow::unbacked(world.title as u64, side(4 * PAGE), 4 * PAGE as u64, false);
+        other.update(world.title, 4 * PAGE);
+        // Held: the refresh copies nothing of it.
+        world.land(&[(PAGE + 64, 0xaaaa), (PAGE + 5000, 0xbbbb)], &mut |_| {});
+        assert_eq!(world.copy.hold_landed(), [1, 1, 0, 8192, 1]);
+        assert_eq!(world.refresh(PAGE, 2 * PAGE), 0, "a held block was read back");
+        assert_eq!(world.cpu()[PAGE + 64..PAGE + 68], 0xaaaa_u32.to_le_bytes());
+        // Another copy of the memory takes the landed bytes.
+        other.update(world.title, 4 * PAGE);
+        // SAFETY: the copy's mapping.
+        let theirs = unsafe { std::slice::from_raw_parts(other.data, 4 * PAGE) };
+        assert!(theirs == world.bytes(world.title), "another copy missed what was landed");
+        // The title writes the landed page after the asking: taken.
+        world.write(PAGE + 68, 0x1234);
+        assert!(world.refresh(PAGE, 2 * PAGE) > 0);
+        assert_eq!(world.cpu()[PAGE + 68..PAGE + 72], 0x1234_u32.to_le_bytes());
+        // Between the asking and the look: not held, and the refresh takes it.
+        world.land(&[(2 * PAGE + 128, 0xcccc)], &mut |_| {});
+        let title = world.title;
+        let looked = world.copy.hold_landed_with(&mut || {
+            // SAFETY: the test's own memory.
+            unsafe { ((title + 2 * PAGE + 132) as *mut u32).write_volatile(0x5678) };
+        });
+        assert_eq!(looked[..3], [1, 0, 1]);
+        assert!(world.refresh(2 * PAGE, 3 * PAGE) > 0);
+        assert_eq!(world.cpu()[2 * PAGE + 132..2 * PAGE + 136], 0x5678_u32.to_le_bytes());
+        // A page the title wrote that no landing of the copy noted: unheld.
+        world.write(3 * PAGE + 40_000, 9);
+        world.land(&[(3 * PAGE + 4, 0xdddd)], &mut |_| {});
+        assert_eq!(world.copy.hold_landed()[..3], [1, 0, 1]);
+        world.refresh(0, 4 * PAGE);
+        assert!(world.cpu() == world.bytes(world.title));
+        HELD_FOR_TEST.set(false);
+    }
+
+    /// The title writes all the while, on a thread of its own: after landings,
+    /// looks and refreshes, a last refresh with the title still leaves the
+    /// copy equal to title memory.
+    #[test]
+    fn held_landings_miss_no_write_of_a_title_thread() {
+        assert!(crate::safecopy::on());
+        HELD_FOR_TEST.set(true);
+        const LEN: usize = 8 * PAGE;
+        let mut world = World::new(LEN, 3);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (stop, title) = (stop.clone(), world.title);
+            std::thread::spawn(move || {
+                let mut random = Random(0x7177_1e00_0bad_f00d);
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let at = title + random.below(LEN / 4) * 4;
+                    // SAFETY: the test's own memory.
+                    unsafe { (at as *mut u32).write_volatile(random.below(1 << 30) as u32) };
+                    if random.below(64) == 0 {
+                        std::thread::yield_now();
+                    }
+                }
+            })
+        };
+        let mut random = Random(0x0c0f_fee0_1234_5678);
+        let mut held = 0;
+        for _ in 0..400 {
+            let block = random.below(8);
+            let writes: Vec<(usize, u32)> =
+                (0..1 + random.below(30)).map(|_| (block * PAGE + random.below(PAGE / 4) * 4, random.below(1 << 30) as u32)).collect();
+            world.land(&writes, &mut |_| {});
+            if random.below(2) == 0 {
+                held += world.copy.hold_landed()[1];
+            } else {
+                // As the relay does it.
+                crate::host::relay_hold_landed(std::slice::from_ref(&world.copy));
+            }
+            let a = random.below(LEN);
+            world.refresh(a, (a + 1 + random.below(2 * PAGE)).min(LEN));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        world.refresh(0, LEN);
+        assert!(world.cpu() == world.bytes(world.title), "a title write was missed ({held} blocks held)");
+        HELD_FOR_TEST.set(false);
+    }
+
+    /// What reading landed blocks back costs the refreshes, and what the
+    /// landing's look costs instead, for a frame of the size measured in game
+    /// (7800X3D: 441 pieces through the title's address in 17 landings, 18.3
+    /// MB read back and left): `cargo test --release -p victory-gpu --lib --
+    /// --ignored --nocapture bench_held_landings`. Offline figures.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_held_landings() {
+        assert!(crate::safecopy::on());
+        const BLOCKS: usize = 448;
+        const LEN: usize = BLOCKS * PAGE;
+        const LANDINGS: usize = 17;
+        let mut random = Random(0xbe7c_4000_0000_0001);
+        // Each frame shaders write ~15 of a block's 16 pages: ~6,700 pages.
+        let frame = |random: &mut Random| -> Vec<Vec<(usize, u32)>> {
+            (0..LANDINGS)
+                .map(|l| {
+                    let mut writes = Vec::new();
+                    for b in (l..BLOCKS).step_by(LANDINGS) {
+                        for page in 0..16 {
+                            if random.below(16) != 0 {
+                                for _ in 0..64 {
+                                    writes.push((b * PAGE + page * 4096 + random.below(1024) * 4, random.below(1 << 30) as u32));
+                                }
+                            }
+                        }
+                    }
+                    writes
+                })
+                .collect()
+        };
+        for held in [false, true] {
+            HELD_FOR_TEST.set(held);
+            let mut world = World::new(LEN, 1);
+            let (mut looks, mut refreshes, mut copied) = (Vec::new(), Vec::new(), 0);
+            for _ in 0..9 {
+                let landings = frame(&mut random);
+                let mut look = 0.0;
+                for writes in &landings {
+                    world.land(writes, &mut |_| {});
+                    let t = std::time::Instant::now();
+                    if held {
+                        crate::host::relay_hold_landed(std::slice::from_ref(&world.copy));
+                    }
+                    look += t.elapsed().as_secs_f64() * 1e3;
+                }
+                let t = std::time::Instant::now();
+                copied = world.refresh(0, LEN);
+                refreshes.push(t.elapsed().as_secs_f64() * 1e3);
+                looks.push(look);
+            }
+            let median = |v: &mut Vec<f64>| {
+                v.sort_by(f64::total_cmp);
+                v[v.len() / 2]
+            };
+            eprintln!(
+                "{}: the landings' looks {:.2} ms a frame, the refresh after them {:.2} ms ({:.1} MB copied or read back), medians of 9 frames",
+                if held { "VICTORY_LAND_HELD=1" } else { "as before" },
+                median(&mut looks),
+                median(&mut refreshes),
+                copied as f64 / (1 << 20) as f64,
+            );
+        }
+        HELD_FOR_TEST.set(false);
     }
 }
 

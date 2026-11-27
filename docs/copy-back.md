@@ -105,6 +105,24 @@ memory of the thread (`put_with_was`) instead of a new allocation per piece. The
 non-relay `CARD_WORK.fetched` were already kept and only grown. Not touched: `read_backs` maps a read-back buffer at
 every landing (outside the functions this work may change).
 
+**Shipped, off: `VICTORY_LAND_HELD=1|2`** (`shadow::land_held`, `host::relay_hold_landed`). What the bytes are for,
+from the 7800X3D log of 2026-11-27 (*measured in game*): 441 of 756 landed pieces a frame go into private
+(write-watched) title memory through the title's own address. The write watch counts those writes as the title's,
+so the next refresh read each landed page back and compared it with its copy: 18.3 MB a frame "held already and
+left", 0.1 MB "the title's too". The census's "our other threads first 98.8 %" is that read-back. Blocks landed beside
+the guards (views) were already noted held (`VICTORY_LAND_TAKEN`, 318 of 319). With the switch the relay asks the
+kernel about the landed private blocks itself, notes the answer as any asking is noted, compares the parts written
+since the copy took each block, and notes a block that holds title memory's bytes as taken by that asking. The
+refresh then reads nothing of it; a title write after the asking is taken as before. `=1` before the ranges are done
+with (the fences wait for it: about 1.4 ms a frame *offline*, mostly kernel askings), `=2` after the title is told
+(off the fences; a refresh that comes first reads back as before). Title memory is only read. Tests and the known
+difference: `docs/changes-2026-11-27.md`, "Landed private blocks held by their copy". Line: "landed private blocks
+per frame (VICTORY_LAND_HELD=N): ...".
+
+What this does not do: it does not land less. The census cannot say whether the title reads landed bytes later: our
+read-back touched every sampled private page first, and the census watches only the first touch. With
+`VICTORY_LAND_HELD` on, that read-back is gone, so a census run with both on says what the title's own threads touch
+first (T %), which is what landing on demand (2. below) needs to know before it is worth its risks.
 **Designed, not shipped:**
 
 1. *Fetch inside the flight* (the largest saving if the fetch wait is queueing). After the card's compare, a compute
@@ -117,7 +135,11 @@ every landing (outside the functions this work may change).
    `writable()` would have to know a second kind of guard; the fault handler would wait for a fetch and take the
    merge locks on a title thread that may hold our console-call locks (deadlock); system calls on guarded memory
    fail instead of faulting; our own refreshes would fault too. Only private memory with no system-call use is
-   safe, and the census says how much that is. Not safely testable offline: not shipped.
+   safe, and the census says how much that is. Not safely testable offline: not shipped. Looked at again for
+   2026-11-27 (with the 7800X3D log): of what lands, 58 % of pieces are private memory, 42 % views; the title is
+   told after landing (`late_signal`), and the relay is 16 ms a frame idle and 18.8 ms landing (7.2 of them the fetch
+   wait, 7.7 the merge). Fences sent before the landing would save up to that 18.8 ms of the fences' wait, but each
+   hole above stands; part (1) of the plan, our own refreshes not reading back, is `VICTORY_LAND_HELD` above.
 3. *Earlier fences* for a flight whose declared writes the CPU cannot read before a guard catches them: this is (2)'s
    guard; without it the only safe early fence is one behind flights with nothing to land, which segments give.
 4. *Finer granularity.* The card's compare gives one bit per 64 KiB piece (`torn::flagged`); the merge already

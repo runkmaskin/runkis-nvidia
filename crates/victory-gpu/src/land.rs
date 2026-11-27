@@ -177,6 +177,7 @@ pub(crate) fn spent(which: usize, from: std::time::Instant) -> std::time::Instan
 /// For the frame-rate line: where landing went, per frame.
 pub(crate) fn log(frames: f64) {
     census::log(frames);
+    crate::shadow::log_held(frames);
     let t: Vec<f64> = TAKEN.iter().map(|t| t.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if t[0] > 0.0 {
         tracing::info!(
@@ -606,6 +607,11 @@ fn taken() -> bool {
 static TAKEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 impl Notes {
+    /// How many pieces were put beside the guards so far in the job.
+    pub(crate) fn beside(&self) -> usize {
+        self.landed.len()
+    }
+
     /// At the end of a job: what it wrote beside the guards is noted.
     pub(crate) fn flush(&mut self) {
         if self.pages.is_empty() {
