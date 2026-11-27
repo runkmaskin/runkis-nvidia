@@ -306,6 +306,15 @@ fn mouse_on() -> bool {
     *ON
 }
 
+/// `VICTORY_MOUSE_NATIVE=1` (with `VICTORY_MOUSE=1`; off unless asked for): the mouse's movement
+/// also goes to the title's mouse events (`victory_loader::mouse_look`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn mouse_native() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_MOUSE_NATIVE").is_some_and(|v| v == "1"));
+    *ON
+}
+
 /// `VICTORY_KEYMAP`, `None` when unset: the default table, and the mouse's
 /// buttons keep their own roles.
 static CUSTOM_KEYMAP: LazyLock<Option<Keymap>> = LazyLock::new(|| {
@@ -1309,7 +1318,31 @@ extern "system" fn key_count(this: *const Reading) -> u32 {
         Value::Pad(_) => 0,
     }
 }
+/// `VICTORY_INPUT_CALLERS=1` (diagnostics builds, off unless asked for): each chain of title code
+/// that reads a pad's or the keyboard's state is logged once, as `module+rva` return addresses.
+/// It finds where the title turns the sticks into camera turns, and where it reads keys.
+#[cfg(feature = "diagnostics")]
+fn note_callers(what: &'static str) {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_INPUT_CALLERS").is_some_and(|v| v == "1"));
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    if !*ON {
+        return;
+    }
+    let from = super::kernel::callers();
+    let mut seen = lock(&SEEN);
+    // A few hundred chains at most; past that the log would only repeat itself.
+    if seen.len() < 512 && !seen.contains(&from) {
+        tracing::info!(what, from = %from, "input read by the title");
+        seen.push(from);
+    }
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn note_callers(_: &'static str) {}
+
 extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyState) -> u32 {
+    note_callers("keys");
     let Value::Keys(keys) = &reading(this).value else {
         return 0;
     };
@@ -1322,6 +1355,7 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
     n as u32
 }
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
+    note_callers("pad");
     match &reading(this).value {
         Value::Pad(state) if !out.is_null() => {
             // SAFETY: checked non-null.
@@ -1545,7 +1579,15 @@ mod host {
                 }
                 let centre = ((window.left + window.right) / 2, (window.top + window.bottom) / 2);
                 SetCursorPos(centre.0, centre.1);
-                let (x, y) = mouse_stick((at.x - centre.0) as f32, (at.y - centre.1) as f32, sense);
+                let (dx, dy) = (at.x - centre.0, at.y - centre.1);
+                // With the native mouse the movement also goes to the title's own mouse events
+                // (the patch in `victory_loader::mouse_look`). It stays the stick as well: in game
+                // nothing listens to those events yet (docs/changes-2026-11-27.md), and the camera
+                // would not turn at all without it.
+                if mouse_native() && victory_loader::mouse_look::active() {
+                    victory_loader::mouse_look::add(dx, dy);
+                }
+                let (x, y) = mouse_stick(dx as f32, dy as f32, sense);
                 // With `VICTORY_KEYMAP` set the buttons go by the map instead
                 // (`mouse_buttons`), which starts from these same roles.
                 let held = |vk: i32| CUSTOM_KEYMAP.is_none() && GetAsyncKeyState(vk) < 0;
