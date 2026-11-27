@@ -585,7 +585,11 @@ impl SentRuns {
             return;
         }
         match self.0.iter_mut().find(|s| s.0 == number) {
-            Some((_, all)) => *all = joined([std::mem::take(all), ranges].concat()),
+            // (Added to the vector it has, not to a new one made for both.)
+            Some((_, all)) => {
+                all.extend(ranges);
+                *all = joined(std::mem::take(all));
+            }
             None => self.0.push((number, ranges)),
         }
     }
@@ -909,6 +913,41 @@ mod card_tests {
     fn ranges_join_where_they_touch() {
         assert_eq!(joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]), [(0, 6), (8, 20), (30, 31)]);
         assert!(joined(Vec::new()).is_empty());
+    }
+
+    /// Sends noted again under the same number keep what a new vector of
+    /// both kept (fixed seeds).
+    #[test]
+    fn sends_noted_again_are_joined_as_before() {
+        let mut seed = 0x51de_5eedu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 16) as usize
+        };
+        for _ in 0..200 {
+            let mut sent = super::SentRuns::default();
+            let mut model: Vec<(u64, Vec<(usize, usize)>)> = Vec::new();
+            for _ in 0..12 {
+                let number = (next() % 4) as u64;
+                let ranges: Vec<(usize, usize)> = (0..next() % 6)
+                    .map(|_| {
+                        let a = next() % 4096;
+                        (a, a + 1 + next() % 64)
+                    })
+                    .collect();
+                let ranges = joined(ranges);
+                if !ranges.is_empty() {
+                    match model.iter_mut().find(|s| s.0 == number) {
+                        Some((_, all)) => *all = joined([std::mem::take(all), ranges.clone()].concat()),
+                        None => model.push((number, ranges.clone())),
+                    }
+                }
+                sent.note_joined(number, ranges);
+            }
+            assert_eq!(sent.0, model);
+        }
     }
 }
 
@@ -4897,17 +4936,26 @@ impl Shadow {
             while at < to {
                 let n = (PAGE - at % PAGE).min(to - at);
                 let title = &mut title[..n];
-                // (Pages that are not there read as zeros.)
-                crate::host::copy_mapped(title.as_mut_ptr(), at as *const u8, n, false);
                 // SAFETY: inside the mapping of the copy's CPU side, which
                 // nothing else reads or writes there (the card copies from
                 // it): no shader's range holds it, and the parts of a
                 // refresh lie apart.
                 let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
                 let was = crate::host::upcheck::on().then(|| held.to_vec());
-                let runs = if whole { vec![(0, n)] } else { dword_runs(at, held, title, 0) };
+                // (Pages that are not there read as zeros.) A page taken
+                // whole goes straight into the CPU's side: the same bytes as
+                // through the page read first, one copy fewer.
+                let runs = if whole {
+                    crate::host::copy_mapped(held.as_mut_ptr(), at as *const u8, n, false);
+                    vec![(0, n)]
+                } else {
+                    crate::host::copy_mapped(title.as_mut_ptr(), at as *const u8, n, false);
+                    dword_runs(at, held, title, 0)
+                };
                 for &(a, len) in &runs {
-                    held[a..a + len].copy_from_slice(&title[a..a + len]);
+                    if !whole {
+                        held[a..a + len].copy_from_slice(&title[a..a + len]);
+                    }
                     self.changed(at - start + a, at - start + a + len);
                 }
                 self.card_changed_runs(runs.iter().map(|&(a, len)| (at - start + a, at - start + a + len)));
@@ -5474,6 +5522,88 @@ mod land_tests {
         (*seed >> 8) as usize
     }
 
+    /// The old way a page went in whole: read into a page of its own first,
+    /// then copied into the CPU's side.
+    fn take_whole_as_before(data: *mut u8, start: usize, from: usize, to: usize) {
+        let mut title = vec![0u8; super::PAGE];
+        let mut at = from;
+        while at < to {
+            let n = (super::PAGE - at % super::PAGE).min(to - at);
+            crate::host::copy_mapped(title.as_mut_ptr(), at as *const u8, n, false);
+            // SAFETY: the caller's mapping of the copy.
+            unsafe { std::ptr::copy_nonoverlapping(title.as_ptr(), data.add(at - start), n) };
+            at += n;
+        }
+    }
+
+    /// A take of pages the copy never held, straight into the CPU's side,
+    /// leaves the same bytes as through a page read first (zeros where title
+    /// memory is not there), and the same offsets to go up.
+    #[test]
+    fn a_page_taken_whole_goes_in_as_through_a_page_read_first() {
+        use windows_sys::Win32::System::Memory as mem;
+        assert!(crate::safecopy::on());
+        const LEN: usize = 5 * PIECE;
+        let mut seed = 0x0bad_cafe_1234u64;
+        let title = memory(LEN, false);
+        // SAFETY: our committed memory of `LEN` bytes.
+        for b in unsafe { std::slice::from_raw_parts_mut(title as *mut u8, LEN) } {
+            *b = random(&mut seed) as u8;
+        }
+        // A page that is not there: it must read as zeros either way.
+        // SAFETY: a part of our own allocation.
+        unsafe { mem::VirtualFree((title + 2 * PIECE) as *mut _, PIECE, mem::MEM_DECOMMIT) };
+        for (from, to) in [(0, LEN), (PIECE / 2 + 12, 4 * PIECE + 100), (3 * PIECE, 3 * PIECE + 4096)] {
+            let Some(new) = copy_of(title, LEN) else {
+                return; // no host GPU
+            };
+            new.changes_only.store(true, Ordering::Relaxed);
+            let Some(old) = copy_of(title, LEN) else { return };
+            // What was in the CPU's side before is overwritten either way.
+            // SAFETY: the mappings, `LEN` bytes each.
+            unsafe {
+                std::ptr::write_bytes(new.data, 0xaa, LEN);
+                std::ptr::write_bytes(old.data, 0xaa, LEN);
+            }
+            let took = new.take(title + from, title + to, false);
+            take_whole_as_before(old.data, title, title + from, title + to);
+            assert_eq!(took, to - from);
+            // SAFETY: as above.
+            let (a, b) = unsafe { (std::slice::from_raw_parts(new.data, LEN), std::slice::from_raw_parts(old.data, LEN)) };
+            assert!(a == b, "[{from:#x}, {to:#x}): other bytes");
+            assert_eq!(new.card_dirty_now(), vec![(from, to)], "[{from:#x}, {to:#x}): other offsets to go up");
+        }
+    }
+
+    /// What a page taken whole costs, the old way (through a page read
+    /// first) and as now (straight in), over 16 MiB of title memory:
+    /// `cargo test --release -p victory-gpu --lib -- --ignored --nocapture
+    /// bench_a_page_taken_whole`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_a_page_taken_whole() {
+        assert!(crate::safecopy::on());
+        const LEN: usize = 256 * PIECE;
+        let title = memory(LEN, false);
+        // SAFETY: our committed memory.
+        unsafe { std::ptr::write_bytes(title as *mut u8, 0x5a, LEN) };
+        let Some(copy) = copy_of(title, LEN) else { return };
+        copy.changes_only.store(true, Ordering::Relaxed);
+        let best = |f: &mut dyn FnMut()| {
+            (0..7)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    f();
+                    t.elapsed().as_secs_f64() * 1e3
+                })
+                .fold(f64::MAX, f64::min)
+        };
+        let before = best(&mut || take_whole_as_before(copy.data, title, title, title + LEN));
+        let now = best(&mut || {
+            copy.take(title, title + LEN, false);
+        });
+        eprintln!("a page taken whole, 16 MiB: before {before:.2} ms (copies only), now {now:.2} ms (with the bookkeeping)");
+    }
     /// [`Shadow::land_card`] leaves title memory and the CPU's side as
     /// [`Shadow::card_merge_relay`] does, with title bytes that went up
     /// behind the fetch, or have not gone up, left out.
