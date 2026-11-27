@@ -170,11 +170,16 @@ public sealed class MainViewModel : Observable, IDisposable
     private Choice? selectedStart;
     public Choice? SelectedStart
     {
-        // The preset worked out for this PC unless the user picks otherwise.
-        get => selectedStart ??= StartChoices[1];
+        // The last choice; the preset worked out for this PC the first time.
+        get => selectedStart ??= StartChoices.FirstOrDefault(c => c.Label == settings.LastStart) ?? StartChoices[1];
         set
         {
             if (!Set(ref selectedStart, value)) return;
+            if (value != null && value.Label != settings.LastStart)
+            {
+                settings.LastStart = value.Label;
+                settings.Save();
+            }
             Raise(nameof(StartDescription));
             Raise(nameof(ProfileSummary));
             Raise(nameof(UsingPreset));
