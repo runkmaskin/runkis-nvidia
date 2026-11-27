@@ -145,7 +145,7 @@ pub(crate) struct HostHeap {
     /// The slots made from a texture whose memory was found away, with what
     /// they were made from and when that was
     /// ([`HostHeap::texture_slot_gone`]).
-    away: Mutex<std::collections::HashMap<u32, (u64, u64)>>,
+    away: Mutex<crate::fx::Map<u32, (u64, u64)>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -545,14 +545,16 @@ pub(crate) struct Spans {
     /// When a newer view makes an older one stale.
     rule: Rule,
     by_start: std::collections::BTreeMap<u64, (u64, std::collections::BTreeSet<u32>)>,
-    by_slot: std::collections::HashMap<u32, u64>,
+    // (FxHash: these are only looked up, never walked, so their order
+    // reaches nothing; SipHash on 14-word keys was a hot spot.)
+    by_slot: crate::fx::Map<u32, u64>,
     /// The level each slot's view starts at, and where what it is read from
     /// ends ([`Spans::shows`]).
-    first: std::collections::HashMap<u32, (u32, u64)>,
+    first: crate::fx::Map<u32, (u32, u64)>,
     /// The bytes a placed texture takes, by resource description: worked
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).
-    sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
+    sizes: crate::fx::Map<WordKey<14>, Option<u64>>,
 }
 
 /// When a view the title writes makes an older view of other memory stale.
@@ -585,11 +587,11 @@ impl Spans {
     /// The bytes of title memory a placed texture with the resource
     /// description `desc` takes (`crate::resource::placed_bytes`).
     fn bytes(&mut self, desc: &[u32; 14]) -> Option<u64> {
-        if let Some(&known) = self.sizes.get(desc) {
+        if let Some(&known) = self.sizes.get(&WordKey(*desc)) {
             return known;
         }
         let bytes = crate::resource::placed_bytes(desc);
-        self.sizes.insert(*desc, bytes);
+        self.sizes.insert(WordKey(*desc), bytes);
         bytes
     }
 
@@ -2117,7 +2119,7 @@ impl HostHeap {
             return false;
         }
         let _made = self.made.lock(index);
-        self.made.get(index) == Some(key) && self.kept_in(index).is_some()
+        self.made.get(index) == Some(key) && self.holds(index)
     }
 
     /// Levels on demand (`crate::tiles`): makes again the host slots of the
@@ -2774,7 +2776,23 @@ impl HostHeap {
                 views.made.clear();
             }
             let twins = self.twins.get(index as usize).is_some();
-            if !views.made.contains_key(&words) {
+            let put = |views: &ListViews, made: &ListView| {
+                self.copy_from(index, views.slot(made.at));
+                if made.twin && twins {
+                    self.copy_from(self.raw + index, views.slot(made.at + 1));
+                    self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    self.clear_twin(index);
+                }
+                self.keep_ref(index, made.kept.as_ref());
+                made.listed
+            };
+            let key = WordKey(words);
+            // Made before in this recording (most records): one lookup.
+            if let Some(made) = views.made.get(&key) {
+                return Some(put(views, made));
+            }
+            {
                 let view = super::view_at(words[1], words[2])?;
                 let at = 2 * views.made.len() as u32;
                 // (A constant buffer's bytes are copied for each draw.)
@@ -2789,18 +2807,9 @@ impl HostHeap {
                     ready: (0, 0, false),
                     tabled: None,
                 };
-                views.made.insert(words, ListView { view, at, twin, kept, listed });
+                views.made.insert(key, ListView { view, at, twin, kept, listed });
             }
-            let made = &views.made[&words];
-            self.copy_from(index, views.slot(made.at));
-            if made.twin && twins {
-                self.copy_from(self.raw + index, views.slot(made.at + 1));
-                self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                self.clear_twin(index);
-            }
-            self.keep(index, made.kept.clone());
-            Some(made.listed)
+            Some(put(views, &views.made[&key]))
         })
     }
 
@@ -2872,11 +2881,42 @@ impl HostHeap {
         // A running submission may still read the old resource through
         // this slot.
         if let Some(old) = old {
-            crate::host::retire_resource(old);
+            retire_kept(old);
         }
     }
 
+    /// As [`HostHeap::keep`], from a borrow: the resource is cloned (a COM
+    /// reference taken) only if the slot did not hold it already. Each
+    /// descriptor a list copies for a draw named its resource so, and the
+    /// clone and its release were 3.5 % of the recording threads (game
+    /// profile on 886ae0e).
+    fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
+        let Some(slot) = self.kept.get(index as usize) else {
+            return;
+        };
+        let old = {
+            use windows::core::Interface;
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            match swap_kept(&mut slot, resource, |a, b| a.as_raw() == b.as_raw()) {
+                Some(old) => old,
+                // The same again: nothing to retire.
+                None => return,
+            }
+        };
+        if let Some(old) = old {
+            retire_kept(old);
+        }
+    }
+
+    /// Whether slot `index` views a resource of the host's.
+    fn holds(&self, index: u32) -> bool {
+        self.kept
+            .get(index as usize)
+            .is_some_and(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()).is_some())
+    }
+
     /// What slot `index` views.
+    #[cfg(feature = "diagnostics")]
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -2909,7 +2949,7 @@ impl HostHeap {
         self.put(index);
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -2952,7 +2992,7 @@ impl HostHeap {
         };
         self.put(index);
         self.clear_twin(index);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3040,7 +3080,7 @@ impl HostHeap {
         self.twin_made(index, twin.is_some());
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep_ref(index, holds.then_some(buffer));
     }
 
     /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
@@ -3088,7 +3128,7 @@ impl HostHeap {
             host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
         }
         self.twin_made(index, true);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
         true
     }
 
@@ -6368,7 +6408,7 @@ struct ListViews {
     heap: ID3D12DescriptorHeap,
     step: usize,
     start: usize,
-    made: std::collections::HashMap<[u32; 3], ListView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    made: std::collections::HashMap<WordKey<3>, ListView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
 }
 
 impl ListViews {
@@ -6407,7 +6447,7 @@ pub(crate) fn listed_view(recording: u64, words: [u32; 3]) -> Option<View> {
     LIST_VIEWS.with(|views| {
         let views = views.borrow();
         let views = views.as_ref().filter(|v| v.recording == recording)?;
-        views.made.get(&words).map(|m| m.view.clone())
+        views.made.get(&WordKey(words)).map(|m| m.view.clone())
     })
 }
 
@@ -6415,7 +6455,7 @@ pub(crate) fn listed_view(recording: u64, words: [u32; 3]) -> Option<View> {
 pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
     LIST_VIEWS.with(|views| {
         if let Some(views) = views.borrow_mut().as_mut().filter(|v| v.recording == recording)
-            && let Some(made) = views.made.get_mut(&words)
+            && let Some(made) = views.made.get_mut(&WordKey(words))
         {
             made.listed = listed;
         }
@@ -6426,4 +6466,404 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
 /// for every table).
 pub(crate) fn list_views() -> bool {
     crate::toggled!("VICTORY_LIST_VIEWS")
+}
+
+/// Words as a table key, hashed two at a time. An array of `u32` hashes as
+/// its bytes, which a hasher that takes a step per byte (FxHash,
+/// [`crate::host::AddressHash`]) walks 4 steps a word; equal when the words
+/// are, as the array is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WordKey<const N: usize>(pub(crate) [u32; N]);
+
+impl<const N: usize> std::hash::Hash for WordKey<N> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let mut pairs = self.0.chunks_exact(2);
+        for pair in &mut pairs {
+            state.write_u64(u64::from(pair[0]) | u64::from(pair[1]) << 32);
+        }
+        for &word in pairs.remainder() {
+            state.write_u32(word);
+        }
+    }
+}
+
+/// What [`HostHeap::keep_ref`] does to a slot's holding: `new` goes in
+/// unless the slot holds the same object (`same`) or nothing and nothing
+/// again. What the slot held, if it changed. `new` is cloned only then.
+fn swap_kept<T: Clone>(slot: &mut Option<T>, new: Option<&T>, same: impl Fn(&T, &T) -> bool) -> Option<Option<T>> {
+    let unchanged = match (slot.as_ref(), new) {
+        (None, None) => true,
+        (Some(held), Some(new)) => same(held, new),
+        _ => false,
+    };
+    (!unchanged).then(|| std::mem::replace(slot, new.cloned()))
+}
+
+thread_local! {
+    /// Resources slots let go of while a [`Retiring`] is alive on this
+    /// thread: retired together when it ends.
+    static RETIRING: std::cell::RefCell<Option<Vec<ID3D12Resource>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A resource a slot let go of: retired now, or with the others when this
+/// thread's [`Retiring`] ends.
+fn retire_kept(old: ID3D12Resource) {
+    let left = RETIRING.with(|r| match r.borrow_mut().as_mut() {
+        Some(batch) => {
+            if batch.capacity() == 0 {
+                // A draw's tables: some tens of slots.
+                batch.reserve(32);
+            }
+            batch.push(old);
+            None
+        }
+        None => Some(old),
+    });
+    if let Some(old) = left {
+        crate::host::retire_resource(old);
+    }
+}
+
+/// While alive, what slots let go of on this thread is retired at once
+/// when it is dropped, under one take of the retirement lock instead of
+/// one each: a draw's tables let go of a resource for most slots they fill,
+/// and the eight recording threads waited for each other on that lock
+/// (`Mutex::lock_contended`, game profile on 886ae0e). Retired later, never
+/// sooner: the objects live a little longer, which is safe.
+pub(crate) struct Retiring(bool);
+
+pub(crate) fn retiring() -> Retiring {
+    RETIRING.with(|r| {
+        let mut r = r.borrow_mut();
+        let outer = r.is_none();
+        if outer {
+            *r = Some(Vec::new());
+        }
+        Retiring(outer)
+    })
+}
+
+impl Drop for Retiring {
+    fn drop(&mut self) {
+        if !self.0 {
+            return;
+        }
+        let batch = RETIRING.with(|r| r.borrow_mut().take()).unwrap_or_default();
+        match batch.len() {
+            0 => {}
+            1 => batch.into_iter().for_each(crate::host::retire_resource),
+            _ => crate::host::retire(batch),
+        }
+    }
+}
+
+/// The list threads' CPU fixes of 2026-11-27 (game profile on 886ae0e):
+/// each against the code it replaced, on fixed seeds, and timed in
+/// release (`cargo test --release -p victory-gpu --lib -- --ignored
+/// --nocapture list_cpu`).
+#[cfg(test)]
+mod list_cpu {
+    use super::*;
+    use windows::core::Interface;
+
+    /// A fixed-seed stream (xorshift64*).
+    struct Seeded(u64);
+
+    impl Seeded {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// The references a COM object has (taken and given back to read).
+    fn references(r: &ID3D12Resource) -> u32 {
+        // SAFETY: a live object; one reference taken and given back.
+        unsafe {
+            let unknown = &r.vtable().base__.base__.base__.base__;
+            (unknown.AddRef)(r.as_raw());
+            (unknown.Release)(r.as_raw())
+        }
+    }
+
+    /// `swap_kept` against the old `keep`: the clone made first, the slot
+    /// compared, the clone dropped if it was the same. Same holdings, same
+    /// objects let go, in the same order; fewer clones.
+    #[test]
+    fn swap_kept_is_the_old_keep() {
+        use std::rc::Rc;
+        let objects: Vec<Rc<u32>> = (0..12).map(Rc::new).collect();
+        let mut rng = Seeded(0x5eed_1234);
+        let (mut old, mut new) = (vec![None::<Rc<u32>>; 16], vec![None::<Rc<u32>>; 16]);
+        let (mut old_gone, mut new_gone) = (Vec::new(), Vec::new());
+        for _ in 0..200_000 {
+            let slot = rng.below(16) as usize;
+            let pick = rng.below(13) as usize;
+            let resource = objects.get(pick);
+            // The old algorithm.
+            let owned = resource.cloned();
+            if old[slot].as_ref().map(Rc::as_ptr) != owned.as_ref().map(Rc::as_ptr) {
+                old_gone.push(std::mem::replace(&mut old[slot], owned).map(|o| *o));
+            }
+            // The new one.
+            if let Some(gone) = swap_kept(&mut new[slot], resource, Rc::ptr_eq) {
+                new_gone.push(gone.map(|o| *o));
+            }
+            assert_eq!(
+                old[slot].as_ref().map(Rc::as_ptr),
+                new[slot].as_ref().map(Rc::as_ptr)
+            );
+        }
+        assert_eq!(old_gone, new_gone);
+        let holds = |slots: &[Option<Rc<u32>>], o: &Rc<u32>| slots.iter().flatten().filter(|s| Rc::ptr_eq(s, o)).count();
+        for o in &objects {
+            // Each object's references: ours, and one per slot of each side.
+            assert_eq!(Rc::strong_count(o), 1 + holds(&old, o) + holds(&new, o));
+        }
+    }
+
+    /// Hashing words two at a time: the same table answers as one keyed by
+    /// the arrays (std's SipHash), for both hashers it serves.
+    #[test]
+    fn word_keys_answer_as_the_arrays() {
+        fn run<const N: usize, S: std::hash::BuildHasher + Default>(seed: u64) {
+            let mut rng = Seeded(seed);
+            let mut reference = std::collections::HashMap::<[u32; N], u64>::new();
+            let mut keyed = std::collections::HashMap::<WordKey<N>, u64, S>::default();
+            // Few distinct words, so that keys repeat and collide in parts.
+            let key = |rng: &mut Seeded| std::array::from_fn::<u32, N, _>(|_| rng.below(5) as u32 * 0x1_0001);
+            for i in 0..100_000u64 {
+                let k = key(&mut rng);
+                match rng.below(4) {
+                    0 => assert_eq!(reference.insert(k, i), keyed.insert(WordKey(k), i)),
+                    1 => assert_eq!(reference.remove(&k), keyed.remove(&WordKey(k))),
+                    _ => assert_eq!(reference.get(&k), keyed.get(&WordKey(k))),
+                }
+            }
+            assert_eq!(reference.len(), keyed.len());
+            for (k, v) in &reference {
+                assert_eq!(keyed.get(&WordKey(*k)), Some(v));
+            }
+        }
+        run::<3, std::hash::BuildHasherDefault<crate::host::AddressHash>>(7);
+        run::<14, std::hash::BuildHasherDefault<crate::fx::Fx>>(11);
+        run::<14, std::hash::BuildHasherDefault<crate::host::AddressHash>>(13);
+    }
+
+    /// The tables FxHash took over from SipHash, keyed as they are: per
+    /// frame of 5,000 draws, 30 lookups each.
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn list_cpu_hash_lookups() {
+        const LOOKUPS: usize = 5_000 * 30;
+        let mut rng = Seeded(3);
+        let descs: Vec<[u32; 14]> =
+            (0..3_000).map(|_| std::array::from_fn(|_| rng.next() as u32)).collect();
+        let order: Vec<usize> = (0..LOOKUPS).map(|_| rng.below(descs.len() as u64) as usize).collect();
+        let time = |f: &mut dyn FnMut() -> u64| {
+            let mut best = f64::MAX;
+            let mut sum = 0;
+            for _ in 0..7 {
+                let began = std::time::Instant::now();
+                sum += f();
+                best = best.min(began.elapsed().as_secs_f64() * 1e3);
+            }
+            std::hint::black_box(sum);
+            best
+        };
+        // `Spans::sizes`, `crate::resource::placed_bytes_from`'s table.
+        let sip: std::collections::HashMap<[u32; 14], Option<u64>> =
+            descs.iter().enumerate().map(|(i, d)| (*d, Some(i as u64))).collect();
+        let fx: crate::fx::Map<WordKey<14>, Option<u64>> =
+            descs.iter().enumerate().map(|(i, d)| (WordKey(*d), Some(i as u64))).collect();
+        let before = time(&mut || order.iter().map(|&i| sip[std::hint::black_box(&descs[i])].unwrap_or(0)).sum());
+        let after =
+            time(&mut || order.iter().map(|&i| fx[&WordKey(*std::hint::black_box(&descs[i]))].unwrap_or(0)).sum());
+        eprintln!("[u32; 14] tables, {LOOKUPS} lookups a frame: SipHash {before:.3} ms, FxHash by word pairs {after:.3} ms");
+        // `ListViews::made`: the same hasher, the key hashed by bytes before.
+        let words: Vec<[u32; 3]> = descs.iter().map(|d| [d[0], d[1], d[2]]).collect();
+        type Address = std::hash::BuildHasherDefault<crate::host::AddressHash>;
+        let bytes: std::collections::HashMap<[u32; 3], u64, Address> =
+            words.iter().enumerate().map(|(i, w)| (*w, i as u64)).collect();
+        let pairs: std::collections::HashMap<WordKey<3>, u64, Address> =
+            words.iter().enumerate().map(|(i, w)| (WordKey(*w), i as u64)).collect();
+        // The old `make_listed` looked twice (`contains_key`, then `[]`).
+        let before = time(&mut || {
+            order
+                .iter()
+                .map(|&i| {
+                    let k = std::hint::black_box(&words[i]);
+                    if bytes.contains_key(k) { bytes[k] } else { 0 }
+                })
+                .sum()
+        });
+        let after = time(&mut || order.iter().map(|&i| pairs.get(&WordKey(*std::hint::black_box(&words[i]))).copied().unwrap_or(0)).sum());
+        eprintln!("list views, {LOOKUPS} records a frame: two lookups by bytes {before:.3} ms, one by word pairs {after:.3} ms");
+        // The draws' root SRV and UAV slots, by (heap, address).
+        let roots: Vec<(usize, u64)> = (0..200).map(|_| (rng.next() as usize, rng.next())).collect();
+        let order: Vec<usize> = (0..5_000 * 4).map(|_| rng.below(roots.len() as u64) as usize).collect();
+        let sip: std::collections::HashMap<(usize, u64), u64> = roots.iter().map(|&k| (k, k.1)).collect();
+        let fx: crate::fx::Map<(usize, u64), u64> = roots.iter().map(|&k| (k, k.1)).collect();
+        let before = time(&mut || order.iter().map(|&i| sip[std::hint::black_box(&roots[i])]).sum());
+        let after = time(&mut || order.iter().map(|&i| fx[std::hint::black_box(&roots[i])]).sum());
+        eprintln!("root view slots, 20,000 lookups a frame: SipHash {before:.3} ms, FxHash {after:.3} ms");
+    }
+
+    fn buffers(n: usize) -> Option<Vec<ID3D12Resource>> {
+        let host = host()?;
+        (0..n).map(|_| host.upload_buffer(256).map(|(b, _)| b)).collect()
+    }
+
+    /// `keep_ref` and the batched retirement against the old `keep` of a
+    /// clone, retired one at a time: on two heaps, the same fixed-seed
+    /// sequence of slots and resources (two sets of buffers alike), then
+    /// the same resource in each slot and the same references on each
+    /// buffer (slots, plus retired objects waiting, plus ours).
+    #[test]
+    fn keep_ref_and_batched_retiring_hold_what_keep_held() {
+        let (Some(old_heap), Some(new_heap), Some(old_set), Some(new_set)) =
+            (HostHeap::new(false, 32), HostHeap::new(false, 32), buffers(24), buffers(24))
+        else {
+            return; // no host GPU
+        };
+        // (Retired objects are dropped once submissions run: other tests'
+        // ones would make the counts below differ by timing.)
+        let submitted = crate::host::submissions();
+        let mut rng = Seeded(0xdead_beef);
+        let mut guard = None;
+        for step in 0..20_000 {
+            // A bind's batch: some tens of slots, as a draw's tables.
+            if step % 37 == 0 {
+                // (The last ends first: a new one inside it would be nested.)
+                drop(guard.take());
+                guard = Some(retiring());
+            }
+            let slot = rng.below(32) as u32;
+            let pick = rng.below(25) as usize;
+            old_heap.keep(slot, old_set.get(pick).cloned());
+            new_heap.keep_ref(slot, new_set.get(pick));
+        }
+        drop(guard);
+        assert!(RETIRING.with(|r| r.borrow().is_none()), "the batch ends with its guard");
+        for slot in 0..32 {
+            let at = |heap: &HostHeap, set: &[ID3D12Resource]| {
+                let held = heap.kept[slot].lock().unwrap().clone();
+                held.map(|h| set.iter().position(|s| s.as_raw() == h.as_raw()).unwrap())
+            };
+            assert_eq!(at(&old_heap, &old_set), at(&new_heap, &new_set), "slot {slot}");
+        }
+        if crate::host::submissions() == submitted {
+            for (o, n) in old_set.iter().zip(&new_set) {
+                assert_eq!(references(o), references(n));
+            }
+        }
+    }
+
+    /// A nested batch leaves the outer one to retire what both let go of.
+    #[test]
+    fn a_nested_batch_retires_with_the_outer() {
+        let (Some(heap), Some(set)) = (HostHeap::new(false, 4), buffers(2)) else {
+            return; // no host GPU
+        };
+        heap.keep_ref(0, Some(&set[0]));
+        let outer = retiring();
+        {
+            let _inner = retiring();
+            heap.keep_ref(0, Some(&set[1]));
+        }
+        assert_eq!(RETIRING.with(|r| r.borrow().as_ref().map(Vec::len)), Some(1));
+        drop(outer);
+        assert!(RETIRING.with(|r| r.borrow().is_none()));
+    }
+
+    /// A frame of 5,000 draws filling 30 slots each from views made before
+    /// (`make_listed`): the old clone-then-keep against `keep_ref`, with
+    /// the slot holding the same resource (the common case) and with a new
+    /// one each time (each retires what the slot held); the latter also on
+    /// eight threads at once, as the recording threads run.
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn list_cpu_keep() {
+        const SLOTS: u32 = 30;
+        const DRAWS: usize = 5_000;
+        let Some(set) = buffers(64) else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, SLOTS) else {
+            return;
+        };
+        let time = |f: &mut dyn FnMut()| {
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let began = std::time::Instant::now();
+                f();
+                best = best.min(began.elapsed().as_secs_f64() * 1e3);
+            }
+            best
+        };
+        let same = |k: u32| &set[k as usize];
+        let before = time(&mut || {
+            for _ in 0..DRAWS {
+                for k in 0..SLOTS {
+                    heap.keep(k, Some(same(k).clone()));
+                }
+            }
+        });
+        let after = time(&mut || {
+            for _ in 0..DRAWS {
+                let _r = retiring();
+                for k in 0..SLOTS {
+                    heap.keep_ref(k, Some(same(k)));
+                }
+            }
+        });
+        eprintln!("keep, same resource, {DRAWS} draws x {SLOTS} slots: clone {before:.3} ms, borrow {after:.3} ms");
+        let other = |d: usize, k: u32| &set[(d + k as usize) % set.len()];
+        let before = time(&mut || {
+            for d in 0..DRAWS {
+                for k in 0..SLOTS {
+                    heap.keep(k, Some(other(d, k).clone()));
+                }
+            }
+        });
+        let after = time(&mut || {
+            for d in 0..DRAWS {
+                let _r = retiring();
+                for k in 0..SLOTS {
+                    heap.keep_ref(k, Some(other(d, k)));
+                }
+            }
+        });
+        eprintln!("keep, new resource each time, {DRAWS} draws x {SLOTS} slots: one retirement each {before:.3} ms, batched by draw {after:.3} ms");
+        let heaps: Vec<HostHeap> = (0..8).filter_map(|_| HostHeap::new(false, SLOTS)).collect();
+        let threads = |batched: bool| {
+            let began = std::time::Instant::now();
+            std::thread::scope(|s| {
+                for (t, heap) in heaps.iter().enumerate() {
+                    let set = &set;
+                    s.spawn(move || {
+                        for d in 0..DRAWS / 8 {
+                            let _r = batched.then(retiring);
+                            for k in 0..SLOTS {
+                                let r = &set[(t + d + k as usize) % set.len()];
+                                if batched {
+                                    heap.keep_ref(k, Some(r));
+                                } else {
+                                    heap.keep(k, Some(r.clone()));
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            began.elapsed().as_secs_f64() * 1e3
+        };
+        let (before, after) = ((0..3).map(|_| threads(false)).fold(f64::MAX, f64::min), (0..3).map(|_| threads(true)).fold(f64::MAX, f64::min));
+        eprintln!("keep, new resource each time, 8 threads x {} draws x {SLOTS} slots: one retirement each {before:.3} ms, batched {after:.3} ms", DRAWS / 8);
+    }
 }
