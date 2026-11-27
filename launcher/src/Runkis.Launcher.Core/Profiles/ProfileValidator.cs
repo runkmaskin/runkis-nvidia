@@ -8,7 +8,8 @@ public sealed record ValidationIssue(string Field, string Message, bool Blocking
 public static partial class ProfileValidator
 {
     /// <summary>The heights play-nvidia.ps1 accepts for -Resolution.</summary>
-    public static readonly int[] Resolutions = [2160, 1440, 1080, 720, 540, 480];
+    // 768: the highest the Series S profile starts at (810 and above run the title out of its own memory pool, 2026-11-27).
+    public static readonly int[] Resolutions = [2160, 1440, 1080, 768, 720, 540, 480];
 
     [GeneratedRegex(@"^[A-Za-z0-9_:=,.\-]+$")]
     private static partial Regex FilterChars();
