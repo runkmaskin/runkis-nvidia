@@ -19,6 +19,10 @@ use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
 
 #[cfg(windows)]
+pub(crate) mod parts;
+#[cfg(windows)]
+pub(crate) mod sets;
+#[cfg(windows)]
 pub(crate) mod thin;
 
 const ALLOCATOR_IIDS: [Iid; 4] = [
@@ -152,12 +156,27 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
+    let started = call_times().then(std::time::Instant::now);
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(feature = "diagnostics")]
-    crate::copystat::recorded(started);
+    if let Some(started) = started {
+        crate::copystat::recorded(started);
+    }
+}
+
+/// Whether diagnostics builds time every list call (on by default;
+/// `VICTORY_CALL_TIMES=0`: not, and the log's figures of list calls and
+/// their milliseconds read 0). The timing is two clock reads and the
+/// bookkeeping of `copystat::recorded`: 60-70 ns of a call's 78 that
+/// reaches no draw (`thin::tests::bench_thin_call_floor` with diagnostics,
+/// against 9 without), some 2.5 ms of processor time a frame of 40,000
+/// calls. It is the diagnostics build players run.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn call_times() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CALL_TIMES").is_none_or(|v| v != "0"))
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'

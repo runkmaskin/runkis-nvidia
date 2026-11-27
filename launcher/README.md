@@ -1,4 +1,4 @@
-﻿# Runkis Launcher
+# Runkis Launcher
 
 A Windows desktop app that sets up, starts, watches and troubleshoots the layer. It is a front end only: it
 changes nothing in how `victory.exe` runs beyond the settings you pick, and every setting it shows is one the
@@ -11,7 +11,7 @@ the .NET 8 SDK). Afterwards `launcher\dist\RunkisLauncher.exe` runs on the .NET 
 
 1. **Settings.** `scripts\play-nvidia.ps1 -PrintEnv` prints the tuned settings as JSON and starts nothing. These
    are the same settings PLAY.bat uses, so there is one source and the two cannot drift apart. The profile's
-   switches (`-SeriesX`, `-Quality`, `-Resolution`, `-Adapter`, `-Build`, â€¦) and its `VN_*` values go into that call.
+   switches (`-SeriesX`, `-Quality`, `-Resolution`, `-Adapter`, `-Build`, …) and its `VN_*` values go into that call.
 2. **Overrides.** The profile's own overrides go on top: pipeline wait, mip drop, compare threads, render-target
    room, pool discard, pipeline book, panel, log filter. Empty fields keep the script's value. "Show effective
    settings" lists the result, with a mark on what the profile changed.
@@ -41,7 +41,7 @@ saved as a profile.
 
 ## Where the numbers come from
 
-Nothing is estimated. A figure that is not available shows "â€”", and its tooltip says why.
+Nothing is estimated. A figure that is not available shows "—", and its tooltip says why.
 
 | Figure | Source |
 |---|---|

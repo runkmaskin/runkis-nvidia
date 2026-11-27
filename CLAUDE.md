@@ -47,6 +47,11 @@ runs it. The layer refuses cache and data folders inside the source tree. Keep t
 | `dotnet test launcher\RunkisLauncher.slnx` | | Launcher tests; one starts the real `victory.exe` |
 
 Pitfalls:
+- `victory-gpu`'s `watch::tests` fail now and then, a different test each time. This happened on the base
+  commit too (about 1 run in 4); rerun before chasing it.
+- Windows PowerShell 5.1 reads UTF-8 files without a BOM as ANSI. Read and write text with
+  `[IO.File]::ReadAllText(path, [Text.Encoding]::UTF8)`, not `Get-Content`/`Set-Content`, or "…" and "—" are
+  mangled.
 - cargo may not rebuild after a file is restored with an old timestamp. Touch the file when results look stale.
 - Any change under `crates/victory-shader/src` changes the translator's hash. Every user's shader cache is then
   rebuilt on the next start: a slow first start, which is expected.

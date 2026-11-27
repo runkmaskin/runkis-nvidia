@@ -921,6 +921,97 @@ mod tests {
         assert!(at::<u32>(&w[1..], 2, 0).is_null());
     }
 
+    /// The floor of a list call with `VICTORY_THIN=1`: what writing it down
+    /// costs the title's thread, and what running it through the list
+    /// methods costs ours, for a frame's worth of calls shaped as the
+    /// title's (about 5.5 calls a draw: two tables, constants, vertex and
+    /// index buffers, the draw; a pipeline, viewport and scissor every ten
+    /// draws). The draws have no pipeline, so they stop where a draw's own
+    /// work begins (`State::prepare`): what is measured is the stream, the
+    /// draw state's lock and its bookkeeping. Ignored; run with
+    /// `cargo test --release -p victory-gpu --lib -- --ignored --nocapture bench_thin_call_floor`
+    /// (and `--features diagnostics` for the diagnostics build's own).
+    #[test]
+    #[ignore = "benchmark; see the comment"]
+    fn bench_thin_call_floor() {
+        const DRAWS: usize = 6500;
+        const RUNS: usize = 15;
+        if crate::host::host().is_none() {
+            eprintln!("no host GPU");
+            return;
+        }
+        let views = [VertexView::default(); 2];
+        let index = IndexView::default();
+        let viewport = [D3D12_VIEWPORT { Width: 1920.0, Height: 1080.0, MaxDepth: 1.0, ..Default::default() }];
+        let rect = [RECT { left: 0, top: 0, right: 1920, bottom: 1080 }];
+        let constants = [1u32, 2, 3, 4];
+        let write = |f: &mut Front| -> usize {
+            let mut calls = 1;
+            f.begin(0, std::ptr::null());
+            for i in 0..DRAWS {
+                if i % 10 == 0 {
+                    f.put(Plain::SET_PIPELINE as u64, &[0]);
+                    f.put_with(VIEWPORTS, &[1], &[bytes_of(viewport.as_ptr(), 1)]);
+                    f.put_with(SCISSORS, &[1], &[bytes_of(rect.as_ptr(), 1)]);
+                    calls += 3;
+                }
+                f.put(Plain::GRAPHICS_TABLE as u64, &[2, 0x1000 + (i as u64 % 7) * 32]);
+                f.put(Plain::GRAPHICS_TABLE as u64, &[3, 0x2000]);
+                f.put_with(GRAPHICS_CONSTANTS, &[1, 4], &[bytes_of(constants.as_ptr(), 4)]);
+                f.put_with(VERTEX_BUFFERS, &[2 << 32, 1], &[bytes_of(views.as_ptr(), 2)]);
+                f.put_with(INDEX_BUFFER, &[1], &[bytes_of(&raw const index, 1)]);
+                f.put(Plain::DRAW_INDEXED as u64, &[36, 1, 0, 0, 0]);
+                calls += 6;
+            }
+            f.close();
+            calls
+        };
+        let take = |f: &mut Front| -> Vec<Vec<u64>> {
+            let recording = f.recording.take().unwrap();
+            held(&READY).retain(|r| !Arc::ptr_eq(r, &recording));
+            held(&recording.inner).chunks.drain(..).collect()
+        };
+        let back = back_list(0, 0);
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let (mut written, mut translated) = (Vec::new(), Vec::new());
+        let mut calls = 0;
+        for run in 0..RUNS + 2 {
+            let mut f = Front::default();
+            let began = std::time::Instant::now();
+            calls = write(&mut f);
+            let wrote = began.elapsed().as_secs_f64() * 1e9;
+            let chunks = take(&mut f);
+            let began = std::time::Instant::now();
+            for chunk in &chunks {
+                translate(back, chunk, || false);
+            }
+            let ran = began.elapsed().as_secs_f64() * 1e9;
+            if run >= 2 {
+                written.push(wrote / calls as f64);
+                translated.push(ran / calls as f64);
+            }
+            give_back(chunks);
+        }
+        eprintln!(
+            "{calls} list calls ({DRAWS} draws), medians of {RUNS}: written down {:.0} ns a call (the title's thread), \
+             run through the list methods {:.0} ns a call (ours, up to a draw's own work)",
+            median(&mut written),
+            median(&mut translated)
+        );
+        // The state's lock and, in diagnostics builds, the timing of each call.
+        let began = std::time::Instant::now();
+        for _ in 0..DRAWS * 6 {
+            super::with_state(back, |_, s| s.set_table(false, 2, 0x1000));
+        }
+        eprintln!(
+            "  of that, one call's lock and bookkeeping (with_state, a table set): {:.0} ns",
+            began.elapsed().as_secs_f64() * 1e9 / (DRAWS * 6) as f64
+        );
+    }
+
     /// A view's record is the one at the call, also if its slot is written
     /// again right after.
     #[test]

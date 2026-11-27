@@ -9502,6 +9502,8 @@ impl Meter {
         card_clock_line(frames, ms);
         upq::line(frames);
         rec::line(frames);
+        crate::list::sets::line(frames);
+        crate::list::parts::line(frames);
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);
