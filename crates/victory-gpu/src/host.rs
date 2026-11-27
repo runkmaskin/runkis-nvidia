@@ -11421,7 +11421,20 @@ impl Meter {
                 );
                 traffic::line(self.copy_stats_frames as f64);
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
-                for (why, n) in drops.iter().take(40) {
+                // The skip list's shaders (about 140 at 3 a frame each) as
+                // one line: one each filled the 40 lines, and a pipeline the
+                // driver refused was not among them.
+                let (skipped, rest): (Vec<_>, Vec<_>) =
+                    drops.iter().partition(|(why, _)| why.starts_with("skipped shader "));
+                if !skipped.is_empty() {
+                    let n: u64 = skipped.iter().map(|(_, n)| n).sum();
+                    tracing::info!(
+                        "dropped {:.1}/frame without a host pipeline: skipped (VICTORY_SKIP_PIPELINES), {} shaders",
+                        n as f64 / frames,
+                        skipped.len()
+                    );
+                }
+                for (why, n) in rest.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
                         *n as f64 / frames

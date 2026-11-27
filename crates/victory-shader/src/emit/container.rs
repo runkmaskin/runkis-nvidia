@@ -64,6 +64,52 @@ impl SigElement {
     }
 }
 
+/// LOCAL (`VICTORY_SIG_ROWS=1`): elements packed into one row with another
+/// interpolation mode than the row's first element are moved to rows of
+/// their own, past the last one used; how many were moved.
+///
+/// The console's compiler packs elements into rows its own way, and the modes
+/// here are worked out per element (by type, by the reads, by `PSV0`). A row
+/// that ends up with two modes is refused by the DXIL validator ("has
+/// interpolation mode that differs from another element packed into the same
+/// row"): 41 pixel and mesh programs of the title, among them the burning
+/// foliage and the interiors' depth clear, whose draws were all dropped.
+/// D3D12 links stages by semantic, and the code reads and writes elements
+/// by their number, not their row, so a row of its own changes nothing else.
+/// Elements of one mode in a row move together; none moves past row 31.
+pub(crate) fn separate_modes(elements: &mut [SigElement]) -> usize {
+    let mut next = elements.iter().filter_map(|e| e.row).max().map_or(0, |r| r + 1);
+    let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    let mut moved = 0;
+    for row in rows {
+        let mut of: Vec<usize> = (0..elements.len()).filter(|&i| elements[i].row == Some(row)).collect();
+        of.sort_by_key(|&i| elements[i].col);
+        let Some(&first) = of.first() else { continue };
+        let mut modes: Vec<u8> = Vec::new();
+        for &i in &of {
+            let mode = elements[i].interp;
+            if mode != elements[first].interp && !modes.contains(&mode) {
+                modes.push(mode);
+            }
+        }
+        for mode in modes {
+            if next >= 32 {
+                return moved;
+            }
+            for &i in &of {
+                if elements[i].interp == mode {
+                    elements[i].row = Some(next);
+                    moved += 1;
+                }
+            }
+            next += 1;
+        }
+    }
+    moved
+}
+
 /// `ISG1`/`OSG1`: 32-byte rows, then the names.
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();

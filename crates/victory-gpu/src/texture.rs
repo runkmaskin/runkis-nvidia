@@ -122,6 +122,17 @@ const HOT_FRAMES: u64 = 64;
 /// and showed frames from earlier again (wt5 r_fps2; the user confirmed
 /// 1,024 fixed it). Only textures caught changing unseen get it, so the
 /// world's static textures do not pay for it.
+/// LOCAL: frames between two reads of a texture only some of whose pages
+/// are mapped (`VICTORY_TEXTURE_PARTIAL_EVERY=<frames>`, 30 when unset). A
+/// level that streams in shows up to that many frames late; a shorter
+/// interval shows it sooner and reads around unmapped pages more often.
+fn partial_every() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_PARTIAL_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(30u64).max(1)
+    })
+}
+
 fn blind_hot_frames() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -1351,7 +1362,7 @@ impl Staging {
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            if last.partial.is_some_and(|at| frame < at + partial_every()) {
                 return 0;
             }
             last.partial = Some(frame);

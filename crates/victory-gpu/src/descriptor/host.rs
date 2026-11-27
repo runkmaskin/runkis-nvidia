@@ -4210,9 +4210,27 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     if let Some(format) = format
         && !typeless
     {
+        if view != own {
+            note_cast(view, own, unordered);
+        }
         *format = d.Format;
     }
     true
+}
+
+/// Says once per pair of formats that a view in `view` of a typed texture in
+/// `own` reads (or writes) in the texture's format ([`fits`]): an sRGB view
+/// of a UNORM texture then reads without its conversion, colours too bright.
+/// Only a log line: what a run shows decides whether such textures are made
+/// typeless.
+fn note_cast(view: u32, own: u32, unordered: bool) {
+    static SAID: std::sync::Mutex<Vec<(u32, u32, bool)>> = std::sync::Mutex::new(Vec::new());
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if said.len() < 32 && !said.contains(&(view, own, unordered)) {
+        said.push((view, own, unordered));
+        let srgb = crate::resource::SRGB.iter().any(|&(s, l)| [s, l] == [view, own] || [l, s] == [view, own]);
+        tracing::warn!(view, own, unordered, srgb, "a view read in its texture's format, not its own");
+    }
 }
 
 /// The title's unordered access view of a depth texture, as a view of the

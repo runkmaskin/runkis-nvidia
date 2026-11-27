@@ -111,6 +111,52 @@ pub(crate) fn nan_scrub() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_SCRUB").is_some_and(|v| v == "1"))
 }
 
+/// LOCAL: `VICTORY_GATHER_LEVELS=1` (off by default): `image_gather4_l` on a
+/// 2D array or a cube reads the level it names. Without it the host's gather
+/// reads level 0 there. Arrays read their four texels by load; cubes take
+/// four samples at the texel centres (a cube view cannot be loaded from).
+pub(crate) fn gather_levels() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_GATHER_LEVELS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GATHER_LEVELS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's [`gather_levels`], for its thread only.
+    pub(super) static TEST_GATHER_LEVELS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's [`sig_rows`], for its thread only.
+    pub(super) static TEST_SIG_ROWS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's [`lod_array`], for its thread only.
+    pub(super) static TEST_LOD_ARRAY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// LOCAL: `VICTORY_LOD_ARRAY=1` (off by default): `image_get_lod` of an
+/// array leaves the slice out of the level query, as DXIL requires.
+pub(crate) fn lod_array() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LOD_ARRAY.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOD_ARRAY").is_some_and(|v| v == "1"))
+}
+
+/// LOCAL: `VICTORY_SIG_ROWS=1` (off by default): signature elements packed
+/// into one row with two interpolation modes get rows of their own
+/// (`container::separate_modes`), so the validator takes the program.
+pub(crate) fn sig_rows() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_SIG_ROWS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SIG_ROWS").is_some_and(|v| v == "1"))
+}
+
 fn counted_in_threads(parts: &Parts) -> bool {
     let crate::native::StageIo::Cs(cs) = &parts.native.io else {
         return false;
@@ -11602,6 +11648,8 @@ impl<'a> Lower<'a> {
                 let x = addr_packed(self, coord_base, k)?;
                 *slot = to_float(self, x);
             }
+            // The face coordinates and face, for a gather at a level of a cube.
+            let face_coords = [cs[0], cs[1], cs[2]];
             if kind == 5 {
                 let dir = self.cube_direction(cs[0], cs[1], cs[2]);
                 cs[..3].copy_from_slice(&dir);
@@ -11626,6 +11674,18 @@ impl<'a> Lower<'a> {
                     return Err("an image result");
                 };
                 let f32t = self.s.t.f32;
+                // LOCAL (`VICTORY_LOD_ARRAY=1`): of an array, the level is
+                // asked with its spatial coordinates alone. The validator
+                // wants the slice undefined ("out of bound coord must be
+                // undef"): with it the title's alpha-clipped materials
+                // (PS_DeferredTextured_AlphaClip and two more) were refused
+                // and their draws dropped.
+                let mut cs = cs.clone();
+                if lod_array() {
+                    for slot in cs.iter_mut().skip(spatial) {
+                        *slot = fu;
+                    }
+                }
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
                     let lod = self.s.op(
@@ -11870,10 +11930,70 @@ impl<'a> Lower<'a> {
                     if dmask.count_ones() != 1 {
                         return Err("a gather of several channels");
                     }
-                    if matches!(name, "image_gather4_l" | "image_gather4_l_o")
-                        && coords == 2
-                        && spatial == 2
-                    {
+                    let at_level = matches!(name, "image_gather4_l" | "image_gather4_l_o");
+                    // LOCAL (`VICTORY_GATHER_LEVELS=1`): a 2D array is read
+                    // as a 2D texture is, in the slice it names.
+                    let array = at_level && kind == 7 && coords == 3 && gather_levels();
+                    if at_level && kind == 5 && gather_levels() {
+                        // LOCAL (`VICTORY_GATHER_LEVELS=1`): a cube view
+                        // cannot be loaded from, so each of the four texels
+                        // is sampled at its centre, at the level. A sample
+                        // at a texel's centre at a whole level is that
+                        // texel, whatever the sampler's filter. Texels past
+                        // the face's edge are on the next face, as the
+                        // console's gather has them.
+                        // shortcut: the level is rounded to a whole one.
+                        let lod = addr_packed(self, coord_base, coords)?;
+                        let lod = to_float(self, lod);
+                        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+                        let zero = self.s.m.f32(0);
+                        let lod = self.binary(35, lod, zero); // maximum
+                        let lod = self.unary(26, lod); // round to nearest
+                        let mip = self.s.m.cast(c, Cast::FpToUi, lod, i32t);
+                        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                        let d = self
+                            .s
+                            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+                        let half = self.s.m.f32(0.5f32.to_bits());
+                        let one = self.s.m.f32(1.0f32.to_bits());
+                        // Face coordinates run from 1 to 2 across the face.
+                        let n = self.s.m.extract(c, d, 0);
+                        let n = self.s.m.cast(c, Cast::UiToFp, n, f32t);
+                        let (mut lo, mut hi) = ([fu; 2], [fu; 2]);
+                        for k in 0..2 {
+                            let t = self.s.m.bin(c, Bin::Sub, face_coords[k], one);
+                            let t = self.s.m.bin(c, Bin::Mul, t, n);
+                            let t = self.s.m.bin(c, Bin::Sub, t, half);
+                            let first = self.unary(27, t); // round down
+                            let next = self.s.m.bin(c, Bin::Add, first, one);
+                            for (slot, x) in [(&mut lo[k], first), (&mut hi[k], next)] {
+                                // The texel's centre in face coordinates.
+                                let x = self.s.m.bin(c, Bin::Add, x, half);
+                                // (`SDiv` of floats is their division.)
+                                let x = self.s.m.bin(c, Bin::SDiv, x, n);
+                                *slot = self.s.m.bin(c, Bin::Add, x, one);
+                            }
+                        }
+                        let ch = dmask.trailing_zeros();
+                        let mut g = [fu; 4];
+                        let mut read = None;
+                        let texels = [(lo[0], hi[1]), (hi[0], hi[1]), (hi[0], lo[1]), (lo[0], lo[1])];
+                        for (slot, (s, t)) in g.iter_mut().zip(texels) {
+                            let dir = self.cube_direction(s, t, face_coords[2]);
+                            let mut one_args = vec![h, sh];
+                            one_args.extend(dir);
+                            one_args.extend([fu, iu, iu, iu, lod]);
+                            let mut chosen = None;
+                            let r = call_sample(self, "sampleLevel.f32", 62, &one_args, &mut chosen);
+                            *slot = match chosen {
+                                Some(channels) => channels[ch as usize],
+                                None => self.s.m.extract(self.cur, r, ch),
+                            };
+                            read = Some(r);
+                        }
+                        gathered = Some(g);
+                        read.expect("four samples")
+                    } else if at_level && ((coords == 2 && spatial == 2) || array) {
                         // The host's gather has no level: it read level 0
                         // where the title names one (the depth pyramid its
                         // occlusion tests read: most of the world was
@@ -11922,6 +12042,19 @@ impl<'a> Lower<'a> {
                                 *slot = self.s.m.cast(c, Cast::FpToSi, x, i32t);
                             }
                         }
+                        // A 2D array's slice: the nearest whole one, within
+                        // the array (the dimensions' third is its slices).
+                        let slice = if array {
+                            let n = self.s.m.extract(c, d, 2);
+                            let n = self.s.m.cast(c, Cast::UiToFp, n, f32t);
+                            let last = self.s.m.bin(c, Bin::Sub, n, one);
+                            let x = self.unary(26, cs[2]); // round to nearest
+                            let x = self.binary(35, x, zero); // maximum
+                            let x = self.binary(36, x, last); // minimum
+                            self.s.m.cast(c, Cast::FpToSi, x, i32t)
+                        } else {
+                            iu
+                        };
                         let ch = dmask.trailing_zeros();
                         let mut g = [fu; 4];
                         let mut read = None;
@@ -11933,7 +12066,7 @@ impl<'a> Lower<'a> {
                                 Attr::ReadOnly,
                                 self.s.t.res_ret,
                                 66,
-                                &[h, mip, x, y, iu, iu, iu, iu],
+                                &[h, mip, x, y, slice, iu, iu, iu],
                             );
                             *slot = self.s.m.extract(c, r, ch);
                             read = Some(r);

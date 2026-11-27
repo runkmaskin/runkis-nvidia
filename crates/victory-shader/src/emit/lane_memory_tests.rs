@@ -243,30 +243,27 @@ fn a_typed_buffer_store_at_a_scalar_offset_is_not_written_without_it() {
     }
 }
 
-/// `image_gather4_l` reads the four texels at the level it names. On a cube
-/// (or an array) the host's gather would read level 0: refused, not run there.
-#[test]
-#[ignore = "known, not fixed: refusing the gather would drop its pipelines' draws (lower.rs, image_gather4_l)"]
-fn a_gather_at_a_named_level_of_a_cube_reads_that_level_or_is_refused() {
-    const SIZE: usize = 8;
-    const MIPS: u16 = 3;
+/// A compute program that gathers channel 0 at level `lod` with the four
+/// coordinates `at` from the SRV of dimension `dim` (3 cube, 5 2D array) at
+/// s[16:23] and stores the four texels to a raw UAV, lowered with
+/// `VICTORY_GATHER_LEVELS` as `levels`.
+fn gather_at_level(dim: u32, at: [f32; 4], levels: bool) -> Result<HostShader, ShaderError> {
     let mut words = vec![
         0xBE81_0380,
         0xBE83_0380, // s1, s3 = 0 (upper halves of the tables)
         0xF40C_0400,
-        0xFA00_0000, // cube SRV to s[16:23] from s[0:1]
+        0xFA00_0000, // SRV to s[16:23] from s[0:1]
         0xF408_0300,
         0xFA00_0020, // raw output UAV to s[12:15] from s[0:1]+32
         0xF408_0601,
         0xFA00_0000, // sampler to s[24:27] from s[2:3]
         0x7E1E_0280, // v15 = 0 for the output byte offset
     ];
-    // positive X face, center; level 1
-    for (reg, value) in [1.5f32, 1.5, 0.0, 1.0].iter().enumerate() {
+    for (reg, value) in at.iter().enumerate() {
         words.extend([0x7E00_02FF | ((reg as u32) << 17), value.to_bits()]);
     }
-    // image_gather4_l v[10:13], v[0:3], s[16:23], s[24:27] dmask:0x1 dim:CUBE
-    words.extend([0xF000_0118 | (0x44 << 18), 0x00C4_0A00]);
+    // image_gather4_l v[10:13], v[0:3], s[16:23], s[24:27] dmask:0x1 dim:`dim`
+    words.extend([0xF000_0100 | dim << 3 | (0x44 << 18), 0x00C4_0A00]);
     // buffer_store_dwordx4 v[10:13], v15, s[12:15], 0 offen
     words.extend([0xE078_1000, 0x8003_0A0F]);
     words.push(S_ENDPGM);
@@ -304,22 +301,18 @@ fn a_gather_at_a_named_level_of_a_cube_reads_that_level_or_is_refused() {
         }),
         code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
     };
-    let shader = match build_compute_shader(&native) {
-        Err(ShaderError::Unsupported { what, .. }) => {
-            assert_eq!(what, "a gather at a named level of a cube or an array");
-            return;
-        }
-        Err(e) => panic!("{e}"),
-        Ok((shader, _)) => shader,
-    };
-    // every texel of a level holds the level's number
-    let texels: Vec<_> = (0..6)
-        .flat_map(|_| {
-            (0..MIPS).flat_map(|mip| std::iter::repeat_n([f32::from(mip); 4], (SIZE >> mip).pow(2)))
-        })
-        .collect();
+    let was = lower::TEST_GATHER_LEVELS.replace(Some(levels));
+    let built = build_compute_shader(&native);
+    lower::TEST_GATHER_LEVELS.set(was);
+    built.map(|(shader, _)| shader)
+}
+
+/// The four texels `shader` gathered from `texture` with a linear sampler
+/// (a linear filter must not blend the texels of a gather); none without a
+/// device.
+fn gathered(shader: &HostShader, texture: View) -> Option<Vec<f32>> {
     let sampler = D3D12_SAMPLER_DESC {
-        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
         AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
         AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -330,21 +323,85 @@ fn a_gather_at_a_named_level_of_a_cube_reads_that_level_or_is_refused() {
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Ok(host) = Host::new(false) else {
         eprintln!("no SM 6.6 hardware device; not run");
-        return;
+        return None;
     };
-    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+    let (root, pso) = host.compute_pipeline(shader).unwrap();
     let out = host
         .dispatch(
             &root,
             &pso,
             &Dispatch {
                 roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords() as usize]))],
-                views: &[View::Cube(SIZE as u32, MIPS, &texels), View::RawUav(4)],
+                views: &[texture, View::RawUav(4)],
                 samplers: &[sampler],
                 groups: [1, 1, 1],
             },
         )
         .unwrap();
-    let got: Vec<f32> = out[0].iter().copied().map(f32::from_bits).collect();
-    assert_eq!(got, [1.0; 4], "the four texels of level 1");
+    Some(out[0].iter().copied().map(f32::from_bits).collect())
+}
+
+/// `image_gather4_l` reads the four texels at the level it names. On a cube
+/// the host's gather reads level 0; with `VICTORY_GATHER_LEVELS=1` the four
+/// texels of the named level, in the gather's order (u0,v1) (u1,v1) (u1,v0)
+/// (u0,v0).
+#[test]
+fn a_gather_at_a_named_level_of_a_cube_reads_that_level() {
+    const SIZE: usize = 8;
+    const MIPS: u16 = 3;
+    // A texel holds 1000 times its level, plus 10 times its row and its
+    // column, on every face.
+    let texels: Vec<_> = (0..6)
+        .flat_map(|_| {
+            (0..MIPS).flat_map(|mip| {
+                let n = SIZE >> mip;
+                (0..n * n).map(move |i| [f32::from(mip) * 1000.0 + (i / n * 10 + i % n) as f32; 4])
+            })
+        })
+        .collect();
+    // Positive X face, a little past its centre (texel 1.6 of 4 across, 1.6
+    // down); level 1.
+    let at = [1.4f32, 1.4, 0.0, 1.0];
+    let cube = View::Cube(SIZE as u32, MIPS, &texels);
+    let old = gather_at_level(3, at, false).expect("lower");
+    let Some(got) = gathered(&old, cube) else {
+        return;
+    };
+    // Without the switch: level 0 (texels 2 and 3 of 8), as before.
+    assert_eq!(got, [32.0, 33.0, 23.0, 22.0], "level 0 without VICTORY_GATHER_LEVELS");
+    let new = gather_at_level(3, at, true).expect("lower");
+    let got = gathered(&new, cube).expect("a device");
+    assert_eq!(got, [1021.0, 1022.0, 1012.0, 1011.0], "the four texels of level 1");
+}
+
+/// The same for a 2D array: the slice the third coordinate names (rounded),
+/// at the level.
+#[test]
+fn a_gather_at_a_named_level_of_an_array_reads_that_level_and_slice() {
+    const SIZE: usize = 8;
+    const MIPS: u16 = 3;
+    const SLICES: u16 = 3;
+    // A texel holds 10,000 times its slice, 1000 times its level, plus 10
+    // times its row and its column.
+    let texels: Vec<_> = (0..SLICES)
+        .flat_map(|slice| {
+            (0..MIPS).flat_map(move |mip| {
+                let n = SIZE >> mip;
+                (0..n * n).map(move |i| {
+                    [f32::from(slice) * 10_000.0 + f32::from(mip) * 1000.0 + (i / n * 10 + i % n) as f32; 4]
+                })
+            })
+        })
+        .collect();
+    // Texel 1.6 across and down of level 1's 4, slice 1.6 (2); level 1.
+    let at = [0.4f32, 0.4, 1.6, 1.0];
+    let array = View::Array(SIZE as u32, SIZE as u32, SLICES, MIPS, &texels);
+    let old = gather_at_level(5, at, false).expect("lower");
+    let Some(got) = gathered(&old, array) else {
+        return;
+    };
+    assert_eq!(got, [20_032.0, 20_033.0, 20_023.0, 20_022.0], "level 0 without VICTORY_GATHER_LEVELS");
+    let new = gather_at_level(5, at, true).expect("lower");
+    let got = gathered(&new, array).expect("a device");
+    assert_eq!(got, [21_021.0, 21_022.0, 21_012.0, 21_011.0], "slice 2, level 1");
 }

@@ -998,6 +998,9 @@ pub enum View<'a> {
     Texture(u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, mip count, texels in D3D subresource order).
     Cube(u32, u16, &'a [[f32; 4]]),
+    /// An RGBA32F 2D array SRV (width, height, slices, mip count, texels in
+    /// D3D subresource order).
+    Array(u32, u32, u16, u16, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
@@ -1174,10 +1177,11 @@ impl Host {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
-                    View::Texture(..) | View::Cube(..) => {
+                    View::Texture(..) | View::Cube(..) | View::Array(..) => {
                         let (w, h, mut texels, faces, mips) = match *v {
                             View::Texture(w, h, t) => (w, h, t, 1, 1),
                             View::Cube(n, mips, t) => (n, n, t, 6, mips),
+                            View::Array(w, h, slices, mips, t) => (w, h, t, u32::from(slices), mips),
                             _ => unreachable!(),
                         };
                         let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
@@ -1238,11 +1242,24 @@ impl Host {
                                 },
                             },
                         };
-                        dev.CreateShaderResourceView(
-                            &tex,
-                            (faces == 6).then_some(&cube as *const _),
-                            at,
-                        );
+                        let array = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                                    MipLevels: u32::from(mips),
+                                    ArraySize: faces,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        let desc = match *v {
+                            View::Cube(..) => Some(&cube as *const _),
+                            View::Array(..) => Some(&array as *const _),
+                            _ => None,
+                        };
+                        dev.CreateShaderResourceView(&tex, desc, at);
                         keep.push(tex);
                     }
                     View::RawUav(_) | View::HalfUav(_) | View::HalfUintUav(_) => {

@@ -2759,6 +2759,119 @@ mod barycentric_tests {
         validate(&shader);
     }
 
+    /// Two elements of one row, one read interpolated and one read flat:
+    /// the validator refuses a row of two modes. With `VICTORY_SIG_ROWS=1`
+    /// the flat one gets a row of its own and the program validates.
+    #[test]
+    fn a_row_of_two_interpolation_modes_is_split_into_two_rows() {
+        let [e0, e1] = exp_mrt0(3);
+        let words = [
+            0xC80E_0202, // v_interp_mov_f32 v3, p0, attr0.z (flat)
+            0xC810_0000, // v_interp_p1_f32 v4, v0, attr0.x
+            0xC811_0001, // v_interp_p2_f32 v4, v1, attr0.x
+            v_add_f32(3, 3, 4),
+            e0,
+            e1,
+            0xBF81_0000,
+        ];
+        let xy = container::SigElement { cols: 2, ..element("TEXCOORD", 0, 0) };
+        let zw = container::SigElement { col: 2, cols: 2, ..element("NORMAL", 0, 0) };
+        let translate = |on: bool| {
+            let was = lower::TEST_SIG_ROWS.replace(Some(on));
+            let shader = pixel_with_inputs(&words, PERSP_CENTER, &[xy.clone(), zw.clone()]);
+            lower::TEST_SIG_ROWS.set(was);
+            shader.unwrap()
+        };
+        #[cfg(windows)]
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let old = translate(false);
+            let refused = v.validate(&mut old.dxil.clone()).expect_err("two modes in one row");
+            assert!(refused.contains("interpolation mode"), "{refused}");
+        }
+        let shader = translate(true);
+        let (_, inputs) = parts(&shader);
+        let row = |name: &str| inputs.iter().find(|e| e.name == name).and_then(|e| e.row);
+        assert_eq!((row("TEXCOORD"), row("NORMAL")), (Some(0), Some(1)), "{inputs:?}");
+        validate(&shader);
+    }
+
+    /// `image_get_lod` of a 2D array: the validator refuses a level query
+    /// with the slice in it ("out of bound coord must be undef"). With
+    /// `VICTORY_LOD_ARRAY=1` the slice is left out and the program validates.
+    #[test]
+    fn a_level_query_of_an_array_leaves_its_slice_out() {
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+        let [e0, e1] = exp_mrt0(4);
+        let mut words = vec![
+            0xBE81_0380,
+            0xBE83_0380, // s1, s3 = 0
+            0xF40C_0400,
+            0xFA00_0000, // s_load_dwordx8 s[16:23], s[0:1], 0 (the array)
+            0xF408_0601,
+            0xFA00_0000, // s_load_dwordx4 s[24:27], s[2:3], 0 (the sampler)
+        ];
+        for (reg, value) in [0.25f32, 0.5, 1.0].iter().enumerate() {
+            words.extend([0x7E00_02FF | ((reg as u32) << 17), value.to_bits()]);
+        }
+        // image_get_lod v[4:5], v[0:2], s[16:23], s[24:27] dmask:0x3 dim:2D_ARRAY
+        words.extend([0xF180_0328, 0x00C4_0400, e0, e1, 0xBF81_0000]);
+        let table = |slot, user_data| RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let range = |kind, words, slot, user_data| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: words,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![table(0, 0), table(1, 2)],
+            used: vec![range(ResourceType::Srv, 8, 0, 0), range(ResourceType::Sampler, 4, 1, 2)],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: PERSP_CENTER,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut target = element("SV_Target", 16, 0);
+        target.usage = 15;
+        let isg1 = container::signature(&[], true);
+        let osg1 = container::signature(&[target], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let translate = |on: bool| {
+            let was = lower::TEST_LOD_ARRAY.replace(Some(on));
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let shader = emit(&c, &native, &p, &st, &io, &res);
+            lower::TEST_LOD_ARRAY.set(was);
+            shader.unwrap()
+        };
+        #[cfg(windows)]
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let old = translate(false);
+            let refused = v.validate(&mut old.dxil.clone()).expect_err("the slice in the level query");
+            assert!(refused.contains("out of bound coord"), "{refused}");
+        }
+        validate(&translate(true));
+    }
+
     /// A pixel program's first-lane loop (no table entry in it, so not a waterfall the tracker
     /// knows) asks for helper lanes, which is valid DXIL (upstream #946's program).
     #[test]

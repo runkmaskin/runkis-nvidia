@@ -613,6 +613,13 @@ impl Shader {
                 }
             }
         }
+        // LOCAL (`VICTORY_SIG_ROWS=1`): a row of two interpolation modes is
+        // refused by the validator; the elements of the second get a row of
+        // their own (`container::separate_modes`).
+        if super::lower::sig_rows() {
+            let interpolated = if self.pixel { &mut self.inputs } else { &mut self.outputs };
+            super::container::separate_modes(interpolated);
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a

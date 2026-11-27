@@ -106,6 +106,11 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            // LOCAL: gathers at a level of a cube or an array.
+            "VICTORY_GATHER_LEVELS",
+            // LOCAL: signature rows of one interpolation mode each.
+            "VICTORY_SIG_ROWS",
+            "VICTORY_LOD_ARRAY",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
