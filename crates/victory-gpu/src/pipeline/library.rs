@@ -416,6 +416,9 @@ struct Library {
     /// their old names again: before, they stayed in the file for good, and
     /// the file only grew (1.3 to 1.5 GB, mapped and read at every start).
     earlier: Option<Earlier>,
+    /// Pipelines made while a save held the library, with their names: in
+    /// the library after it ([`store_or_keep`]).
+    later: Mutex<Vec<(String, ID3D12PipelineState)>>,
 }
 
 /// A library of another translator and its blob (in that order: the
@@ -536,6 +539,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     added: AtomicU64::new(0),
                     saving: RwLock::new(()),
                     earlier: None,
+                    later: Mutex::default(),
                 });
             }
             Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
@@ -553,6 +557,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
         added: AtomicU64::new(0),
         saving: RwLock::new(()),
         earlier: None,
+        later: Mutex::default(),
     })
 }
 
@@ -599,12 +604,12 @@ fn pipeline_in(
             // the new one from now on.
             (Err(e), Some(earlier)) => match load(&earlier.library, PCWSTR(wide.as_ptr())) {
                 Ok(pso) => {
-                    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
-                    // SAFETY: a live pipeline, of a name the new library lacks.
-                    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-                        library.added.fetch_add(1, Ordering::Relaxed);
-                        CARRIED.fetch_add(1, Ordering::Relaxed);
-                    }
+                    // Kept in the new library, as a made pipeline is: never
+                    // waiting for a save in progress ([`store_or_keep`]).
+                    CARRIED.fetch_add(1, Ordering::Relaxed);
+                    store_or_keep(&library.saving, &library.later, (name.to_owned(), pso.clone()), |(name, pso)| {
+                        library.store(&name, &pso)
+                    });
                     Ok(pso)
                 }
                 Err(_) => Err(e),
@@ -640,14 +645,56 @@ fn pipeline_in(
         )
     });
     let _all = one_call();
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
-    let _call = call("store", name);
-    // SAFETY: a live pipeline; a name already stored (a description that
-    // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        library.added.fetch_add(1, Ordering::Relaxed);
-    }
+    // A save holds the library for seconds (1.3 GB written): the pipeline
+    // goes to its draws now and into the library after the save.
+    store_or_keep(&library.saving, &library.later, (name.to_owned(), pso.clone()), |(name, pso)| library.store(&name, &pso));
     Ok(pso)
+}
+
+impl Library {
+    /// Stores `pso` as `name`; under [`Library::saving`], shared.
+    fn store(&self, name: &str, pso: &ID3D12PipelineState) {
+        let wide = HSTRING::from(name);
+        let _call = call("store", name);
+        // SAFETY: a live pipeline; a name already stored (a description that
+        // differs) is refused, which leaves the library as it was.
+        if unsafe { self.library.StorePipeline(PCWSTR(wide.as_ptr()), pso) }.is_ok() {
+            self.added.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The pipelines kept while a save held the library, stored.
+    fn store_kept(&self) {
+        store_kept(&self.saving, &self.later, |(name, pso)| self.store(&name, &pso));
+    }
+}
+
+/// `store`s `item` unless a save holds `saving`, and with it what was kept
+/// in `later` meanwhile; else keeps it there, for the next store or
+/// [`store_kept`]. A pipeline made during a save waited for the whole save
+/// to go to its draws (seconds, with a cold cache's hundreds being made);
+/// none is lost, and none is stored twice. Returns whether it was stored.
+fn store_or_keep<T>(saving: &RwLock<()>, later: &Mutex<Vec<T>>, item: T, mut store: impl FnMut(T)) -> bool {
+    let _stores = match saving.try_read() {
+        Ok(stores) => stores,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            later.lock().unwrap_or_else(|e| e.into_inner()).push(item);
+            return false;
+        }
+    };
+    store(item);
+    let kept = std::mem::take(&mut *later.lock().unwrap_or_else(|e| e.into_inner()));
+    kept.into_iter().for_each(store);
+    true
+}
+
+/// What [`store_or_keep`] kept in `later`, stored (after a save that holds
+/// `saving` now).
+fn store_kept<T>(saving: &RwLock<()>, later: &Mutex<Vec<T>>, store: impl FnMut(T)) {
+    let _stores = saving.read().unwrap_or_else(|e| e.into_inner());
+    let kept = std::mem::take(&mut *later.lock().unwrap_or_else(|e| e.into_inner()));
+    kept.into_iter().for_each(store);
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -679,7 +726,11 @@ fn save_in(dir: &std::path::Path, library: &Library) {
     // of the library again: run 60's second save).
     let bytes = {
         let _all = one_call();
-        // No store between asking the size and writing; loads go on.
+        // Those made during the last save go into this one; those made
+        // during this one are stored when it is done.
+        library.store_kept();
+        // No store between asking the size and writing; loads go on, and
+        // stores wait beside it ([`store_or_keep`]).
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
         if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
@@ -701,6 +752,10 @@ fn save_in(dir: &std::path::Path, library: &Library) {
             size
         }
     };
+    {
+        let _all = one_call();
+        library.store_kept();
+    }
     // Through `used`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
     let used: Vec<String> = used().iter().flatten().cloned().collect();
@@ -1073,6 +1128,95 @@ mod tests {
             pattern(page * 4096, &mut expected);
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
+    }
+
+    /// Stores made while saves hold the library, from several threads: each
+    /// pipeline is stored once, none lost, none before a save that held the
+    /// library when it was made has let go of it.
+    #[test]
+    fn stores_during_a_save_are_kept_and_none_lost() {
+        let saving = RwLock::new(());
+        let later = Mutex::new(Vec::new());
+        let stored = Mutex::new(Vec::new());
+        let saves = AtomicU64::new(0);
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !done.load(Ordering::Relaxed) {
+                    let _alone = saving.write().unwrap();
+                    saves.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_micros(300));
+                    drop(_alone);
+                    store_kept(&saving, &later, |i: u32| stored.lock().unwrap().push(i));
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+            });
+            let makers: Vec<_> = (0..4u32)
+                .map(|t| {
+                    let (saving, later, stored) = (&saving, &later, &stored);
+                    s.spawn(move || {
+                        let mut kept = 0;
+                        for i in 0..5000 {
+                            let store = |i: u32| {
+                                // Never under a save.
+                                assert!(saving.try_write().is_err(), "stored with no store's share of the lock");
+                                stored.lock().unwrap().push(i);
+                            };
+                            kept += u32::from(!store_or_keep(saving, later, t * 10_000 + i, store));
+                        }
+                        kept
+                    })
+                })
+                .collect();
+            let kept: u32 = makers.into_iter().map(|m| m.join().unwrap()).sum();
+            done.store(true, Ordering::Relaxed);
+            assert!(kept > 0, "no store came during a save: nothing shown");
+        });
+        // The last save (`save(true)` at the end) stores what is left.
+        store_kept(&saving, &later, |i: u32| stored.lock().unwrap().push(i));
+        let mut stored = stored.into_inner().unwrap();
+        stored.sort_unstable();
+        let all: Vec<u32> = (0..4u32).flat_map(|t| (0..5000).map(move |i| t * 10_000 + i)).collect();
+        assert_eq!(stored, all);
+        assert!(saves.load(Ordering::Relaxed) > 0);
+    }
+
+    /// Before and after: how long a pipeline made during a save waits to
+    /// go to its draws. A save of the 1.3-1.5 GB library held the lock for
+    /// seconds; here it holds it 400 ms.
+    #[test]
+    fn a_pipeline_made_during_a_save_is_not_held_back() {
+        const SAVE: std::time::Duration = std::time::Duration::from_millis(400);
+        let saving = RwLock::new(());
+        let later = Mutex::new(Vec::new());
+        let waited = |keep: bool| {
+            let held = std::sync::Barrier::new(2);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let _alone = saving.write().unwrap();
+                    held.wait();
+                    std::thread::sleep(SAVE);
+                });
+                held.wait();
+                let began = std::time::Instant::now();
+                if keep {
+                    store_or_keep(&saving, &later, 1u32, |_| {});
+                } else {
+                    // As before: the store's share of the lock, waited for.
+                    let _stores = saving.read().unwrap();
+                }
+                began.elapsed()
+            })
+        };
+        let (before, after) = (waited(false), waited(true));
+        store_kept(&saving, &later, |_| {});
+        eprintln!(
+            "pipeline library, a pipeline made during a {} ms save: before {:.1} ms, after {:.3} ms to its draws",
+            SAVE.as_millis(),
+            before.as_secs_f64() * 1e3,
+            after.as_secs_f64() * 1e3
+        );
+        assert!(before >= SAVE / 2 && after < SAVE / 4);
     }
 
     #[test]

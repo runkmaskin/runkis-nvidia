@@ -583,7 +583,7 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = make::shared(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
     known::note(host.key(), &shaders, host.graphics.as_deref());
     #[cfg(windows)]

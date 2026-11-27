@@ -1029,8 +1029,15 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     skip.sort_unstable();
     let mut out = Vec::new();
+    outside_sorted(from, to, &skip, &mut out);
+    out
+}
+
+/// [`outside`] of ranges sorted already, onto `out`. Ranges that end by
+/// `from` or begin at `to` or later may be among them: they change nothing.
+fn outside_sorted(from: usize, to: usize, skip: &[(usize, usize)], out: &mut Vec<(usize, usize)>) {
     let mut at = from;
-    for (a, b) in skip {
+    for &(a, b) in skip {
         if b <= at {
             continue;
         }
@@ -1045,7 +1052,60 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
     if at < to {
         out.push((at, to));
     }
-    out
+}
+
+/// [`outside`] of many pieces with the same ranges left out
+/// ([`Shadow::land_card`]), in memory used again. Each piece filtered all
+/// of them and sorted what it kept, in three allocations. For more than
+/// [`Outside::SORTED`] pieces the ranges are sorted once, and for each
+/// piece only those from the first that reaches into it gone through.
+struct Outside {
+    skip: Vec<(usize, usize)>,
+    /// Sorted: the furthest end of the ranges up to each (by start); from
+    /// the first that reaches past a piece's start on, the piece's ranges
+    /// are there. Empty: not sorted.
+    reach: Vec<usize>,
+    /// Not sorted: the ranges of a piece.
+    near: Vec<(usize, usize)>,
+}
+
+impl Outside {
+    /// Pieces up to which the ranges are not sorted: for a few, filtering
+    /// all and sorting those of the piece is less work than sorting all.
+    const SORTED: usize = 16;
+
+    fn new(mut skip: Vec<(usize, usize)>, pieces: usize) -> Outside {
+        let mut reach = Vec::new();
+        if pieces > Outside::SORTED {
+            skip.sort_unstable();
+            reach = skip
+                .iter()
+                .scan(0, |far, &(_, b)| {
+                    *far = b.max(*far);
+                    Some(*far)
+                })
+                .collect();
+        }
+        Outside { skip, reach, near: Vec::new() }
+    }
+
+    /// The parts of `[lo, hi)` outside the ranges, as offsets from `lo`, in
+    /// `out` (cleared first).
+    fn of(&mut self, lo: usize, hi: usize, out: &mut Vec<(usize, usize)>) {
+        out.clear();
+        if self.reach.is_empty() {
+            self.near.clear();
+            self.near.extend(self.skip.iter().copied().filter(|&(a, b)| a < hi && b > lo));
+            self.near.sort_unstable();
+            outside_sorted(lo, hi, &self.near, out);
+        } else {
+            let first = self.reach.partition_point(|&far| far <= lo);
+            outside_sorted(lo, hi, &self.skip[first..], out);
+        }
+        for part in out.iter_mut() {
+            *part = (part.0 - lo, part.1 - lo);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1115,6 +1175,103 @@ mod relay_tests {
         assert_eq!(outside(10, 50, vec![(0, 10), (50, 60)]), vec![(10, 50)]);
         assert_eq!(outside(10, 50, vec![(30, 35), (0, 12), (34, 40), (48, 99)]), vec![(12, 30), (40, 48)]);
         assert_eq!(outside(10, 50, vec![(0, 99)]), vec![]);
+    }
+
+    fn random(seed: &mut u64) -> usize {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        (*seed >> 8) as usize
+    }
+
+    /// The ranges `Shadow::land_card` leaves out of `[from, to)`: the title's
+    /// writes (dirty, short) and sends noted (longer), overlapping, some
+    /// empty, some reaching out of it.
+    fn skips(seed: &mut u64, from: usize, to: usize, n: usize) -> Vec<(usize, usize)> {
+        (0..n)
+            .map(|i| {
+                let a = from.saturating_sub(4096) + random(seed) % (to - from + 8192);
+                let len = if i % 5 == 0 { random(seed) % 70_000 } else { random(seed) % 300 / 4 * 4 };
+                (a, a + len)
+            })
+            .collect()
+    }
+
+    /// The parts of each piece as `land_card` cut them before: the ranges
+    /// near the piece filtered out of all, sorted, cut out, made offsets.
+    fn parts_as_before(skip: &[(usize, usize)], lo: usize, hi: usize) -> Vec<(usize, usize)> {
+        let near: Vec<(usize, usize)> = skip.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
+        outside(lo, hi, near).into_iter().map(|(a, b)| (a - lo, b - lo)).collect()
+    }
+
+    /// Pieces of 64 KiB blocks, whole or in parts, in any order.
+    fn pieces(seed: &mut u64, blocks: usize, n: usize) -> Vec<(usize, usize)> {
+        (0..n)
+            .map(|_| {
+                let block = random(seed) % blocks * super::PIECE;
+                let lo = block + random(seed) % super::PIECE / 4 * 4;
+                let hi = if random(seed).is_multiple_of(3) { block + super::PIECE } else { (lo + 4 + random(seed) % 4000).min(block + super::PIECE) };
+                (lo, hi)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pieces_are_cut_as_one_by_one() {
+        let mut seed = 0x0c75_1de5u64;
+        let mut parts = Vec::new();
+        for round in 0..400 {
+            let blocks = 1 + random(&mut seed) % 40;
+            let (n, ranges) = (1 + random(&mut seed) % 60, random(&mut seed) % 400);
+            let pieces = pieces(&mut seed, blocks, n);
+            let skip = skips(&mut seed, 0, blocks * super::PIECE, ranges);
+            // Sorted or not, as many pieces or few have them.
+            for many in [0, usize::MAX] {
+                let mut cut = super::Outside::new(skip.clone(), many);
+                for &(lo, hi) in &pieces {
+                    cut.of(lo, hi, &mut parts);
+                    assert_eq!(parts, parts_as_before(&skip, lo, hi), "round {round} piece {lo:#x}..{hi:#x}");
+                }
+            }
+        }
+    }
+
+    /// Before and after, in release (`cargo test --release`): a landing's
+    /// pieces cut, for a job of about 256 KiB (`land::JOB`) as whole blocks
+    /// (4 pieces) or as smaller pieces (24, 256), with 200 or 2,000 ranges left
+    /// out (the title's writes of the copy not gone up yet, and sends after
+    /// the fetch).
+    #[test]
+    fn pieces_are_cut_faster_than_one_by_one() {
+        let mut seed = 0xcafe_f00du64;
+        for (n, ranges) in [(4, 200), (4, 2000), (24, 2000), (256, 200), (256, 2000)] {
+            let pieces = pieces(&mut seed, 4, n);
+            let skip = skips(&mut seed, 0, 4 * super::PIECE, ranges);
+            let rounds = 400;
+            let began = std::time::Instant::now();
+            let mut a = 0;
+            for _ in 0..rounds {
+                // (Each a call's ranges, as after.)
+                let skip = std::hint::black_box(skip.clone());
+                for &(lo, hi) in &pieces {
+                    a += std::hint::black_box(parts_as_before(&skip, lo, hi)).len();
+                }
+            }
+            let before = began.elapsed().as_secs_f64() * 1e6 / f64::from(rounds);
+            let began = std::time::Instant::now();
+            let mut b = 0;
+            for _ in 0..rounds {
+                let mut cut = super::Outside::new(skip.clone(), pieces.len());
+                let mut parts = Vec::new();
+                for &(lo, hi) in &pieces {
+                    cut.of(lo, hi, &mut parts);
+                    b += std::hint::black_box(&parts).len();
+                }
+            }
+            let after = began.elapsed().as_secs_f64() * 1e6 / f64::from(rounds);
+            assert_eq!(a, b);
+            eprintln!("landing, {n} pieces with {ranges} ranges left out: before {before:.1} us, after {after:.1} us a call");
+        }
     }
 
     /// A model of a copy in the PC's memory under the relay: the card
@@ -1265,7 +1422,8 @@ mod relay_tests {
     }
 }
 
-/// Snapshot memory kept for reuse (already touched, so no page faults).
+/// Snapshot memory kept for reuse (already touched, so no page faults);
+/// the largest first ([`give_back`] keeps them so).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one
@@ -1274,19 +1432,18 @@ static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// reserved (1.4 GB in run 24).
 fn pooled(n: usize) -> Vec<u8> {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let most = n.saturating_mul(4).max(1 << 20);
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
+    let mut v = pool_take(&mut pool, n).unwrap_or_else(|| Vec::with_capacity(n));
     v.clear();
     v
+}
+
+/// The smallest buffer of `pool` (the largest first) with room for `n`
+/// bytes, if it is not more than four times that (or 1 MiB), taken out.
+fn pool_take(pool: &mut Vec<Vec<u8>>, n: usize) -> Option<Vec<u8>> {
+    let most = n.saturating_mul(4).max(1 << 20);
+    // The last of those with room: the order stays as it was.
+    let fit = pool.partition_point(|v| v.capacity() >= n).checked_sub(1)?;
+    (pool[fit].capacity() <= most).then(|| pool.remove(fit))
 }
 
 /// How many snapshot buffers are kept (`VICTORY_SNAPSHOT_POOL`; `8`: as
@@ -1309,20 +1466,137 @@ fn snapshots_kept() -> usize {
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    let gone = pool_put(&mut pool, v, snapshots_kept(), KEPT);
+    // (Given back to the kernel without the lock: milliseconds.)
+    drop(pool);
+    drop(gone);
+}
+
+/// [`give_back`] of `v` into `pool` (the largest first, kept so): put in
+/// its place, after those as large, where a sort of the pool with it last
+/// put it (up to 1,024 buffers were sorted at every return, under the
+/// lock). Returns what is not kept: past the first `most`, past `bytes`.
+fn pool_put(pool: &mut Vec<Vec<u8>>, v: Vec<u8>, most: usize, bytes: usize) -> Vec<Vec<u8>> {
+    let at = pool.partition_point(|p| p.capacity() >= v.capacity());
+    pool.insert(at, v);
     let (mut kept, mut total) = (0, 0usize);
-    for v in pool.iter().take(snapshots_kept()) {
+    for v in pool.iter().take(most) {
         total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
+        if kept > 0 && total > bytes {
             break;
         }
         kept += 1;
     }
-    // (Given back to the kernel without the lock: milliseconds.)
-    let gone = pool.split_off(kept);
-    drop(pool);
-    drop(gone);
+    pool.split_off(kept)
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::{pool_put, pool_take};
+
+    /// The pool as it was: searched whole, taken out of by a swap, sorted
+    /// whole at every return.
+    fn take_as_before(pool: &mut Vec<Vec<u8>>, n: usize) -> Option<Vec<u8>> {
+        let most = n.saturating_mul(4).max(1 << 20);
+        let fit = pool
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
+            .min_by_key(|(_, v)| v.capacity())
+            .map(|(i, _)| i)?;
+        Some(pool.swap_remove(fit))
+    }
+
+    fn put_as_before(pool: &mut Vec<Vec<u8>>, v: Vec<u8>, most: usize, bytes: usize) -> Vec<Vec<u8>> {
+        pool.push(v);
+        pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+        let (mut kept, mut total) = (0, 0usize);
+        for v in pool.iter().take(most) {
+            total = total.saturating_add(v.capacity());
+            if kept > 0 && total > bytes {
+                break;
+            }
+            kept += 1;
+        }
+        pool.split_off(kept)
+    }
+
+    fn random(seed: &mut u64) -> usize {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        (*seed >> 8) as usize
+    }
+
+    fn sizes(pool: &[Vec<u8>]) -> Vec<usize> {
+        let mut sizes: Vec<usize> = pool.iter().map(Vec::capacity).collect();
+        sizes.sort_unstable();
+        sizes
+    }
+
+    /// The same buffers (by size) taken, kept and let go, whatever is asked
+    /// and given back.
+    #[test]
+    fn the_pool_keeps_and_gives_what_it_did() {
+        let mut seed = 0x9001u64;
+        for (most, bytes) in [(8, usize::MAX), (1024, 512 << 10), (16, 3 << 20), (1024, usize::MAX)] {
+            let (mut old, mut new) = (Vec::new(), Vec::new());
+            let mut out: Vec<usize> = Vec::new();
+            for step in 0..6000 {
+                // Sizes of a few kinds, often the same.
+                let n = match random(&mut seed) % 4 {
+                    0 => 4096 * (1 + random(&mut seed) % 8),
+                    1 => 1 + random(&mut seed) % 300_000,
+                    2 => 1 << (10 + random(&mut seed) % 12),
+                    _ => 2_000_000 + random(&mut seed) % 3,
+                };
+                if random(&mut seed).is_multiple_of(2) {
+                    let (a, b) = (take_as_before(&mut old, n), pool_take(&mut new, n));
+                    assert_eq!(a.as_ref().map(Vec::capacity), b.as_ref().map(Vec::capacity), "step {step}");
+                    out.extend(a.map(|v| v.capacity()));
+                } else {
+                    let size = out.pop().unwrap_or(n);
+                    let (a, b) = (
+                        put_as_before(&mut old, Vec::with_capacity(size), most, bytes),
+                        pool_put(&mut new, Vec::with_capacity(size), most, bytes),
+                    );
+                    assert_eq!(sizes(&a), sizes(&b), "step {step}");
+                }
+                assert_eq!(sizes(&old), sizes(&new), "step {step}");
+                assert!(new.windows(2).all(|w| w[0].capacity() >= w[1].capacity()));
+            }
+        }
+    }
+
+    /// Before and after, in release (`cargo test --release`): a return and a
+    /// take with the pool full (`VICTORY_SNAPSHOT_POOL`, 1,024 buffers).
+    #[test]
+    fn the_pool_returns_faster_than_sorted() {
+        let run = |before: bool| {
+            let mut seed = 0x7007u64;
+            let mut pool: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..1024 {
+                let v = Vec::with_capacity(1 + random(&mut seed) % 65_536);
+                if before {
+                    put_as_before(&mut pool, v, 1024, usize::MAX);
+                } else {
+                    pool_put(&mut pool, v, 1024, usize::MAX);
+                }
+            }
+            let rounds = 20_000;
+            let began = std::time::Instant::now();
+            for _ in 0..rounds {
+                let n = 1 + random(&mut seed) % 65_536;
+                let v = if before { take_as_before(&mut pool, n) } else { pool_take(&mut pool, n) };
+                let v = v.unwrap_or_else(|| Vec::with_capacity(n));
+                let gone = if before { put_as_before(&mut pool, v, 1024, usize::MAX) } else { pool_put(&mut pool, v, 1024, usize::MAX) };
+                std::hint::black_box(gone);
+            }
+            began.elapsed().as_secs_f64() * 1e9 / f64::from(rounds)
+        };
+        let (before, after) = (run(true), run(false));
+        eprintln!("snapshot pool of 1,024 buffers, a take and a return: before {before:.0} ns, after {after:.0} ns");
+    }
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -4875,20 +5149,21 @@ impl Shadow {
         let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
         crate::land::spent(crate::land::stat::LOCK, waiting);
         let (from, to) = pieces.iter().fold((usize::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.1)));
-        let skip: Vec<(usize, usize)> = {
+        let skip = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
             let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < to && b > from).collect();
             sent.near(fetched_after, from, to, &mut skip);
             skip
         };
+        let mut skip = Outside::new(skip, pieces.len());
         let mut put = 0;
+        let mut parts = Vec::new();
         for &(lo, hi, now) in pieces {
             if lo >= hi || hi > self.len as usize {
                 continue;
             }
-            let near: Vec<(usize, usize)> = skip.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
-            let parts: Vec<(usize, usize)> = outside(lo, hi, near).into_iter().map(|(a, b)| (a - lo, b - lo)).collect();
+            skip.of(lo, hi, &mut parts);
             // SAFETY: inside the mapping (checked above), in a range
             // declared and not done with, which no refresh writes; the
             // title's bytes are kept out by the lock; the caller's.

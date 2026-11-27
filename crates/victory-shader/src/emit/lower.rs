@@ -441,6 +441,21 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 pub(super) const LANE_MASK: Why = "a lane mask read as data";
+
+/// The inline float constants 240-248 (0.5, -0.5, 1, -1, 2, -2, 4, -4,
+/// 1/(2π)) as a 64-bit scalar operand reads them: the double's bits. The last
+/// is the hardware's 1/(2π) (LLVM's `isInlinableLiteral64`).
+const SALU_INLINE_F64: [u64; 9] = [
+    0x3FE0_0000_0000_0000,
+    0xBFE0_0000_0000_0000,
+    0x3FF0_0000_0000_0000,
+    0xBFF0_0000_0000_0000,
+    0x4000_0000_0000_0000,
+    0xC000_0000_0000_0000,
+    0x4010_0000_0000_0000,
+    0xC010_0000_0000_0000,
+    0x3FC4_5F30_6DC9_C882,
+];
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
 /// run that block are not all of the wave.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
@@ -3640,9 +3655,47 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
+        let mut f = self.fsrc_plain(inst, k)?;
+        if v.abs >> k & 1 != 0 {
+            f = self.unary(6, f);
+        }
+        if v.neg >> k & 1 != 0 {
+            let z = self.s.m.f32(0x8000_0000);
+            f = self.s.m.bin(self.cur, Bin::Sub, z, f);
+        }
+        Ok(f)
+    }
+
+    /// A float source as its bits, abs and neg applied to the sign bit
+    /// alone, as the hardware's input modifiers are: no host arithmetic
+    /// flushes a denormal or quiets a signalling NaN on the way (for the
+    /// class compares, which test exactly those).
+    fn fsrc_bits(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let f = self.fsrc_plain(inst, k)?;
+        let mut x = self.as_int(f);
+        let c = self.cur;
+        if v.abs >> k & 1 != 0 {
+            let m = self.s.m.i32(0x7FFF_FFFF);
+            x = self.s.m.bin(c, Bin::And, x, m);
+        }
+        if v.neg >> k & 1 != 0 {
+            let m = self.s.m.i32(0x8000_0000);
+            x = self.s.m.bin(c, Bin::Xor, x, m);
+        }
+        Ok(x)
+    }
+
+    /// A float source without its abs/neg modifiers.
+    fn fsrc_plain(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let selected = Self::sdwa_src(inst, k);
-        let mut f = match op {
+        let f = match op {
             _ if selected.is_some() => {
                 let (sel, sext) = selected.expect("checked");
                 let x = self.operand(inst, &op)?;
@@ -3675,13 +3728,6 @@ impl<'a> Lower<'a> {
                 self.as_float(x)
             }
         };
-        if v.abs >> k & 1 != 0 {
-            f = self.unary(6, f);
-        }
-        if v.neg >> k & 1 != 0 {
-            let z = self.s.m.f32(0x8000_0000);
-            f = self.s.m.bin(self.cur, Bin::Sub, z, f);
-        }
         Ok(f)
     }
 
@@ -5567,6 +5613,12 @@ impl<'a> Lower<'a> {
                 Some(&Operand::Scalar { code, .. }) if code != NULL => {
                     let v = inst.read(Reg::S(code + h)).ok_or("an unread operand")?;
                     l.i32_of(v)
+                }
+                // A float inline constant is the double in a 64-bit operand
+                // (1.0 is 0x3FF0_0000_0000_0000, not 0x3F80_0000 below a sign).
+                Some(&Operand::Const(k @ 240..=248)) => {
+                    let bits = SALU_INLINE_F64[usize::from(k - 240)];
+                    Ok(l.s.m.i32((bits >> (32 * u32::from(h))) as u32))
                 }
                 Some(op) if h == 0 => l.operand(inst, op),
                 Some(Operand::Const(k)) => {
@@ -7886,7 +7938,7 @@ impl<'a> Lower<'a> {
         }
         let mut guard = self.guard(b, i)?;
         if let Some(d) = v.dpp {
-            let (x, enable) = self.dpp(inst, d)?;
+            let (x, enable) = self.dpp(inst, d, guard)?;
             guard = match (guard, enable) {
                 (Some(g), Some(e)) => Some(self.s.m.bin(self.cur, Bin::And, g, e)),
                 (g, e) => g.or(e),
@@ -7899,8 +7951,8 @@ impl<'a> Lower<'a> {
     }
 
     /// DPP: src0 as read from another lane, and which lanes write their
-    /// result (none: all).
-    fn dpp(&mut self, inst: &Inst, dpp: Dpp) -> Result<(V, Option<V>), Why> {
+    /// result (none: all). `guard`: the lanes of EXEC here.
+    fn dpp(&mut self, inst: &Inst, dpp: Dpp, guard: Option<V>) -> Result<(V, Option<V>), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -7989,6 +8041,34 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
+        // FI clear: a source lane outside EXEC is out of range too (RDNA2
+        // ISA, DPP: BOUND_CTRL then gives 0, else the lane keeps its
+        // destination), as `v_permlane16` has it below. EXEC: the guard and
+        // the host lanes at this instruction; nothing to ask where every
+        // lane is here. Not in pixel programs: the host's ballot leaves out
+        // the helper lanes the console's whole-quad mode has in EXEC.
+        let (mut src, mut inside) = (src, inside);
+        let everyone = guard.is_none() && all_lane_blocks(self.x.st).is_some_and(|all| all[self.cur_ir]);
+        if matches!(dpp, Dpp::Row { fi: false, .. }) && !self.s.pixel && !mesh_quad && !everyone {
+            let enabled = guard.unwrap_or_else(|| self.s.m.bool(true));
+            let i32t = self.s.t.i32;
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[enabled]);
+            let (lo, hi) = (self.s.m.extract(c, ballot, 0), self.s.m.extract(c, ballot, 1));
+            let (k31, k32, one, z) = (k(self, 31), k(self, 32), k(self, 1), k(self, 0));
+            let lower = self.s.m.cmp(c, pred::IULT, src, k32);
+            let word = self.s.m.select(c, lower, lo, hi);
+            let bit = self.s.m.bin(c, Bin::And, src, k31);
+            let bit = self.s.m.bin(c, Bin::LShr, word, bit);
+            let bit = self.s.m.bin(c, Bin::And, bit, one);
+            let active = self.s.m.cmp(c, pred::NE, bit, z);
+            // (an inactive host lane is never read)
+            src = self.s.m.select(c, active, src, lane);
+            inside = Some(match inside {
+                Some(i) => self.s.m.bin(c, Bin::And, i, active),
+                None => active,
+            });
+        }
         let mut r = if mesh_quad {
             self.quad_pick(x, src)
         } else if let Dpp::Row { ctrl, .. } = dpp
@@ -8008,9 +8088,13 @@ impl<'a> Lower<'a> {
             }
         }
         if let Some((rows, banks)) = masks {
-            // Row (16 lanes) and bank (4 lanes of a row) write masks.
+            // Row (16 lanes) and bank (4 lanes of a row) write masks. The
+            // rows are the console wave's: one of 64 in two host waves of
+            // 32 has rows 2 and 3 in the upper one, whose host lanes count
+            // from 0 again (they took the row mask's bits 0 and 1).
             let (four, two, three) = (k(self, 4), k(self, 2), k(self, 3));
-            let ri = self.s.m.bin(c, Bin::LShr, lane, four);
+            let console = if self.halves.is_some() { self.console_thread() } else { lane };
+            let ri = self.s.m.bin(c, Bin::LShr, console, four);
             let ri = self.s.m.bin(c, Bin::And, ri, three);
             let bi = self.s.m.bin(c, Bin::LShr, lane, two);
             let bi = self.s.m.bin(c, Bin::And, bi, three);
@@ -8311,19 +8395,23 @@ impl<'a> Lower<'a> {
             }
             "v_div_scale_f32" => {
                 // RDNA2 ISA: src0 = value to scale, src1 = denominator, src2 = numerator.
+                // The ISA's cases, first match wins: a zero operand gives NaN; a quotient
+                // near the largest float (exponent(num) - exponent(den) >= 96) sets VCC
+                // and scales only the denominator up; a denormal denominator scales up;
+                // a denormal reciprocal of the denominator with a denormal quotient sets
+                // VCC and scales only the denominator, down (above 2^126 it cannot go up,
+                // and down is what v_div_fmas_f32 undoes for a small quotient); a
+                // denormal reciprocal alone scales down; a denormal quotient sets VCC and scales only the numerator
+                // up; a numerator of exponent 23 or less scales up. Scales are 2^64 and
+                // 2^-64; where no VCC is set, both calls (on the numerator and on the
+                // denominator) scale alike, so their quotient stays. v_div_fmas_f32 undoes
+                // a scale VCC marks.
                 let (a, den, num) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
                 let (ai, ni, di) = (self.as_int(a), self.as_int(num), self.as_int(den));
-                let (k23, k255, kabs) = (
-                    self.s.m.i32(23),
-                    self.s.m.i32(0xFF),
-                    self.s.m.i32(0x7FFF_FFFF),
-                );
-                let (zero, k23_exp, k232_exp, k96) = (
-                    self.s.m.i32(0),
-                    self.s.m.i32(23),
-                    self.s.m.i32(232),
-                    self.s.m.i32(96),
-                );
+                let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+                let (k23, k255, kabs, kman) =
+                    (k(self, 23), k(self, 0xFF), k(self, 0x7FFF_FFFF), k(self, 0x7F_FFFF));
+                let (zero, k96, km126) = (k(self, 0), k(self, 96), k(self, (-126i32) as u32));
                 let exp_of = |l: &mut Self, x: V| {
                     let s = l.s.m.bin(c, Bin::LShr, x, k23);
                     l.s.m.bin(c, Bin::And, s, k255)
@@ -8334,46 +8422,74 @@ impl<'a> Lower<'a> {
                 let z1 = self.s.m.cmp(c, pred::EQ, n_abs, zero);
                 let z2 = self.s.m.cmp(c, pred::EQ, d_abs, zero);
                 let any_zero = self.s.m.bin(c, Bin::Or, z1, z2);
-                let special = {
-                    let s1 = self.s.m.cmp(c, pred::EQ, e1, k255);
-                    let s2 = self.s.m.cmp(c, pred::EQ, e2, k255);
-                    let a12 = self.s.m.bin(c, Bin::Or, s1, s2);
-                    self.s.m.bin(c, Bin::Or, a12, any_zero)
+                let diff = self.s.m.bin(c, Bin::Sub, e1, e2);
+                let near_max = self.s.m.cmp(c, pred::SGE, diff, k96);
+                let den_denorm = self.s.m.cmp(c, pred::EQ, e2, zero);
+                // 1/den below the smallest normal: |den| above 2^126, finite.
+                let (k126, kinf) = (k(self, 0x7E80_0000), k(self, 0x7F80_0000));
+                let rcp_big = self.s.m.cmp(c, pred::IUGT, d_abs, k126);
+                let rcp_fin = self.s.m.cmp(c, pred::IULT, d_abs, kinf);
+                let rcp_denorm = self.s.m.bin(c, Bin::And, rcp_big, rcp_fin);
+                // num/den below the smallest normal, both finite: by the exponents, and
+                // at a gap of exactly 126 by the mantissas (the smaller mantissa above
+                // gives a quotient below 2^-126). shortcut: a denormal numerator counts
+                // as exponent 0 here.
+                let below = self.s.m.cmp(c, pred::SLT, diff, km126);
+                let at = self.s.m.cmp(c, pred::EQ, diff, km126);
+                let (m1, m2) = (
+                    self.s.m.bin(c, Bin::And, ni, kman),
+                    self.s.m.bin(c, Bin::And, di, kman),
+                );
+                let smaller = self.s.m.cmp(c, pred::IULT, m1, m2);
+                let at = self.s.m.bin(c, Bin::And, at, smaller);
+                let q_denorm = self.s.m.bin(c, Bin::Or, below, at);
+                let n_fin = self.s.m.cmp(c, pred::NE, e1, k255);
+                let d_fin = self.s.m.cmp(c, pred::NE, e2, k255);
+                let fin = self.s.m.bin(c, Bin::And, n_fin, d_fin);
+                let q_denorm = self.s.m.bin(c, Bin::And, q_denorm, fin);
+                let num_tiny = self.s.m.cmp(c, pred::IULE, e1, k23);
+                let both = self.s.m.bin(c, Bin::And, rcp_denorm, q_denorm);
+                // a · 2^64, exact for a denormal `a` too (its integer mantissa times
+                // 2^-85), which a host that flushes denormals would make 0.
+                let up = {
+                    let k_up = self.s.m.f32(0x5F80_0000);
+                    let normal = self.s.m.bin(c, Bin::Mul, a, k_up);
+                    let a_abs = self.s.m.bin(c, Bin::And, ai, kabs);
+                    let m = self.s.m.cast(c, Cast::UiToFp, a_abs, self.s.t.f32);
+                    let k85 = self.s.m.f32(0x1500_0000);
+                    let m = self.s.m.bin(c, Bin::Mul, m, k85);
+                    let m = self.as_int(m);
+                    let ksign = k(self, 0x8000_0000);
+                    let sign = self.s.m.bin(c, Bin::And, ai, ksign);
+                    let m = self.s.m.bin(c, Bin::Or, m, sign);
+                    let m = self.as_float(m);
+                    let ea = exp_of(self, ai);
+                    let tiny = self.s.m.cmp(c, pred::EQ, ea, zero);
+                    self.s.m.select(c, tiny, m, normal)
                 };
-                let is_den = self.s.m.cmp(c, pred::EQ, ai, di);
-                let diff = self.s.m.bin(c, Bin::Sub, e2, e1);
-                let den_tiny = self.s.m.cmp(c, pred::IULE, e2, k23_exp);
-                let den_huge = self.s.m.cmp(c, pred::IUGE, e2, k232_exp);
-                let num_tiny_exp = self.s.m.cmp(c, pred::IULE, e1, k23_exp);
-                let num_huge = self.s.m.cmp(c, pred::IUGE, e1, k232_exp);
-                let num_gap = self.s.m.cmp(c, pred::SGE, diff, k96);
-                let not_den_huge = {
-                    let t = self.s.m.bool(true);
-                    self.s.m.bin(c, Bin::Xor, den_huge, t)
-                };
-                let num_gap = self.s.m.bin(c, Bin::And, num_gap, not_den_huge);
-                let num_tiny = self.s.m.bin(c, Bin::Or, num_tiny_exp, num_gap);
-                let up_raw = self.s.m.select(c, is_den, den_tiny, num_tiny);
-                let dn_raw = self.s.m.select(c, is_den, den_huge, num_huge);
-                let not_special = {
-                    let t = self.s.m.bool(true);
-                    self.s.m.bin(c, Bin::Xor, special, t)
-                };
-                let up = self.s.m.bin(c, Bin::And, up_raw, not_special);
-                let dn = self.s.m.bin(c, Bin::And, dn_raw, not_special);
-                let uncancelled = {
-                    let x_tiny = self.s.m.bin(c, Bin::Xor, den_tiny, num_tiny);
-                    let x_huge = self.s.m.bin(c, Bin::Xor, den_huge, num_huge);
-                    self.s.m.bin(c, Bin::Or, x_tiny, x_huge)
-                };
-                let flag_raw = self.s.m.select(c, is_den, uncancelled, up_raw);
-                let flag = self.s.m.bin(c, Bin::And, flag_raw, not_special);
-                let k_up = self.s.m.f32(0x5F80_0000);
                 let k_dn = self.s.m.f32(0x1F80_0000);
-                let a_up = self.s.m.bin(c, Bin::Mul, a, k_up);
-                let a_dn = self.s.m.bin(c, Bin::Mul, a, k_dn);
-                let r = self.s.m.select(c, dn, a_dn, a);
-                let r = self.s.m.select(c, up, a_up, r);
+                let down = self.s.m.bin(c, Bin::Mul, a, k_dn);
+                let is_den = self.s.m.cmp(c, pred::EQ, ai, di);
+                let is_num = self.s.m.cmp(c, pred::EQ, ai, ni);
+                let den_up = self.s.m.select(c, is_den, up, a);
+                let den_down = self.s.m.select(c, is_den, down, a);
+                let num_up = self.s.m.select(c, is_num, up, a);
+                let (yes, no) = (self.s.m.bool(true), self.s.m.bool(false));
+                // From the last case to the first, each taking over where it holds.
+                let mut r = a;
+                let mut flag = no;
+                for (when, value, vcc) in [
+                    (num_tiny, up, no),
+                    (q_denorm, num_up, yes),
+                    (rcp_denorm, down, no),
+                    (both, den_down, yes),
+                    (den_denorm, up, no),
+                    (near_max, den_up, yes),
+                ] {
+                    r = self.s.m.select(c, when, value, r);
+                    flag = self.s.m.select(c, when, vcc, flag);
+                }
+                let flag = self.s.m.select(c, any_zero, no, flag);
                 let qnan = self.s.m.f32(0x7FC0_0000);
                 let r = self.s.m.select(c, any_zero, qnan, r);
                 float(self, r)?;
@@ -8438,16 +8554,18 @@ impl<'a> Lower<'a> {
                 let both_inf = self.s.m.bin(c, Bin::And, n_inf, d_inf);
                 let both_zero = self.s.m.bin(c, Bin::And, n_zero, d_zero);
                 let invalid = self.s.m.bin(c, Bin::Or, both_inf, both_zero);
-                let make_inf = {
-                    let t = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
-                    self.s.m.bin(c, Bin::Or, t, q_nan)
-                };
+                let make_inf = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
                 let make_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
                 let signed_q = self.s.m.bin(c, Bin::Or, sign, q_abs);
                 let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
                 let n_qnan = self.s.m.bin(c, Bin::Or, ni, kqnan_bit);
                 let d_qnan = self.s.m.bin(c, Bin::Or, di, kqnan_bit);
-                let r = self.s.m.select(c, make_zero, sign, signed_q);
+                // A NaN quotient gives infinity only after the zero cases: x/inf
+                // and 0/y are 0 though the division's steps make the quotient NaN
+                // (v_div_scale_f32 gives NaN for a zero operand; rcp(inf) = 0, then
+                // inf * 0).
+                let r = self.s.m.select(c, q_nan, signed_inf, signed_q);
+                let r = self.s.m.select(c, make_zero, sign, r);
                 let r = self.s.m.select(c, make_inf, signed_inf, r);
                 let r = self.s.m.select(c, invalid, kneg_qnan, r);
                 let r = self.s.m.select(c, d_nan, d_qnan, r);
@@ -10341,8 +10459,10 @@ impl<'a> Lower<'a> {
                     }
                     h
                 } else {
-                    let x = self.fsrc(inst, 0)?;
-                    self.as_int(x)
+                    // Modifiers on the bits, as for f16 above: the host's FAbs and
+                    // negation flush a denormal and quiet a signalling NaN
+                    // (measured on an RTX 4070 SUPER and WARP).
+                    self.fsrc_bits(inst, 0)?
                 };
                 let mask = self.src(inst, 1)?;
                 let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -12092,6 +12212,12 @@ impl<'a> Lower<'a> {
             let (op, name) = if typed {
                 // shortcut: typed stores are taken to write all four channels
                 // of a float format.
+                // Known: an SOFFSET register or a built descriptor's offset
+                // (`off` computed) is dropped here, and the store goes to the
+                // element the index alone names
+                // (`a_typed_buffer_store_at_a_scalar_offset_is_not_written_without_it`).
+                // Refusing it would drop the draws of every pipeline with such
+                // a store; left as it is until a game run shows which is worse.
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }

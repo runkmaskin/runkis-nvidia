@@ -131,6 +131,11 @@
                           Visibility="{Binding IsRunning, Converter={StaticResource Vis}}">
                     <TextBlock Text="■  STOP" Foreground="White" FontWeight="Bold"/>
                   </Button>
+                  <Button Command="{Binding WarmUp}" Margin="0,10,0,0" Padding="16,8"
+                          Visibility="{Binding IsRunning, Converter={StaticResource Vis}, ConverterParameter=not}"
+                          ToolTip="Translates every shader of the game into the cache, then builds every pipeline earlier plays recorded into the driver's cache. Fewer hitches the first time a place is seen. Run it once after a new build, and again after playing new places. Needs about 23 GB free on C:.">
+                    <TextBlock Text="⚡  Warm up shaders"/>
+                  </Button>
                   <TextBlock Text="{Binding StateDetail}" Style="{StaticResource Hint}" MaxWidth="260" TextAlignment="Center" Margin="0,10,0,0"/>
                 </StackPanel>
               </Grid>

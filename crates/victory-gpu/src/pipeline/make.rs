@@ -86,6 +86,16 @@ impl Pending {
         &self.key
     }
 
+    /// Whether `other` is made of the same shaders (the same containers)
+    /// and the same state (of the same description, by its hash in the key,
+    /// as the library names host pipelines): the same host pipeline.
+    fn same(&self, other: &Pending) -> bool {
+        self.key == other.key
+            && self.graphics.is_some() == other.graphics.is_some()
+            && self.shaders.len() == other.shaders.len()
+            && self.shaders.iter().zip(&other.shaders).all(|(a, b)| Arc::ptr_eq(a, b))
+    }
+
     fn make(&self) {
         self.made.get_or_init(|| {
             let began = Instant::now();
@@ -106,6 +116,32 @@ impl Pending {
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+}
+
+/// The title's pipelines by [`Pending::key`], while one of them lives.
+static SHARED: Mutex<Option<(std::collections::HashMap<String, std::sync::Weak<Pending>>, usize)>> = Mutex::new(None);
+
+/// `p`, or the one of the title's pipelines made of the same shaders and
+/// state, being made or made: a title pipeline created again with them
+/// shares its host pipeline. Each had a host pipeline of its own, made
+/// again by a worker (compiled again where the library did not have it
+/// yet, as when both are made at once).
+pub(crate) fn shared(p: Pending) -> Arc<Pending> {
+    let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+    let (by_key, prune_at) = shared.get_or_insert_with(|| (Default::default(), 1024));
+    if let Some(known) = by_key.get(&p.key).and_then(std::sync::Weak::upgrade)
+        && known.same(&p)
+    {
+        return known;
+    }
+    let p = Arc::new(p);
+    by_key.insert(p.key.clone(), Arc::downgrade(&p));
+    // Those no title pipeline holds any more, let go now and then.
+    if by_key.len() >= *prune_at {
+        by_key.retain(|_, w| w.strong_count() > 0);
+        *prune_at = (by_key.len() * 2).max(1024);
+    }
+    p
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -680,5 +716,65 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    fn state(mask: u32) -> Option<Box<GraphicsState>> {
+        Some(Box::new(GraphicsState { sample_mask: mask, ..Default::default() }))
+    }
+
+    /// Title pipelines of the same containers and state share one host
+    /// pipeline, made once; any other difference, or none left holding it,
+    /// makes another.
+    #[test]
+    fn pipelines_of_the_same_shaders_and_state_are_made_once() {
+        let (a, b) = (super::super::shader("pixel", b"shared test container a"), super::super::shader("pixel", b"shared test container b"));
+        let one = shared(Pending::new(vec![a.clone()], state(1)));
+        let again = shared(Pending::new(vec![a.clone()], state(1)));
+        assert!(Arc::ptr_eq(&one, &again));
+        for other in [
+            shared(Pending::new(vec![a.clone()], state(3))),
+            shared(Pending::new(vec![b.clone()], state(1))),
+            shared(Pending::new(vec![a.clone()], None)),
+            shared(Pending::new(vec![a.clone(), b.clone()], state(1))),
+            shared(Pending::new(vec![b.clone(), a.clone()], state(1))),
+        ] {
+            assert!(!Arc::ptr_eq(&one, &other));
+        }
+        // What the worker made for one is the other's.
+        assert!(one.made.set(None).is_ok());
+        assert!(again.made.get().is_some());
+        // Once no title pipeline holds it, the next is made afresh.
+        drop((one, again));
+        let fresh = shared(Pending::new(vec![a.clone()], state(1)));
+        assert!(fresh.made.get().is_none());
+    }
+
+    /// Before and after (`cargo test --release`): the title creating 60,000
+    /// pipelines (its first 20 seconds), one in three of them made of the
+    /// shaders and state of one before (most of those): the host pipelines
+    /// to make, and what a creation costs.
+    #[test]
+    fn identical_pipelines_are_made_once_at_little_cost() {
+        let shaders: Vec<_> = (0..2000u32).map(|i| super::super::shader("pixel", format!("bench container {i}").as_bytes())).collect();
+        let creations: Vec<(usize, u32)> = (0..60_000usize).map(|i| if i % 3 == 2 { (i / 3 % 2000, (i / 3) as u32) } else { (i % 2000, i as u32) }).collect();
+        let time = |share: bool| {
+            let began = Instant::now();
+            let made: Vec<Arc<Pending>> = creations
+                .iter()
+                .map(|&(s, mask)| {
+                    let p = Pending::new(vec![shaders[s].clone()], state(mask ^ 0x5a5a_0000));
+                    if share { shared(p) } else { Arc::new(p) }
+                })
+                .collect();
+            let mut distinct: Vec<usize> = made.iter().map(|p| Arc::as_ptr(p) as usize).collect();
+            distinct.sort_unstable();
+            distinct.dedup();
+            (began.elapsed().as_secs_f64() * 1e9 / creations.len() as f64, distinct.len())
+        };
+        let ((before, made_before), (after, made_after)) = (time(false), time(true));
+        eprintln!(
+            "pipelines, 60,000 created, a third again: before {made_before} host pipelines to make at {before:.0} ns a creation, after {made_after} at {after:.0} ns"
+        );
+        assert!(made_after < made_before);
     }
 }

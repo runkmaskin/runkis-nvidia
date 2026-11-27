@@ -2624,3 +2624,403 @@ fn a_format_load_read_as_halves_loads_the_integer() {
     }
     assert!(ran > 0, "no SM 6.6 device available");
 }
+
+/// Runs `body` on each `(inputs, expected v0)` case and collects the
+/// mismatches as messages (`what` names the case set); lane reads run on
+/// the hardware adapter alone (`hardware_only`).
+fn collect_cases(
+    what: &str,
+    body: &[u32],
+    cases: &[([u32; 4], u32)],
+    hardware_only: bool,
+    bad: &mut Vec<String>,
+) {
+    let shader = build_valu_cs(body);
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    let devices: &[(&str, bool)] = if hardware_only {
+        &[("hardware", false)]
+    } else {
+        &[("hardware", false), ("warp", true)]
+    };
+    run_cases_on(&shader, &inputs, devices, |backend, i, inp, got| {
+        let want = cases[i].1;
+        if got != want {
+            bad.push(format!(
+                "{backend}: {what}({:#010x}, {:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1], inp[2], inp[3]
+            ));
+        }
+    });
+}
+
+fn assert_none_bad(bad: &[String]) {
+    for b in bad {
+        eprintln!("{b}");
+    }
+    assert!(bad.is_empty(), "{} mismatches (listed above)", bad.len());
+}
+
+/// `body` then `v_cndmask_b32_e64 v0, 0, 1, s20`.
+fn with_s20_as_v0(body: [u32; 2]) -> Vec<u32> {
+    let c = vop3(0x101, 0, 0x80, 0x81, sgpr(20));
+    vec![body[0], body[1], c[0], c[1]]
+}
+
+#[test]
+fn v_cmp_class_f32_modifiers_flip_only_the_sign_bit() {
+    // v_cmp_class_f32_e64 s20, v1, v2 (VOP3 0x088), plain, with neg and with abs on src0.
+    // The input modifiers act on the sign bit: a negated denormal is a negative
+    // denormal, a negated signalling NaN still a signalling NaN.
+    let f = f32::to_bits;
+    let classes = [
+        (0x7F80_0001u32, 0u32),
+        (0xFF80_0001, 0),
+        (0x7FC0_0000, 1),
+        (0xFFC0_0001, 1),
+        (0xFF80_0000, 2),
+        (f(-1.0), 3),
+        (0x8000_0001, 4),
+        (0x8000_0000, 5),
+        (0, 6),
+        (1, 7),
+        (f(1.0), 8),
+        (0x7F80_0000, 9),
+    ];
+    let cases = |flip: u32| -> Vec<([u32; 4], u32)> {
+        let mut cases = Vec::new();
+        for &(bits, class) in &classes {
+            cases.push(([bits ^ flip, 1 << class, 0, 0], 1));
+            cases.push(([bits ^ flip, 0x3FF & !(1 << class), 0, 0], 0));
+        }
+        cases
+    };
+    let mut bad = Vec::new();
+    let [a, b] = vop3(0x088, 20, vgpr(1), vgpr(2), 0);
+    collect_cases("class", &with_s20_as_v0([a, b]), &cases(0), false, &mut bad);
+    let neg = cases(0x8000_0000);
+    collect_cases("class(-x)", &with_s20_as_v0([a, b | 1 << 29]), &neg, false, &mut bad);
+    // |x| of a negative zero, denormal, normal and infinity: the positive class.
+    let abs: Vec<_> = classes[8..]
+        .iter()
+        .map(|&(bits, class)| ([bits | 0x8000_0000, 1 << class, 0, 0], 1))
+        .collect();
+    collect_cases("class(|x|)", &with_s20_as_v0([a | 1 << 8, b]), &abs, false, &mut bad);
+    assert_none_bad(&bad);
+}
+
+#[test]
+fn f32_division_expansion_is_correctly_rounded() {
+    // LLVM's IEEE f32 division (fdiv without fast-math), num v1 / den v2:
+    //   v_div_scale_f32 v3, s20, v2, v2, v1 ; v_div_scale_f32 v4, vcc, v1, v2, v1
+    //   v_rcp_f32 v5, v3 ; v_fma_f32 v6, -v3, v5, 1.0 ; v_fma_f32 v5, v6, v5, v5
+    //   v_mul_f32 v6, v4, v5 ; v_fma_f32 v7, -v3, v6, v4 ; v_fma_f32 v6, v7, v5, v6
+    //   v_fma_f32 v3, -v3, v6, v4 ; v_div_fmas_f32 v3, v3, v5, v6 ; v_div_fixup_f32 v0, v3, v2, v1
+    // The scaling cases of v_div_scale_f32 and the special cases of
+    // v_div_fixup_f32 make it the quotient rounded once, infinities, zeros
+    // and NaN included. (shortcut: within one place, v_fma_f32 being FMad
+    // here; a denormal quotient may come out flushed.)
+    let mut body = Vec::new();
+    let [a, b] = vop3(0x16d, 3, vgpr(2), vgpr(2), vgpr(1));
+    body.extend([a | 20 << 8, b]);
+    let [a, b] = vop3(0x16d, 4, vgpr(1), vgpr(2), vgpr(1));
+    body.extend([a | 106 << 8, b]);
+    body.push(vop1(0x02a, 5, vgpr(3)));
+    body.extend(vop3_mod(0x14b, 6, vgpr(3), vgpr(5), 242, 0, 1, 0, false));
+    body.extend(vop3(0x14b, 5, vgpr(6), vgpr(5), vgpr(5)));
+    body.extend(vop3(0x108, 6, vgpr(4), vgpr(5), 0));
+    body.extend(vop3_mod(0x14b, 7, vgpr(3), vgpr(6), vgpr(4), 0, 1, 0, false));
+    body.extend(vop3(0x14b, 6, vgpr(7), vgpr(5), vgpr(6)));
+    body.extend(vop3_mod(0x14b, 3, vgpr(3), vgpr(6), vgpr(4), 0, 1, 0, false));
+    body.extend(vop3(0x16f, 3, vgpr(3), vgpr(5), vgpr(6)));
+    body.extend(vop3(0x15f, 0, vgpr(3), vgpr(2), vgpr(1)));
+    let (inf, p) = (f32::INFINITY, |e: i32| 2f32.powi(e));
+    let pairs = [
+        (1.0f32, 3.0f32),
+        (7.0, 2.0),
+        (-7e-30, 3e10),
+        (1e-20, 7e18),
+        (1e20, 1e-10),
+        // a quotient near the largest float, or past it
+        (3.4e38, 0.5),
+        (3e38, 1e-38),
+        (1e38, 1e-5),
+        (p(127), p(-10)),
+        (6e37, 3e-2),
+        // a denormal denominator, or both operands denormal
+        (1.0, 1e-39),
+        (1e-30, 1e-39),
+        (1e-40, 1e-40),
+        (1e-40, 3e-41),
+        // a denominator whose reciprocal is denormal
+        (3e38, 3e38),
+        (1.0, 3e38),
+        (5e-39, 2e38),
+        // a tiny numerator
+        (1e-38, 1e30),
+        (1e-45, 1.0),
+        (p(-126), p(100)),
+        // special cases
+        (5.0, inf),
+        (3.0, -inf),
+        (1.0, 0.0),
+        (-1.0, 0.0),
+        (0.0, 5.0),
+        (0.0, 0.0),
+        (inf, inf),
+        (inf, 0.0),
+        (f32::NAN, 1.0),
+    ];
+    let shader = build_valu_cs(&body);
+    let inputs: Vec<[u32; 4]> = pairs.iter().map(|&(n, d)| [n.to_bits(), d.to_bits(), 0, 0]).collect();
+    let mut bad = Vec::new();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let (n, d) = pairs[i];
+        let want = n / d;
+        let g = f32::from_bits(got);
+        let near = (i64::from(got) - i64::from(want.to_bits())).abs() <= 1;
+        let ok = if want.is_nan() {
+            g.is_nan()
+        } else if want.is_subnormal() {
+            g == 0.0 || near
+        } else if want == 0.0 || want.is_infinite() {
+            got == want.to_bits()
+        } else {
+            near
+        };
+        if !ok {
+            bad.push(format!("{backend}: {n:e} / {d:e} = {g:e} ({got:#010x}), want {want:e}"));
+        }
+    });
+    assert_none_bad(&bad);
+}
+
+/// An f32 rounded toward zero to f16 bits.
+fn half_toward_zero(x: f32) -> u16 {
+    let sign = ((x.to_bits() >> 16) & 0x8000) as u16;
+    let a = x.abs();
+    if a.is_nan() {
+        return sign | 0x7E00;
+    }
+    if a.is_infinite() {
+        return sign | 0x7C00;
+    }
+    if a > 65504.0 {
+        return sign | 0x7BFF;
+    }
+    if a < 2f32.powi(-14) {
+        // denormals: steps of 2^-24
+        return sign | (a / 2f32.powi(-24)).trunc() as u16;
+    }
+    let e = (a.to_bits() >> 23) as i32 - 127;
+    let m = ((a / 2f32.powi(e) - 1.0) * 1024.0).trunc() as u16;
+    sign | ((e + 15) as u16) << 10 | m
+}
+
+#[test]
+fn valu_edge_cases_match_rdna2() {
+    // Conversions, compares, carries, SDWA, EXEC writes, 16-bit and packed
+    // operations at their edges, as the RDNA2 ISA gives them.
+    let mut bad = Vec::new();
+    let f = f32::to_bits;
+    let (nan, snan) = (0x7FC0_0000u32, 0x7F80_0001u32);
+    // v_cmp_u_f32 / v_cmp_o_f32 (VOP3 0x008 / 0x007)
+    let unordered = [
+        ([nan, f(1.0), 0, 0], 1),
+        ([f(1.0), nan, 0, 0], 1),
+        ([f(1.0), f(2.0), 0, 0], 0),
+        ([snan, snan, 0, 0], 1),
+        ([0x7F80_0000, 0xFF80_0000, 0, 0], 0),
+    ];
+    let ordered: Vec<_> = unordered.iter().map(|&(i, w)| (i, 1 - w)).collect();
+    collect_cases("v_cmp_u_f32", &with_s20_as_v0(vop3(0x008, 20, vgpr(1), vgpr(2), 0)), &unordered, false, &mut bad);
+    collect_cases("v_cmp_o_f32", &with_s20_as_v0(vop3(0x007, 20, vgpr(1), vgpr(2), 0)), &ordered, false, &mut bad);
+    // Float to integer: toward zero (flr: down, rpi: floor(x + 0.5)), saturating, NaN 0.
+    let values = [
+        3e9f32, -3e9, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 2147483520.0, -2147483648.0,
+        4294967040.0, 5e9, -1.0, -0.5, 1.5, 2.5, -2.5, 0.49999997, -1.5, 2147483647.0,
+    ];
+    for (op, name) in [
+        (0x008u16, "v_cvt_i32_f32"),
+        (0x007, "v_cvt_u32_f32"),
+        (0x00d, "v_cvt_flr_i32_f32"),
+        (0x00c, "v_cvt_rpi_i32_f32"),
+    ] {
+        let cases: Vec<_> = values
+            .iter()
+            .map(|&x| {
+                let y = match op {
+                    0x00d => x.floor(),
+                    0x00c => (x + 0.5).floor(),
+                    _ => x,
+                };
+                let want = if op == 0x007 { y as u32 } else { (y as i32) as u32 };
+                ([x.to_bits(), 0, 0, 0], want)
+            })
+            .collect();
+        collect_cases(name, &[vop1(op, 0, vgpr(1))], &cases, false, &mut bad);
+    }
+    // v_cvt_pkrtz_f16_f32 v0, v1, v2 (VOP2 0x2f): both halves toward zero.
+    let pk = [
+        1.0f32 + 3.0 / 4096.0, 70000.0, f32::INFINITY, -70000.0, 2f32.powi(-20), 2f32.powi(-25),
+        1.0 / 3.0, -1.0 / 3.0, 65519.0, 65520.0, 2f32.powi(-24) * 1.75, -0.0,
+    ];
+    let cases: Vec<_> = pk
+        .iter()
+        .map(|&x| ([x.to_bits(), f(-1.0 / 3.0), 0, 0], u32::from(half_toward_zero(x)) | 0xB555 << 16))
+        .collect();
+    collect_cases("v_cvt_pkrtz_f16_f32", &[vop2(0x2f, 0, vgpr(1), 2)], &cases, false, &mut bad);
+    // v_mad_u64_u32 v[5:6], s20, v1, v2, v[3:4]: the sum, and its carry out.
+    {
+        let [a, b] = vop3(0x176, 5, vgpr(1), vgpr(2), vgpr(3));
+        let a = a | 20 << 8;
+        let sums = [
+            (u32::MAX, u32::MAX, u64::MAX),
+            (u32::MAX, u32::MAX, 0x1_FFFF_FFFE),
+            (u32::MAX, u32::MAX, 0x1_FFFF_FFFF),
+            (3, 5, 7),
+            (0, 0, u64::MAX),
+        ];
+        let run = |what: &str, body: Vec<u32>, pick: fn(u64, bool) -> u32, bad: &mut Vec<String>| {
+            let cases: Vec<_> = sums
+                .iter()
+                .map(|&(x, y, z)| {
+                    let (r, o) = (u64::from(x) * u64::from(y)).overflowing_add(z);
+                    ([x, y, z as u32, (z >> 32) as u32], pick(r, o))
+                })
+                .collect();
+            collect_cases(what, &body, &cases, false, bad);
+        };
+        run("v_mad_u64_u32 carry", with_s20_as_v0([a, b]), |_, o| o as u32, &mut bad);
+        run("v_mad_u64_u32 lo", vec![a, b, vop1(1, 0, vgpr(5))], |r, _| r as u32, &mut bad);
+        run("v_mad_u64_u32 hi", vec![a, b, vop1(1, 0, vgpr(6))], |r, _| (r >> 32) as u32, &mut bad);
+    }
+    // v_sub_co_u32 v5, s20, v1, v2 (VOP3 0x310): the borrow; then into VCC and
+    // v_subrev_co_ci_u32 v0, v3, v4 (VOP2 0x2a): v4 - v3 - VCC.
+    {
+        let [a, b] = vop3(0x310, 5, vgpr(1), vgpr(2), 0);
+        let pairs = [(1u32, 2u32), (2, 1), (0, 0), (0, u32::MAX)];
+        let cases: Vec<_> = pairs.iter().map(|&(x, y)| ([x, y, 0, 0], u32::from(x < y))).collect();
+        collect_cases("v_sub_co_u32 borrow", &with_s20_as_v0([a | 20 << 8, b]), &cases, false, &mut bad);
+        let quads = [(1u32, 2u32, 5u32, 9u32), (2, 1, 5, 9), (1, 2, 0, 0), (2, 1, 0, 0)];
+        let cases: Vec<_> = quads
+            .iter()
+            .map(|&(x, y, p, q)| ([x, y, p, q], q.wrapping_sub(p).wrapping_sub(u32::from(x < y))))
+            .collect();
+        let body = [a | 106 << 8, b, vop2(0x2a, 0, vgpr(3), 4)];
+        collect_cases("v_subrev_co_ci_u32", &body, &cases, false, &mut bad);
+    }
+    // v_cvt_pk_u8_f32 v0, v1, 1, v2 (VOP3 0x15e): byte 1 of v2, rounded to nearest even.
+    {
+        let xs = [f32::NAN, 255.5, 256.0, -1.0, 0.5, 1.5, 2.5, 254.5, f32::INFINITY];
+        let cases: Vec<_> = xs
+            .iter()
+            .map(|&x| {
+                let r = if x.is_nan() { 0 } else { x.round_ties_even().clamp(0.0, 255.0) as u32 };
+                ([x.to_bits(), 0xAABB_CCDD, 0, 0], 0xAABB_00DD | r << 8)
+            })
+            .collect();
+        collect_cases("v_cvt_pk_u8_f32", &vop3(0x15e, 0, vgpr(1), 0x81, vgpr(2)), &cases, false, &mut bad);
+    }
+    // Transcendentals and roundings at their edges (VOP1).
+    let unary = [
+        (0x027u16, "v_log_f32", vec![(f(-0.0), f(f32::NEG_INFINITY)), (f(0.0), f(f32::NEG_INFINITY)), (f(f32::INFINITY), f(f32::INFINITY)), (f(8.0), f(3.0))]),
+        (0x025, "v_exp_f32", vec![(f(f32::NEG_INFINITY), 0), (f(f32::INFINITY), f(f32::INFINITY)), (f(3.0), f(8.0))]),
+        (0x02a, "v_rcp_f32", vec![(f(-0.0), f(f32::NEG_INFINITY)), (f(0.0), f(f32::INFINITY)), (f(f32::INFINITY), 0), (f(4.0), f(0.25))]),
+        (0x02e, "v_rsq_f32", vec![(f(-0.0), f(f32::NEG_INFINITY)), (f(0.0), f(f32::INFINITY)), (f(f32::INFINITY), 0), (f(4.0), f(0.5))]),
+        (0x033, "v_sqrt_f32", vec![(f(-0.0), f(-0.0)), (f(f32::INFINITY), f(f32::INFINITY)), (f(4.0), f(2.0))]),
+        (0x023, "v_rndne_f32", vec![(f(2.5), f(2.0)), (f(-2.5), f(-2.0)), (f(-0.4), f(-0.0))]),
+        (0x021, "v_trunc_f32", vec![(f(-0.5), f(-0.0)), (f(2.7), f(2.0))]),
+        (0x022, "v_ceil_f32", vec![(f(-0.5), f(-0.0)), (f(2.1), f(3.0))]),
+        (0x024, "v_floor_f32", vec![(f(-0.5), f(-1.0)), (f(2.9), f(2.0))]),
+    ];
+    for (op, name, pairs) in unary {
+        let cases: Vec<_> = pairs.iter().map(|&(x, w)| ([x, 0, 0, 0], w)).collect();
+        collect_cases(name, &[vop1(op, 0, vgpr(1))], &cases, false, &mut bad);
+    }
+    // v_max_f32 with a NaN gives the number.
+    let max = [([nan, f(1.0), 0, 0], f(1.0)), ([f(1.0), nan, 0, 0], f(1.0)), ([f(-3.0), f(2.0), 0, 0], f(2.0))];
+    collect_cases("v_max_f32", &[vop2(0x10, 0, vgpr(1), 2)], &max, false, &mut bad);
+    // omod, then clamp (v_mul_f32_e64, VOP3 0x108)
+    let omod = |o: u8, clamp: bool| vop3_mod(0x108, 0, vgpr(1), vgpr(2), 0, 0, 0, o, clamp);
+    collect_cases("v_mul_f32 *2", &omod(1, false), &[([f(1.5), f(3.0), 0, 0], f(9.0))], false, &mut bad);
+    collect_cases("v_mul_f32 /2 clamp", &omod(3, true), &[([f(1.5), f(1.0), 0, 0], f(0.75)), ([f(3.0), f(1.0), 0, 0], f(1.0))], false, &mut bad);
+    collect_cases("v_mul_f32 *4 clamp", &omod(2, true), &[([f(0.125), f(1.0), 0, 0], f(0.5)), ([f(0.5), f(1.0), 0, 0], f(1.0))], false, &mut bad);
+    // -|v1| + |v2| (v_add_f32_e64, VOP3 0x103); v0 = -v1 * v2 + v0 (v_fmac_f32_e64, 0x12b)
+    collect_cases("v_add_f32 -|a| + |b|", &vop3_mod(0x103, 0, vgpr(1), vgpr(2), 0, 3, 1, 0, false), &[([f(2.0), f(-3.0), 0, 0], f(1.0)), ([f(-2.0), f(3.0), 0, 0], f(1.0))], false, &mut bad);
+    let fmac = vop3_mod(0x12b, 0, vgpr(1), vgpr(2), 0, 0, 1, 0, false);
+    collect_cases("v_fmac_f32 -a", &[vop1(1, 0, vgpr(3)), fmac[0], fmac[1]], &[([f(2.0), f(3.0), f(10.0), 0], f(4.0))], false, &mut bad);
+    // v_fma_mix_f32 v0, |v1.lo| (f16), v2, v3 (VOP3P 0x20; neg_hi is abs here)
+    {
+        let w0 = 0xCC00_0000 | 0x20 << 16 | 1 << 8;
+        let w1 = 1 << 27 | vgpr(1) as u32 | (vgpr(2) as u32) << 9 | (vgpr(3) as u32) << 18;
+        let cases = [([0xBC00, f(2.0), f(1.0), 0], f(3.0)), ([0x4000, f(2.0), f(1.0), 0], f(5.0))];
+        collect_cases("v_fma_mix_f32 |lo|", &[w0, w1], &cases, false, &mut bad);
+        let cases = [([0xC000_0000, f(2.0), f(1.0), 0], f(5.0))];
+        collect_cases("v_fma_mix_f32 |hi|", &[w0 | 1 << 11, w1], &cases, false, &mut bad);
+    }
+    // SDWA v_mov_b32 v0, v1: sext(BYTE_1) into WORD_1, the rest kept; BYTE_0
+    // sign-extended over the dword; v_add_nc_u32 of BYTE_0 and WORD_1.
+    {
+        let xs = [0x0000_8000u32, 0x0000_7F00, 0x1234_5678];
+        let keep_word1 = 1 | 5 << 8 | 2 << 11 | 1 << 16 | 1 << 19;
+        let cases: Vec<_> = xs
+            .iter()
+            .map(|&x| ([x, 0xCAFE_BABE, 0, 0], 0xBABE | (((x >> 8) as u8 as i8 as i32 as u32) & 0xFFFF) << 16))
+            .collect();
+        collect_cases("SDWA mov word1", &[vop1(1, 0, vgpr(2)), vop1(1, 0, 0xF9), keep_word1], &cases, false, &mut bad);
+        let sext_byte0 = 1 | 1 << 11 | 6 << 16;
+        let cases: Vec<_> = xs.iter().map(|&x| ([x, 0, 0, 0], x as u8 as i8 as i32 as u32)).collect();
+        collect_cases("SDWA mov sext", &[vop1(1, 0, 0xF9), sext_byte0], &cases, false, &mut bad);
+        let add = 1 | 6 << 8 | 5 << 24;
+        let cases: Vec<_> = xs.iter().map(|&x| ([x, 0xFFFF_0003, 0, 0], (x & 0xFF) + 0xFFFF)).collect();
+        collect_cases("SDWA add", &[vop2(0x25, 0, 0xF9, 2), add], &cases, false, &mut bad);
+    }
+    // v_cmpx_lt_f32 v1, v2 (VOPC 0x011) writes EXEC: the move after it is
+    // done only where it held; EXEC is restored for the store.
+    {
+        let body = [
+            vop1(1, 0, 0x87),
+            0x7C00_0000 | 0x011 << 17 | 2 << 9 | vgpr(1) as u32,
+            vop1(1, 0, 0x89),
+            s_mov_b32(126, 0xC1),
+        ];
+        let cases = [([f(1.0), f(2.0), 0, 0], 9), ([f(2.0), f(1.0), 0, 0], 7), ([nan, f(1.0), 0, 0], 7)];
+        collect_cases("v_cmpx_lt_f32", &body, &cases, false, &mut bad);
+    }
+    // v_lshlrev_b64 v[5:6], v1, v[2:3]: the shift's low 6 bits.
+    {
+        let sh = vop3(0x2ff, 5, vgpr(1), vgpr(2), 0);
+        let ins = [(33u32, 0x8000_0001u32, 0x1u32), (1, 0x8000_0000, 0), (64 + 4, 0xF, 0), (0, 5, 6)];
+        let shifted = |s: u32, a: u32, b: u32| (u64::from(b) << 32 | u64::from(a)) << (s & 63);
+        let lo: Vec<_> = ins.iter().map(|&(s, a, b)| ([s, a, b, 0], shifted(s, a, b) as u32)).collect();
+        let hi: Vec<_> = ins.iter().map(|&(s, a, b)| ([s, a, b, 0], (shifted(s, a, b) >> 32) as u32)).collect();
+        collect_cases("v_lshlrev_b64 lo", &[sh[0], sh[1], vop1(1, 0, vgpr(5))], &lo, false, &mut bad);
+        collect_cases("v_lshlrev_b64 hi", &[sh[0], sh[1], vop1(1, 0, vgpr(6))], &hi, false, &mut bad);
+    }
+    collect_cases("v_bcnt_u32_b32", &vop3(0x364, 0, vgpr(1), vgpr(2), 0), &[([0xF0F0_0001, 5, 0, 0], 14)], false, &mut bad);
+    // v_writelane_b32 v0, s0, 0; v_readlane_b32 s20, v1, 0
+    collect_cases("v_writelane_b32", &vop3(0x361, 0, sgpr(0), 0x80, 0), &[([77, 0, 0, 0], 77)], true, &mut bad);
+    let r = vop3(0x360, 20, vgpr(1), 0x80, 0);
+    collect_cases("v_readlane_b32", &[r[0], r[1], vop1(1, 0, sgpr(20))], &[([78, 0, 0, 0], 78)], true, &mut bad);
+    // 16-bit results keep the other half of the VGPR (GFX10).
+    let keep = vop1(1, 0, vgpr(3));
+    collect_cases("v_add_f16", &[keep, vop2(0x32, 0, vgpr(1), 2)], &[([0x1111_3C00, 0x2222_4000, 0xABCD_0000, 0], 0xABCD_4200)], false, &mut bad);
+    let [a, b] = vop3(0x132, 0, vgpr(1), vgpr(2), 0);
+    collect_cases("v_add_f16 op_sel dst", &[keep, a | 1 << 14, b], &[([0x1111_3C00, 0x2222_4000, 0xABCD_1234, 0], 0x4200_1234)], false, &mut bad);
+    collect_cases("v_cvt_f16_f32", &[keep, vop1(0x0a, 0, vgpr(1))], &[([f(1.5), 0, 0xABCD_0000, 0], 0xABCD_3E00)], false, &mut bad);
+    let [a, b] = vop3(0x303, 0, vgpr(1), vgpr(2), 0);
+    collect_cases("v_add_nc_u16", &[keep, a, b], &[([0x1111_FFFF, 0x2222_0003, 0xABCD_0000, 0], 0xABCD_0002)], false, &mut bad);
+    // v_pk_fma_f16 v0, v1, v2, v3 op_sel:[1,0,0] op_sel_hi:[0,1,1] neg_lo:[1,0,0] neg_hi:[0,1,0]:
+    // low -v1.hi * v2.lo + v3.lo = -2 * 4 + 5, high v1.lo * -v2.hi + v3.hi = 1 * -3 + 0.5.
+    {
+        let w0 = 0xCC00_0000 | 0x0e << 16 | 1 << 11 | 1 << 14 | 2 << 8;
+        let w1 = 1 << 29 | 2 << 27 | vgpr(1) as u32 | (vgpr(2) as u32) << 9 | (vgpr(3) as u32) << 18;
+        let inputs = [0x4000_3C00, 0x4200_4400, 0x3800_4500, 0];
+        collect_cases("v_pk_fma_f16", &[w0, w1], &[(inputs, 0xC100_C200)], false, &mut bad);
+        collect_cases("v_pk_fma_f16 clamp", &[w0 | 1 << 15, w1], &[(inputs, 0)], false, &mut bad);
+    }
+    let pk2 = |op: u32| [0xCC00_0000 | op << 16 | 1 << 14, 3 << 27 | vgpr(1) as u32 | (vgpr(2) as u32) << 9];
+    collect_cases("v_pk_mul_lo_u16", &pk2(0x01), &[([0x0003_0102, 0x8001_0100, 0, 0], 0x8003_0200)], false, &mut bad);
+    collect_cases("v_pk_max_f16", &pk2(0x12), &[([0x7E00_8000, 0x3C00_0000, 0, 0], 0x3C00_0000)], false, &mut bad);
+    assert_none_bad(&bad);
+}

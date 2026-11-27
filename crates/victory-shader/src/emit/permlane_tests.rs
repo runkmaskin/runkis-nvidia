@@ -253,3 +253,91 @@ fn permlane_rows_and_inactive_sources() {
         eprintln!("no SM 6.6 device with 32-lane rows; GPU checks skipped");
     }
 }
+
+/// `v_mov_b32 v6, v5` with the DPP16 dword `ext` (src0 v5), wave32, EXEC all.
+fn dpp_native(ext: u32) -> NativeProgram {
+    let mut n = native(false, false, false, false, false);
+    let mut words: Vec<u32> = n
+        .code
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .collect();
+    // The permlane's two dwords at 8..10 become the DPP move.
+    words[8] = 0x7E00_0200 | 6 << 17 | 0xFA;
+    words[9] = ext | 5;
+    n.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    n
+}
+
+#[test]
+fn dpp16_rows_masks_and_bound_ctrl() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // (ctrl, the source lane in its row of 16 for position p, or none)
+    let ctrls: &[(u32, fn(u32) -> Option<u32>)] = &[
+        (0xB1, |p| Some(p & !3 | [1, 0, 3, 2][(p & 3) as usize])),
+        (0x101, |p| (p + 1 < 16).then_some(p + 1)),
+        (0x113, |p| p.checked_sub(3)),
+        (0x125, |p| Some((p + 16 - 5) % 16)),
+        (0x140, |p| Some(15 - p)),
+        (0x141, |p| Some(p & 8 | (7 - (p & 7)))),
+        (0x157, |_| Some(7)),
+        (0x165, |p| Some(p ^ 5)),
+    ];
+    for (backend, warp) in [("hardware", false), ("WARP", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {backend}; skipped");
+            continue;
+        };
+        for &(ctrl, src_of) in ctrls {
+            for bc in [false, true] {
+                for (rows, banks) in [(0xFu32, 0xFu32), (0x5, 0xF), (0xF, 0x3), (0x2, 0x9)] {
+                    let ext = ctrl << 8 | u32::from(bc) << 19 | banks << 24 | rows << 28;
+                    let shader = match lowered(&dpp_native(ext), 32) {
+                        Ok(s) => s,
+                        Err(e) => panic!("{backend}: DPP {ctrl:#x}: {e:?}"),
+                    };
+                    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+                        eprintln!("{backend}: no pipeline for 32-lane waves; skipped");
+                        break;
+                    };
+                    let constants = [0, 0, u32::MAX, u32::MAX];
+                    let mut ud = vec![0; shader.user_data_dwords() as usize];
+                    for u in &shader.user_data {
+                        if u.root == RootType::Constants {
+                            ud[u.index as usize] = constants[u.dword as usize];
+                        }
+                    }
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![(0, Root::Constants(ud))],
+                                views: &[View::RawUav(THREADS)],
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .expect("dispatch DPP");
+                    for t in 0..THREADS {
+                        let lane = t % 32;
+                        let on = rows >> (lane / 16) & 1 != 0 && banks >> (lane / 4 % 4) & 1 != 0;
+                        let want = match src_of(lane % 16) {
+                            _ if !on => OLD,
+                            Some(p) => BASE + (t & !15 | p),
+                            None if bc => 0,
+                            None => OLD,
+                        };
+                        assert_eq!(
+                            out[0][t as usize],
+                            want,
+                            "{backend}: DPP ctrl {ctrl:#x} bound_ctrl {bc} rows {rows:x} banks {banks:x} lane {t}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

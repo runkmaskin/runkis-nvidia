@@ -3346,6 +3346,18 @@ impl State {
                 .max()
                 .unwrap_or(0)
                 + 1;
+            // The first entry at record `k`. Of a big table, found by the
+            // record ([`ByRecord`], made when first asked): each of its
+            // records was looked for among all its entries.
+            let by_record = std::cell::OnceCell::new();
+            let records = || by_record.get_or_init(|| ByRecord::new(entries().map(|u| u.table_offset_dwords / 8)));
+            let entry_at = |k: u32| {
+                if n <= 64 {
+                    entries().find(|u| u.table_offset_dwords / 8 == k)
+                } else {
+                    records().first(k).map(|j| &used[usize::from(places[j])])
+                }
+            };
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
@@ -3394,7 +3406,7 @@ impl State {
                     }
                 }
                 for k in selected {
-                    if entries().any(|u| u.table_offset_dwords / 8 == k) {
+                    if entry_at(k).is_some() {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
@@ -3437,8 +3449,15 @@ impl State {
             // which may lie over slots shaders pick by index, only the ones
             // the shader names.)
             if let Some(title) = title_first {
-                for k in (0..n).filter(|&k| n <= 64 || entries().any(|u| u.table_offset_dwords / 8 == k)) {
-                    host.slot_tabled(title + k);
+                if n <= 64 {
+                    for k in 0..n {
+                        host.slot_tabled(title + k);
+                    }
+                } else {
+                    // (In order, each once, all below `n`.)
+                    for k in records().records() {
+                        host.slot_tabled(title + k);
+                    }
                 }
             }
             let list_views = crate::descriptor::host::list_views();
@@ -3457,8 +3476,7 @@ impl State {
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
-                    let kind = entries()
-                        .find(|u| u.table_offset_dwords / 8 == k)
+                    let kind = entry_at(k)
                         .map(|u| u.kind)
                         .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
                     let was = (listed.ready, listed.tabled);
@@ -3493,7 +3511,7 @@ impl State {
                     }
                     continue;
                 }
-                let used = entries().find(|u| u.table_offset_dwords / 8 == k);
+                let used = entry_at(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         // Renderer port 5: title memory in place is the
@@ -4221,6 +4239,15 @@ impl<T: Copy, const N: usize> Few<T, N> {
             self.many.push(what);
         }
     }
+
+    /// Keeps the first `len`.
+    fn truncate(&mut self, len: usize) {
+        if self.many.is_empty() {
+            self.len = self.len.min(len);
+        } else {
+            self.many.truncate(len);
+        }
+    }
 }
 
 impl<T, const N: usize> std::ops::Deref for Few<T, N> {
@@ -4233,6 +4260,47 @@ impl<T, const N: usize> std::ops::Deref for Few<T, N> {
 impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
     fn deref_mut(&mut self) -> &mut [T] {
         if self.many.is_empty() { &mut self.few[..self.len] } else { &mut self.many }
+    }
+}
+
+/// A fresh table's entries by the record each names ([`State::tables`]):
+/// for each record, the first of them in order. A table of thousands of
+/// records (a shader that picks views by index) went through all of its
+/// entries for every record, up to three times.
+struct ByRecord {
+    /// Records and the place of their first entry, by record.
+    firsts: Few<(u32, usize), 32>,
+}
+
+impl ByRecord {
+    /// Of the entries' records, in the entries' order.
+    fn new(records: impl Iterator<Item = u32>) -> ByRecord {
+        let mut firsts = Few::default();
+        for (place, record) in records.enumerate() {
+            firsts.push((record, place));
+        }
+        // (Places differ: in the entries' order within a record.)
+        firsts.sort_unstable();
+        let mut kept = 0;
+        for i in 0..firsts.len() {
+            if kept == 0 || firsts[kept - 1].0 != firsts[i].0 {
+                firsts[kept] = firsts[i];
+                kept += 1;
+            }
+        }
+        firsts.truncate(kept);
+        ByRecord { firsts }
+    }
+
+    /// The place among the entries of the first that names record `k`.
+    fn first(&self, k: u32) -> Option<usize> {
+        let i = self.firsts.binary_search_by_key(&k, |f| f.0).ok()?;
+        Some(self.firsts[i].1)
+    }
+
+    /// The records the entries name, each once, in order.
+    fn records(&self) -> impl Iterator<Item = u32> + '_ {
+        self.firsts.iter().map(|f| f.0)
     }
 }
 
@@ -4619,5 +4687,124 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+}
+
+#[cfg(test)]
+mod by_record_tests {
+    use super::{ByRecord, ResourceType, RootType, UsedResource};
+
+    fn random(seed: &mut u64) -> u32 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        (*seed >> 16) as u32
+    }
+
+    fn entry(dwords: u32, kind: ResourceType) -> UsedResource {
+        UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 1,
+        }
+    }
+
+    /// A fresh table's entries (their places among `used`) and its records,
+    /// as [`super::State::tables`] has them: `n` records, some named by
+    /// several entries, the rest picked by index.
+    fn table(seed: &mut u64, entries: usize, n: u32) -> (Vec<UsedResource>, Vec<u16>) {
+        let kinds = [ResourceType::Srv, ResourceType::Uav, ResourceType::Cbv];
+        let mut used = Vec::new();
+        let mut places = Vec::new();
+        for i in 0..entries {
+            // Records near one another, and the last one at the end.
+            let record = if i + 1 == entries { n - 1 } else { random(seed) % n.min(48) };
+            used.push(entry(random(seed) % 4 * 1000 + 7, ResourceType::Srv)); // another slot's
+            places.push(used.len() as u16);
+            used.push(entry(record * 8 + random(seed) % 8, kinds[random(seed) as usize % 3]));
+        }
+        (used, places)
+    }
+
+    /// What the three walks over a fresh table's records found, as they
+    /// found it before: the first entry at each record, whether one is
+    /// there, and those of a big table's records that are named.
+    fn walks_as_before(used: &[UsedResource], places: &[u16], n: u32, selected: &[u32]) -> (Vec<Option<ResourceType>>, Vec<bool>, Vec<u32>) {
+        let entries = || places.iter().map(|&i| &used[usize::from(i)]);
+        let kinds = (0..n).map(|k| entries().find(|u| u.table_offset_dwords / 8 == k).map(|u| u.kind)).collect();
+        let named = selected.iter().map(|&k| entries().any(|u| u.table_offset_dwords / 8 == k)).collect();
+        let tabled = (0..n).filter(|&k| n <= 64 || entries().any(|u| u.table_offset_dwords / 8 == k)).collect();
+        (kinds, named, tabled)
+    }
+
+    fn walks(used: &[UsedResource], places: &[u16], n: u32, selected: &[u32]) -> (Vec<Option<ResourceType>>, Vec<bool>, Vec<u32>) {
+        // ([`ByRecord`] for every size here: the tables use it past 64.)
+        let records = ByRecord::new(places.iter().map(|&i| used[usize::from(i)].table_offset_dwords / 8));
+        let at = |k: u32| records.first(k).map(|j| &used[usize::from(places[j])]);
+        let kinds = (0..n).map(|k| at(k).map(|u| u.kind)).collect();
+        let named = selected.iter().map(|&k| at(k).is_some()).collect();
+        let tabled = if n <= 64 { (0..n).collect() } else { records.records().collect() };
+        (kinds, named, tabled)
+    }
+
+    #[test]
+    fn records_find_the_entries_the_walks_found() {
+        let mut seed = 0x7ab1e5u64;
+        for round in 0..3000 {
+            let entries = 1 + random(&mut seed) as usize % 40;
+            let n = 1 + random(&mut seed) % if round % 3 == 0 { 5000 } else { 70 };
+            let (used, places) = table(&mut seed, entries, n);
+            let mut selected: Vec<u32> = (0..random(&mut seed) % 20).map(|_| random(&mut seed) % n).collect();
+            selected.sort_unstable();
+            selected.dedup();
+            assert_eq!(walks(&used, &places, n, &selected), walks_as_before(&used, &places, n, &selected), "round {round}");
+        }
+    }
+
+    /// Before and after, in release (`cargo test --release`): the walks over
+    /// one fresh table's records, at 8 and 32 entries (`Few<_, 32>`), for
+    /// tables of 128 and 4,096 records that a shader picking views by index
+    /// reaches across. (Up to 64 records the tables walk as before.)
+    #[test]
+    fn records_walk_faster_than_the_entries() {
+        let mut seed = 0xfa57u64;
+        for (entries, n) in [(8, 128), (8, 4096), (32, 4096)] {
+            let tables: Vec<_> = (0..64).map(|_| table(&mut seed, entries, n)).collect();
+            let selected: Vec<u32> = (0..n).step_by(97).collect();
+            let time = |f: &dyn Fn(&[UsedResource], &[u16]) -> usize| {
+                let began = std::time::Instant::now();
+                let mut sum = 0;
+                let rounds = if n > 1000 { 20 } else { 400 };
+                for _ in 0..rounds {
+                    for (used, places) in &tables {
+                        sum += std::hint::black_box(f(used, places));
+                    }
+                }
+                (began.elapsed().as_secs_f64() * 1e9 / (rounds * tables.len()) as f64, sum)
+            };
+            // (The same walks, counted as they go: nothing allocated.)
+            let (before, a) = time(&|used, places| {
+                let entries = || places.iter().map(|&i| &used[usize::from(i)]);
+                let kinds = (0..n).filter(|&k| entries().find(|u| u.table_offset_dwords / 8 == k).is_some_and(|u| u.kind == ResourceType::Srv)).count();
+                let named = selected.iter().filter(|&&k| entries().any(|u| u.table_offset_dwords / 8 == k)).count();
+                let tabled = (0..n).filter(|&k| n <= 64 || entries().any(|u| u.table_offset_dwords / 8 == k)).count();
+                kinds + named + tabled
+            });
+            let (after, b) = time(&|used, places| {
+                let records = ByRecord::new(places.iter().map(|&i| used[usize::from(i)].table_offset_dwords / 8));
+                let at = |k: u32| records.first(k).map(|j| &used[usize::from(places[j])]);
+                let kinds = (0..n).filter(|&k| at(k).is_some_and(|u| u.kind == ResourceType::Srv)).count();
+                let named = selected.iter().filter(|&&k| records.first(k).is_some()).count();
+                let tabled = if n <= 64 { n as usize } else { records.records().count() };
+                kinds + named + tabled
+            });
+            assert_eq!(a, b);
+            eprintln!("fresh table walks, {entries} entries over {n} records: before {before:.0} ns, after {after:.0} ns a table");
+        }
     }
 }

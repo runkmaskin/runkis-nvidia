@@ -88,6 +88,8 @@ mod cube_lod_tests;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
+#[cfg(all(test, windows))]
+mod lane_memory_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
@@ -102,6 +104,8 @@ mod threading;
 pub mod validator;
 #[cfg(all(test, windows))]
 mod probe_tests;
+#[cfg(all(test, windows))]
+mod salu_tests;
 #[cfg(all(test, windows))]
 mod size_tests;
 #[cfg(all(test, windows))]

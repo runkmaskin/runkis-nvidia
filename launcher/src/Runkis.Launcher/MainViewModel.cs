@@ -88,6 +88,7 @@ public sealed class MainViewModel : Observable, IDisposable
         ClearLog = new Command(() => LogLines.Clear());
         Go = new Command(p => Page = p as string ?? "Play");
         SavePreset = new Command(DoSavePreset, () => UsingPreset);
+        WarmUp = new Command(() => { warmUpNext = true; _ = StartAsync(RunMode.Precompile); }, () => CanStart);
 
         fast = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(250) };
         fast.Tick += (_, _) => FastTick();
@@ -346,7 +347,7 @@ public sealed class MainViewModel : Observable, IDisposable
             s.ProblemFound += p => Application.Current.Dispatcher.BeginInvoke(() => Problems.Add(p));
             s.StateChanged += st => Application.Current.Dispatcher.BeginInvoke(() => OnSessionState(s, st));
             session = s;
-            RunTitle = mode switch { RunMode.Warm => "Building the pipeline cache", RunMode.Precompile => "Translating shaders", _ => $"{GameName} · {SelectedStart?.Label}" };
+            RunTitle = mode switch { RunMode.Warm => "Warm-up: building the pipeline cache", RunMode.Precompile => "Warm-up: translating shaders", _ => $"{GameName} · {SelectedStart?.Label}" };
             s.Start();
             if (mode == RunMode.Play) Page = "Play";
         }
@@ -372,6 +373,17 @@ public sealed class MainViewModel : Observable, IDisposable
                 if (!ok && Problems.Count == 0)
                     Problems.Add(new Problem("exit", Severity.Error, "The run ended unexpectedly", s.ExitText ?? "", "See the log for the last lines before it ended.", ""));
                 foreach (var t in Tiles) t.Unknown("Not running");
+                // Warm up, second step: the pipelines earlier plays recorded, once the shaders are in the cache.
+                if (s.Plan.Mode == RunMode.Precompile && warmUpNext)
+                {
+                    warmUpNext = false;
+                    if (ok)
+                        Application.Current.Dispatcher.BeginInvoke(() => _ = StartAsync(RunMode.Warm));
+                    else
+                        Toast("Warm-up stopped: translating the shaders failed (see Logs).");
+                }
+                else if (s.Plan.Mode == RunMode.Warm && ok)
+                    Toast("Warm-up done: shaders and recorded pipelines are cached. Pipelines get recorded while you play, so warm up again after playing new places.");
                 break;
         }
         Raise(nameof(IsRunning));
@@ -638,6 +650,9 @@ public sealed class MainViewModel : Observable, IDisposable
     public Command ClearLog { get; }
     public Command Go { get; }
     public Command SavePreset { get; }
+    /// <summary>Translates every shader into the cache, then builds every recorded pipeline into the driver's cache.</summary>
+    public Command WarmUp { get; }
+    private bool warmUpNext;
 
     /// <summary>True when the window may close; asks what to do with a run still going.</summary>
     public bool ConfirmClose()
