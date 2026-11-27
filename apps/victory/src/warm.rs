@@ -68,6 +68,12 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         bad.len(),
         all.len()
     );
+    // Before the first play nothing is recorded and the folder may not exist yet: nothing to do is no error.
+    if all.is_empty() {
+        println!("nothing to make: pipelines are recorded while the title runs (VICTORY_PIPELINE_BOOK=1)");
+        return Ok(());
+    }
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let chunks: Vec<&[usize]> = all.chunks(AT_ONCE).collect();
     let next = AtomicUsize::new(0);
     let state = Mutex::new((Vec::<f64>::new(), 0usize, 0usize));
