@@ -272,6 +272,57 @@ pub(crate) fn asked(ranges: &[(usize, usize)]) {
     }
 }
 
+/// Whether the fallback's pages leave out the slots the marks told of in the
+/// same round (`VICTORY_PORT_DESCRIPTORS_APART=1`; off: the pages are looked
+/// at whole, as before). Read once.
+///
+/// Why: the fallback's pages are pages the watch said were written, which is
+/// where the marks are too. `descriptor::sync_heaps` hands the marked runs
+/// and the whole pages to its threads as parts, and a marked slot on such a
+/// page was in two parts: compared twice, and the record last seen of it
+/// written by two threads at once (the parts are meant to be apart). When
+/// the page's part came first, the slot was found new there, its mark
+/// already taken, and counted and said as a view record no store told of.
+/// With the switch each slot is in one part. What is made is the same.
+pub(crate) fn apart() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_DESCRIPTORS_APART").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The byte ranges of `pages` without those of `runs` (sorted, apart from
+/// one another, as [`take`] gives them once made byte ranges): the pieces
+/// left, in the order of `pages`, empty ones left out. A piece begins and ends
+/// where a page or a run does, so it holds whole records when they do.
+pub(crate) fn outside(runs: &[(usize, usize)], pages: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut out = Vec::with_capacity(pages.len());
+    for &(from, to) in pages {
+        let mut at = from;
+        // The first run that ends after the page begins.
+        let first = runs.partition_point(|&(_, end)| end <= from);
+        for &(run_from, run_to) in &runs[first..] {
+            if run_from >= to {
+                break;
+            }
+            if run_from > at {
+                out.push((at, run_from));
+            }
+            at = at.max(run_to);
+        }
+        if at < to {
+            out.push((at, to));
+        }
+    }
+    let kept: usize = out.iter().map(|&(a, b)| b - a).sum();
+    let whole: usize = pages.iter().map(|&(a, b)| b.saturating_sub(a)).sum();
+    APART[0].fetch_add(whole.saturating_sub(kept) as u64, Relaxed);
+    APART[1].fetch_add(out.len() as u64, Relaxed);
+    out
+}
+
+/// Since the last line, with [`apart`]: bytes of the fallback's pages left
+/// out (marked in the same round), pieces the pages were cut into.
+static APART: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// The pages to look at whole this frame (once a frame; none after).
 pub(crate) fn to_check(frame: u64) -> Vec<usize> {
     let mut f = FALLBACK.lock().unwrap_or_else(|e| e.into_inner());
@@ -469,6 +520,14 @@ pub(crate) fn line(frames: f64) {
         MISSED_ALL.load(Relaxed),
         if writers.is_empty() { "none".into() } else { writers }
     );
+    if apart() {
+        let [left_out, pieces] = [0, 1].map(|i| APART[i].swap(0, Relaxed) as f64 / frames);
+        tracing::info!(
+            "renderer port 2's fallback pages without the slots told in the same round (VICTORY_PORT_DESCRIPTORS_APART=1) per frame: {:.0} slots left out, the pages in {:.1} pieces",
+            left_out / 32.0,
+            pieces
+        );
+    }
 }
 
 #[cfg(test)]
@@ -515,5 +574,253 @@ mod tests {
         mark(start + 5 * 32);
         assert!(take(start).is_none());
         assert_eq!(MARKS.len.load(Relaxed), 0);
+    }
+
+    /// A fixed-seed source of numbers (xorshift64*).
+    struct Seeded(u64);
+
+    impl Seeded {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    const STEP: usize = 32;
+    const PAGE: usize = crate::watch::PAGE;
+    const SLOTS_A_PAGE: usize = PAGE / STEP;
+    const HEAP: usize = 0x2000_0000;
+
+    /// A round's input: the heap's slots as the title has them now, the runs
+    /// taken from the marks, the fallback's pages.
+    struct Round {
+        title: Vec<[u8; STEP]>,
+        runs: Vec<(usize, usize)>,
+        pages: Vec<(usize, usize)>,
+    }
+
+    /// `rounds` rounds over a heap of `slots` slots: `marked` slots written and
+    /// marked a round, in runs of 1 to 32, and on the fallback's `pages`
+    /// pages; `unmarked` more written that no mark tells of, on those pages.
+    /// With `clustered` the marked runs lie on the pages, as the title's do
+    /// (they are the pages the watch said were written).
+    fn rounds(seed: u64, slots: usize, rounds: usize, marked: usize, pages: usize, unmarked: usize, clustered: bool) -> Vec<Round> {
+        let mut rng = Seeded(seed);
+        let mut title = vec![[0u8; STEP]; slots];
+        let page_count = slots / SLOTS_A_PAGE;
+        (0..rounds)
+            .map(|r| {
+                let chosen: Vec<usize> = {
+                    let mut p: Vec<usize> = Vec::new();
+                    while p.len() < pages.min(page_count) {
+                        let n = rng.below(page_count as u64) as usize;
+                        if !p.contains(&n) {
+                            p.push(n);
+                        }
+                    }
+                    p
+                };
+                let mut is_marked = vec![false; slots];
+                let mut left = marked;
+                while left > 0 {
+                    let len = (1 + rng.below(32) as usize).min(left);
+                    let first = if clustered {
+                        chosen[rng.below(chosen.len() as u64) as usize] * SLOTS_A_PAGE + rng.below(SLOTS_A_PAGE as u64) as usize
+                    } else {
+                        rng.below(slots as u64) as usize
+                    }
+                    .min(slots - len);
+                    for s in first..first + len {
+                        is_marked[s] = true;
+                        let mut record = [0u8; STEP];
+                        record[..4].copy_from_slice(&crate::descriptor::VIEW_TAG.to_le_bytes());
+                        record[4..12].copy_from_slice(&rng.next().to_le_bytes());
+                        record[12] = r as u8;
+                        title[s] = record;
+                    }
+                    left -= len;
+                }
+                for _ in 0..unmarked {
+                    let s = chosen[rng.below(chosen.len() as u64) as usize] * SLOTS_A_PAGE + rng.below(SLOTS_A_PAGE as u64) as usize;
+                    if !is_marked[s] {
+                        title[s][16..24].copy_from_slice(&rng.next().to_le_bytes());
+                    }
+                }
+                // As `take` gives them: sorted runs of marked slots, as bytes.
+                let mut runs: Vec<(usize, usize)> = Vec::new();
+                for (s, _) in is_marked.iter().enumerate().filter(|(_, m)| **m) {
+                    let at = HEAP + s * STEP;
+                    match runs.last_mut() {
+                        Some((_, end)) if *end == at => *end += STEP,
+                        _ => runs.push((at, at + STEP)),
+                    }
+                }
+                let pages = chosen.iter().map(|&p| (HEAP + p * PAGE, HEAP + (p + 1) * PAGE)).collect();
+                Round { title: title.clone(), runs, pages }
+            })
+            .collect()
+    }
+
+    /// What one round of `descriptor::sync_heaps` does with its parts, one part
+    /// after another in `order`: the slots whose first byte lies in a part and
+    /// that lie whole in it are compared with the record last seen (`seen`),
+    /// a new one is made and is seen from then on, and one found new by a
+    /// fallback part is counted as no mark's (their marks are taken). Returns
+    /// the slots made, and those counted missed.
+    fn sync_round(title: &[[u8; STEP]], seen: &mut [[u8; STEP]], parts: &[(usize, usize, bool)], order: &[usize]) -> (Vec<u32>, u64, u64) {
+        let (mut made, mut missed, mut looked) = (Vec::new(), 0u64, 0u64);
+        for &p in order {
+            let (from, to, check) = parts[p];
+            // `descriptor::sync_heaps`: `first`, `lead`, and the records' count.
+            let first = (from - HEAP).div_ceil(STEP);
+            let lead = HEAP + first * STEP;
+            let count = (to.saturating_sub(lead) / STEP).min(title.len() - first.min(title.len()));
+            looked += count as u64;
+            for s in first..first + count {
+                if title[s] != seen[s] {
+                    seen[s] = title[s];
+                    made.push(s as u32);
+                    if check {
+                        missed += 1;
+                    }
+                }
+            }
+        }
+        made.sort_unstable();
+        made.dedup();
+        (made, missed, looked)
+    }
+
+    /// The parts of a round as `descriptor::sync_heaps` makes them: the runs,
+    /// then the fallback's pages, whole (`apart` off) or without the runs.
+    fn parts_of(round: &Round, apart: bool) -> Vec<(usize, usize, bool)> {
+        let mut parts: Vec<(usize, usize, bool)> = round.runs.iter().map(|&(a, b)| (a, b, false)).collect();
+        if apart {
+            parts.extend(outside(&round.runs, &round.pages).into_iter().map(|(a, b)| (a, b, true)));
+        } else {
+            parts.extend(round.pages.iter().map(|&(a, b)| (a, b, true)));
+        }
+        parts
+    }
+
+    /// The pieces are apart from one another and from the runs, slot-aligned,
+    /// inside their pages, and with the runs they hold every byte of the pages.
+    #[test]
+    fn pages_without_runs_hold_the_rest_of_the_pages() {
+        assert_eq!(outside(&[], &[(0, 64)]), [(0, 64)]);
+        assert_eq!(outside(&[(0, 64)], &[(0, 64)]), []);
+        assert_eq!(outside(&[(32, 96), (128, 160), (300, 320)], &[(64, 192)]), [(96, 128), (160, 192)]);
+        assert_eq!(outside(&[(0, 32), (224, 256)], &[(64, 128), (192, 256)]), [(64, 128), (192, 224)]);
+        for seed in 1..=8u64 {
+            for round in rounds(seed, 64 * SLOTS_A_PAGE, 3, 5_000, 16, 200, seed % 2 == 0) {
+                let pieces = outside(&round.runs, &round.pages);
+                let mut covered = vec![0u8; 64 * SLOTS_A_PAGE];
+                for &(a, b) in pieces.iter().chain(&round.runs) {
+                    assert!(a < b && (a - HEAP).is_multiple_of(STEP) && (b - HEAP).is_multiple_of(STEP));
+                    for s in (a - HEAP) / STEP..(b - HEAP) / STEP {
+                        covered[s] += 1;
+                    }
+                }
+                for &(a, b) in &pieces {
+                    assert!(round.pages.iter().any(|&(pa, pb)| pa <= a && b <= pb));
+                }
+                assert!(covered.iter().all(|&n| n <= 1), "seed {seed}: a slot in two parts");
+                for &(a, b) in &round.pages {
+                    assert!(covered[(a - HEAP) / STEP..(b - HEAP) / STEP].iter().all(|&n| n == 1), "seed {seed}: a slot of a page in no part");
+                }
+            }
+        }
+    }
+
+    /// With the switch the same slots are made, the records last seen come out
+    /// the same, and only the true misses are counted; whole pages (the old
+    /// way, as reference) count a marked slot as missed when its page's part
+    /// is done before its run's, and look at it twice.
+    #[test]
+    fn pages_without_runs_make_what_whole_pages_make() {
+        for (seed, clustered) in (1..=12u64).map(|s| (s, s % 3 != 0)) {
+            let slots = 128 * SLOTS_A_PAGE;
+            let all = rounds(seed, slots, 6, 8_000, 16, 120, clustered);
+            let mut seen = [vec![[0u8; STEP]; slots], vec![[0u8; STEP]; slots], vec![[0u8; STEP]; slots]];
+            for round in &all {
+                let old = parts_of(round, false);
+                let new = parts_of(round, true);
+                // Old, runs first (the order of the parts), and pages first.
+                let in_order: Vec<usize> = (0..old.len()).collect();
+                let pages_first: Vec<usize> = (round.runs.len()..old.len()).chain(0..round.runs.len()).collect();
+                let (made_a, missed_a, looked_a) = sync_round(&round.title, &mut seen[0], &old, &in_order);
+                let (made_b, missed_b, _) = sync_round(&round.title, &mut seen[1], &old, &pages_first);
+                let new_order: Vec<usize> = (round.runs.len()..new.len()).chain(0..round.runs.len()).collect();
+                let (made_c, missed_c, looked_c) = sync_round(&round.title, &mut seen[2], &new, &new_order);
+                assert_eq!(made_a, made_c, "seed {seed}: other slots made");
+                assert_eq!(made_b, made_c, "seed {seed}: other slots made");
+                assert!(seen[0] == seen[2] && seen[1] == seen[2], "seed {seed}: other records last seen");
+                // Runs first, whole pages count only the true misses too.
+                assert_eq!(missed_c, missed_a, "seed {seed}");
+                assert!(missed_b >= missed_c);
+                assert!(looked_c <= looked_a);
+                if clustered {
+                    assert!(missed_b > missed_c, "seed {seed}: no false miss in the reference");
+                    assert!(looked_c < looked_a);
+                }
+            }
+        }
+    }
+
+    /// The cut and the compares it saves, at the figures of `docs/findings.md`:
+    /// ~40,000 slots mirrored a frame, 16 fallback pages, a heap of 2^20 slots
+    /// (32 MiB). `cargo test --release -p victory-gpu --lib -- --ignored --nocapture bench_pages_without_runs`.
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn bench_pages_without_runs() {
+        use std::hint::black_box;
+        let slots = 1 << 20;
+        for clustered in [false, true] {
+            let all = rounds(0x5eed, slots, 4, 40_000, 16, 250, clustered);
+            let mut seen = [vec![[0u8; STEP]; slots], vec![[0u8; STEP]; slots]];
+            let (mut cut_ns, mut old_ns, mut new_ns, mut looked) = (Vec::new(), Vec::new(), Vec::new(), [0u64; 2]);
+            let mut missed = [0u64; 2];
+            for round in &all {
+                let t = std::time::Instant::now();
+                for _ in 0..100 {
+                    black_box(outside(black_box(&round.runs), black_box(&round.pages)));
+                }
+                cut_ns.push(t.elapsed().as_nanos() as f64 / 100.0);
+                let old = parts_of(round, false);
+                let new = parts_of(round, true);
+                let pages_first = |parts: &[(usize, usize, bool)]| -> Vec<usize> { (round.runs.len()..parts.len()).chain(0..round.runs.len()).collect() };
+                let t = std::time::Instant::now();
+                let (_, m, l) = sync_round(&round.title, &mut seen[0], &old, &pages_first(&old));
+                old_ns.push(t.elapsed().as_nanos() as f64);
+                missed[0] += m;
+                looked[0] += l;
+                let t = std::time::Instant::now();
+                let (_, m, l) = sync_round(&round.title, &mut seen[1], &new, &pages_first(&new));
+                new_ns.push(t.elapsed().as_nanos() as f64);
+                missed[1] += m;
+                looked[1] += l;
+            }
+            let median = |v: &mut Vec<f64>| {
+                v.sort_by(f64::total_cmp);
+                v[v.len() / 2]
+            };
+            let n = all.len() as f64;
+            println!(
+                "{}: cut {:.1} us a round; slots looked at {:.0} whole pages, {:.0} without the runs; compares {:.1} us against {:.1} us (one thread); counted missed {:.0} against {:.0} a round",
+                if clustered { "runs on the pages" } else { "runs anywhere" },
+                median(&mut cut_ns) / 1e3,
+                looked[0] as f64 / n,
+                looked[1] as f64 / n,
+                median(&mut old_ns) / 1e3,
+                median(&mut new_ns) / 1e3,
+                missed[0] as f64 / n,
+                missed[1] as f64 / n,
+            );
+        }
     }
 }

@@ -492,6 +492,9 @@ pub(crate) fn sync_heaps() {
         // fallback of renderer port #2 looks at whole.
         let mut parts: Vec<(usize, usize, bool)> = Vec::new();
         let port = crate::port_descriptors::adopted(start);
+        // With `VICTORY_PORT_DESCRIPTORS_APART`: the fallback's pages cut into
+        // pieces, and pages, for the count of pages looked at.
+        let mut recount: Option<(u64, u64)> = None;
         if port {
             // Renderer port #2: the slots the title's patched stores and our
             // calls marked, in place of the changed pages; and a few of the
@@ -510,8 +513,21 @@ pub(crate) fn sync_heaps() {
                 spent[0] += since(began);
                 crate::port_descriptors::asked(&taken);
             }
-            for page in crate::port_descriptors::to_check(frame) {
-                parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
+            if crate::port_descriptors::apart() {
+                // Without the slots just taken: each slot in one part
+                // (`port_descriptors::apart`).
+                let pages: Vec<(usize, usize)> = crate::port_descriptors::to_check(frame)
+                    .into_iter()
+                    .map(|page| (page.max(start as usize), (page + crate::watch::PAGE).min(end as usize)))
+                    .collect();
+                let runs: Vec<(usize, usize)> = parts.iter().map(|&(from, to, _)| (from, to)).collect();
+                let pieces = crate::port_descriptors::outside(&runs, &pages);
+                recount = Some((pieces.len() as u64, pages.len() as u64));
+                parts.extend(pieces.into_iter().map(|(from, to)| (from, to, true)));
+            } else {
+                for page in crate::port_descriptors::to_check(frame) {
+                    parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
+                }
             }
         } else {
             let began = std::time::Instant::now();
@@ -696,6 +712,10 @@ pub(crate) fn sync_heaps() {
             for (ns, n) in job_ns.iter_mut().zip(part.ns) {
                 *ns += n;
             }
+        }
+        if let Some((pieces, whole)) = recount {
+            // A piece of a page counted as a page: the pages are counted.
+            pages = pages.saturating_sub(pieces) + whole;
         }
         spent[1] += since(began);
         let began = std::time::Instant::now();
