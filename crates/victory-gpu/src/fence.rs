@@ -37,6 +37,21 @@ struct Fence {
     flags: u32,
     /// Events to set once the value reaches theirs (handles as integers).
     waiters: Mutex<Vec<(u64, usize)>>,
+    /// Diagnostics: when the title first asked for the value or its address
+    /// since the fence was last set (crate::host's microseconds; 0: not
+    /// since). A title that spins on a fence asks at every turn.
+    #[cfg(feature = "diagnostics")]
+    asked: AtomicU64,
+}
+
+/// Diagnostics: the title asks `fence` for its value or its address.
+#[cfg(feature = "diagnostics")]
+#[inline]
+fn asking(fence: &Fence) {
+    // (A load first: a spinning title asks millions of times.)
+    if fence.asked.load(Ordering::Relaxed) == 0 {
+        let _ = fence.asked.compare_exchange(0, crate::host::tell_clock(), Ordering::Relaxed, Ordering::Relaxed);
+    }
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -57,6 +72,8 @@ pub(crate) extern "system" fn create(
         value: AtomicU64::new(initial),
         flags,
         waiters: Mutex::new(Vec::new()),
+        #[cfg(feature = "diagnostics")]
+        asked: AtomicU64::new(0),
     });
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
 }
@@ -90,6 +107,8 @@ extern "system" fn completed_called(this: This) -> u64 {
     let value = completed(this);
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::polled(this as usize, value);
+    #[cfg(feature = "diagnostics")]
+    asking(fence(this));
     value
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
@@ -126,9 +145,21 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     waiters.push((value, event as usize));
     S_OK
 }
+
+/// Diagnostics: [`set`], and when the title first asked the fence since it
+/// was last set (0: it did not).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn set_asked(this: This, value: u64) -> u64 {
+    let asked = fence(this).asked.swap(0, Ordering::Relaxed);
+    set(this, value);
+    asked
+}
+
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
+    #[cfg(feature = "diagnostics")]
+    fence.asked.store(0, Ordering::Relaxed);
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::told("a fence set", this as usize, value);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
@@ -155,6 +186,8 @@ extern "system" fn creation_flags(this: This) -> u32 {
 }
 /// Where the value lives (GPU addresses are CPU addresses).
 extern "system" fn gpu_address(this: This) -> u64 {
+    #[cfg(feature = "diagnostics")]
+    asking(fence(this));
     (&raw const fence(this).value) as u64
 }
 

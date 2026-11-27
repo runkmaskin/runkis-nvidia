@@ -961,6 +961,133 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
+    /// The copy of flagged pieces inside the flight (`crate::host`'s
+    /// `in_flight`), on the software adapter, behind the compare as the
+    /// relay records it: every piece the compare flags gets a place in the
+    /// room, and its bytes are there, as the copy held them, whatever the
+    /// copy's skew; a piece not flagged gets none; a room too small gives
+    /// places to as many as it has and none to the rest; the counter starts
+    /// from 0 at every pass; the places wrap around the ring.
+    #[test]
+    fn warp_card_snapshot_copies_what_the_compare_flagged() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let snap = compile_cs(&warp.device, crate::host::CARD_SNAP).expect("the card snapshot must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const SLOTS: u64 = 3;
+        let slot = crate::host::SNAP_SLOT as usize;
+        let all = [D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+            },
+            ..Default::default()
+        }];
+        for skew in [0u32, 4096 + 48] {
+            let pieces: u32 = if skew == 0 { 4 } else { 5 };
+            let size = PIECE * 4;
+            let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+            let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * 8);
+            let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+            let (_places, places_ptr, places_gpu) = warp.shared_buffer(64);
+            let (_ring, ring_ptr, ring_gpu) = warp.shared_buffer(slot as u64 * SLOTS);
+            let counters = warp.default_uav(4096 * 4);
+            let mut content: Vec<u8> = (0..size).map(|i| (i * 131 + i / 977 + skew as usize) as u8).collect();
+            // SAFETY: the mapping holds `size` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+            let compare_pass = |warp: &mut WarpHarness, mode: u32| {
+                // SAFETY: our open list, live buffers, the compare's own root
+                // signature.
+                unsafe {
+                    warp.list.SetComputeRootSignature(&compare.root);
+                    warp.list.SetPipelineState(&compare.pso);
+                    let constants = [0u32, skew, size as u32, pieces, 0, mode];
+                    warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                    warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                    warp.list.Dispatch(pieces, 1, 1);
+                }
+                warp.submit_and_wait();
+            };
+            // The places a pass gives (room `room` from ring place `base`).
+            let snap_pass = |warp: &mut WarpHarness, base: u32, room: u32| -> Vec<u32> {
+                // SAFETY: as above, with the snapshot's own root signature;
+                // the mappings hold what is read.
+                unsafe {
+                    for p in 0..pieces as usize {
+                        places_ptr.cast::<u32>().add(p).write_volatile(77);
+                    }
+                    warp.list.SetComputeRootSignature(&snap.root);
+                    warp.list.SetPipelineState(&snap.pso);
+                    warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(2, differs_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(3, places_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(4, ring_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(5, counters.GetGPUVirtualAddress());
+                    let zero = [0u32, 0, 0, 0, 0, 0, 0, 8, SLOTS as u32, 0];
+                    warp.list.SetComputeRoot32BitConstants(0, 10, zero.as_ptr().cast(), 0);
+                    warp.list.Dispatch(1, 1, 1);
+                    warp.list.ResourceBarrier(&all);
+                    let constants = [0u32, skew, size as u32, pieces, 0, base, room, 8, SLOTS as u32, 1];
+                    warp.list.SetComputeRoot32BitConstants(0, 10, constants.as_ptr().cast(), 0);
+                    warp.list.Dispatch(pieces, 1, 1);
+                }
+                warp.submit_and_wait();
+                // SAFETY: as above.
+                (0..pieces as usize).map(|p| unsafe { places_ptr.cast::<u32>().add(p).read_volatile() }).collect()
+            };
+            compare_pass(&mut warp, 0);
+            // Bytes change in pieces 1 and 3 (and with the skew, the last one's).
+            let changed: Vec<u32> = if skew == 0 { vec![1, 3] } else { vec![1, 3, 4] };
+            for &p in &changed {
+                let at = (p as usize * PIECE).saturating_sub(skew as usize).min(size - 1) + 7;
+                content[at] ^= 0x5a;
+                // SAFETY: inside the mapping.
+                unsafe { now_ptr.add(at).write_volatile(content[at]) };
+            }
+            compare_pass(&mut warp, 2);
+            // Piece `p`'s bytes in the ring where place `place` of a room from
+            // `base` is, against the copy.
+            let holds = |p: u32, base: u32, place: u32| -> bool {
+                let lo = ((p as usize * PIECE) as isize - skew as isize).max(0) as usize;
+                let hi = ((p as usize + 1) * PIECE - skew as usize).min(size);
+                let at = ((base + place - 1) as u64 % SLOTS) as usize * slot;
+                let begins = crate::host::snap_place_begins(p, skew);
+                // SAFETY: inside the ring's mapping, which the card wrote.
+                let got = unsafe { std::slice::from_raw_parts(ring_ptr.add(at + lo - begins).cast_const(), hi - lo) };
+                got == &content[lo..hi]
+            };
+            // SAFETY: inside the mapping, written by the compare.
+            let flags: Vec<u32> = (0..pieces as usize).map(|p| unsafe { differs_ptr.cast::<u32>().add(p).read_volatile() } & 1).collect();
+            for p in 0..pieces {
+                assert_eq!(flags[p as usize] == 1, changed.contains(&p), "skew {skew} piece {p}");
+            }
+            // Room for all, from place 2 of 3: the places wrap.
+            for _ in 0..2 {
+                let places = snap_pass(&mut warp, 2, 3);
+                let mut given: Vec<u32> = places.iter().copied().filter(|&q| q != 0).collect();
+                given.sort_unstable();
+                assert_eq!(given, (1..=changed.len() as u32).collect::<Vec<_>>(), "skew {skew}: {places:?}");
+                for p in 0..pieces {
+                    let q = places[p as usize];
+                    assert_eq!(q != 0, changed.contains(&p), "skew {skew} piece {p}");
+                    if q != 0 {
+                        assert!(holds(p, 2, q), "skew {skew}: piece {p}'s bytes at place {q}");
+                    }
+                }
+            }
+            // A room of one: one place given, the others none.
+            let places = snap_pass(&mut warp, 0, 1);
+            assert_eq!(places.iter().filter(|&&q| q == 1).count(), 1, "{places:?}");
+            assert_eq!(places.iter().filter(|&&q| q != 0 && q != 1).count(), 0, "{places:?}");
+            let p = places.iter().position(|&q| q == 1).unwrap() as u32;
+            assert!(holds(p, 0, 1));
+        }
+    }
+
     /// What the passes over copies in the card's memory cost on the card
     /// (ignored: a measurement): rounds of a few passes of some pieces and a
     /// wait, as a frame has them. `VICTORY_BENCH_CS=<file>` times another

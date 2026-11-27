@@ -2210,6 +2210,8 @@ struct CardWork {
     taken: u32,
     /// Plans made and not done with (`Host::card_done`).
     out: u32,
+    /// With `in_flight`: the copy of flagged pieces inside the flight.
+    snap: Option<in_flight::Snap>,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and persistent mappings, used only
@@ -2422,6 +2424,8 @@ struct CardPlan {
     sends: Option<send::Memory>,
     /// With [`upq`]: the copy list and buffer what went up came through.
     up: Option<upq::Slot>,
+    /// With `in_flight`: its room in the ring its flagged pieces went to.
+    snap: Option<in_flight::Room>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -2768,6 +2772,143 @@ fn fetch_parts_of(jobs: &[std::ops::Range<usize>], pieces: &[(usize, usize)], mo
     parts
 }
 
+/// Whether the thread that lands flights tells the title what follows each
+/// segment of a landing (the flights up to the next tells, as
+/// [`segment_end`] cuts them) as soon as that segment is merged, while the
+/// rest of the landing is still merged (`VICTORY_MERGE_SPREAD=1`; off by
+/// default: everything is merged, then everything told, as before).
+///
+/// A landing of four flights with a fence behind the first told that fence
+/// only after the fetch and merge of all four. [`land_segments`] cuts such a
+/// landing in parts, at the cost of a fetch and its wait for each. Here the
+/// fetch stays one (in parts with [`fetch_parts`], cut where segments end),
+/// its pieces go segment by segment, and the merge of a segment's pieces,
+/// then of its copies in the PC's memory (what earlier segments did not look
+/// through), then its ranges done with and its tells, come before the next
+/// segment's merge.
+///
+/// Why it changes no order: the title is told what follows a segment when
+/// every flight ahead of it is in title memory, as with
+/// [`land_segments`]; the bytes a segment merges were fetched with the rest,
+/// after the card had run every flight of the landing, as before. Later
+/// segments' pieces are merged after the title may have been told and gone
+/// on: as with [`land_segments`], the merge stores only what shaders changed
+/// and leaves bytes the title sent up since out
+/// (`Shadow::card_merge_relay`). Not with the check of torn pieces
+/// (`VICTORY_FETCH_CHECK`), nor without `crate::land`.
+fn merge_spread() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_SPREAD").is_some_and(|v| v == "1") && crate::land::on() && !torn::on())
+}
+
+/// With [`relay`]: sends up to `after` are of no use to a merge still to
+/// come ([`crate::shadow::relay_fetched`]); with `in_flight`, at most up to
+/// `behind`, the sends the landed flights ran behind: a flight still in the
+/// air may have run behind fewer than `after`, and its copy from inside the
+/// flight is merged after those sends.
+fn relay_fetched_to(after: u64, behind: u64) {
+    crate::shadow::relay_fetched(if in_flight::on() { after.min(behind) } else { after });
+}
+
+/// [`merge_spread`] for [`Host::relay_card_back`]: where each segment's
+/// plans end (counts of the landing's plans, in order), and what to call
+/// when a segment's pieces are merged.
+struct Spread<'a> {
+    plan_ends: &'a [usize],
+    merged: &'a mut dyn FnMut(usize),
+}
+
+/// Diagnostics: where a landing's tells stand ([`tells`]): its flights, the
+/// flights passed, and the value signalled behind the last one passed.
+#[cfg(feature = "diagnostics")]
+struct TellPlace {
+    flights: u32,
+    behind: u32,
+    ahead: u64,
+}
+
+#[cfg(feature = "diagnostics")]
+impl TellPlace {
+    fn of(items: &[Late]) -> TellPlace {
+        let flights = items.iter().filter(|l| matches!(l, Late::Run(_))).count() as u32;
+        TellPlace { flights, behind: 0, ahead: 0 }
+    }
+
+    fn passed(&mut self, fence: u64) {
+        self.behind += 1;
+        self.ahead = fence;
+    }
+
+    /// A tell: of `fence` (0: a bottom-of-pipe write), which the title
+    /// first asked at `asked`.
+    fn told(&self, fence: usize, asked: u64) {
+        tells::told(self.ahead, fence, asked, self.behind, self.flights);
+    }
+}
+
+/// The line's things (`Some`: a flight) cut into [`segment_end`]'s
+/// segments, one after the other: where each ends.
+fn segment_ends(line: &[Option<u64>]) -> Vec<usize> {
+    let mut ends = Vec::new();
+    let mut at = 0;
+    while at < line.len() {
+        at += segment_end(&line[at..], line.len() - at);
+        ends.push(at);
+    }
+    ends
+}
+
+/// [`merge_spread`] with [`fetch_parts`]: `titles` (title address, bytes),
+/// whose segments end at `ends`, as jobs (each in one segment, as
+/// `crate::land::jobs` cuts a segment) and parts (ranges of jobs, each in
+/// one segment, a segment in about its share of `most` parts by bytes, at
+/// least one). A segment with no pieces has no job and no part.
+fn segment_parts(titles: &[(usize, usize)], ends: &[usize], most: usize) -> (Vec<std::ops::Range<usize>>, Vec<std::ops::Range<usize>>) {
+    let total: usize = titles.iter().map(|t| t.1).sum::<usize>().max(1);
+    let (mut jobs, mut parts) = (Vec::new(), Vec::new());
+    let mut from = 0;
+    for &to in ends {
+        let to = to.min(titles.len());
+        if to <= from {
+            continue;
+        }
+        let seg = &titles[from..to];
+        let seg_jobs: Vec<std::ops::Range<usize>> = crate::land::jobs(seg);
+        let bytes: usize = seg.iter().map(|t| t.1).sum();
+        let share = (most * bytes).div_ceil(total).max(1);
+        let first = jobs.len();
+        // `fetch_parts_of` takes pieces as (anything, bytes).
+        parts.extend(fetch_parts_of(&seg_jobs, seg, share).into_iter().map(|p| p.start + first..p.end + first));
+        jobs.extend(seg_jobs.into_iter().map(|j| j.start + from..j.end + from));
+        from = to;
+    }
+    (jobs, parts)
+}
+
+/// `ranges` without what `minus` holds (both in order and joined).
+fn ranges_minus(ranges: &[(usize, usize)], minus: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for &(mut from, to) in ranges {
+        let mut i = minus.partition_point(|m| m.1 <= from);
+        while from < to {
+            match minus.get(i) {
+                Some(&(a, b)) if a < to => {
+                    if a > from {
+                        out.push((from, a));
+                    }
+                    from = from.max(b);
+                    i += 1;
+                }
+                _ => {
+                    out.push((from, to));
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Told when something joins [`LINE`], for the thread that lands flights
 /// ([`relay`]); [`LINE_MOVED`] stays the word for the thread that looks at
 /// what queues hold.
@@ -2945,6 +3086,333 @@ mod relay_tests {
                     assert_eq!(ends[0], ends[1], "{line:?} pace {pace}");
                 }
             }
+        }
+    }
+
+    /// [`super::segment_ends`] cuts a landing as [`segment_end`] does, one
+    /// segment after the other: every line of up to 8 things.
+    #[test]
+    fn a_landing_is_cut_into_segment_ends() {
+        use super::segment_ends;
+        for len in 0..=8usize {
+            for bits in 0..1u32 << len {
+                let line: Vec<Option<u64>> = (0..len).map(|i| (bits >> i & 1 == 1).then_some(i as u64 + 1)).collect();
+                let ends = segment_ends(&line);
+                let mut at = 0;
+                for &end in &ends {
+                    assert_eq!(end, at + segment_end(&line[at..], len - at), "{line:?}");
+                    // Each segment but the first begins with a flight.
+                    assert!(at == 0 || line[at].is_some(), "{line:?} {ends:?}");
+                    at = end;
+                }
+                assert_eq!(at, len);
+            }
+        }
+    }
+
+    /// A model of the relay with [`super::merge_spread`] against the old
+    /// landing: the flight at place i of the line writes value i + 1 to title
+    /// address i % 3 on the card (and declares only that); the card runs 0-2
+    /// flights between two looks of the relay, by the pace, and runs on while
+    /// a landing merges. Old: one fetch when the landing begins, everything
+    /// merged, then every tell. Spread: the same one fetch; then segment by
+    /// segment its flights' addresses merged and its tells told, the card
+    /// running on between them. A merge stores a fetched value only where it
+    /// differs from what the copy's CPU side held (as `card_merge_relay`
+    /// does); after every tell the title writes address 3, which no flight
+    /// declares, and it must stay. Every line of up to 8 things, 9 paces: at
+    /// every tell every flight ahead of it is in title memory; tells come in
+    /// the line's order, the same with both; both end with the same memory.
+    #[test]
+    fn spread_tells_never_let_a_stale_byte_be_read() {
+        use super::segment_ends;
+        for len in 1..=8usize {
+            for bits in 0..1u32 << len {
+                let line: Vec<Option<u64>> = (0..len).map(|i| (bits >> i & 1 == 1).then_some(i as u64 + 1)).collect();
+                let flights: Vec<usize> = (0..len).filter(|&i| line[i].is_some()).collect();
+                for pace in 0..9usize {
+                    let mut ends_of = Vec::new();
+                    for spread in [false, true] {
+                        let (mut title, mut cpu, mut card, mut told) = ([0, 0, 0, 1000u64], [0u64; 4], [0u64; 4], Vec::new());
+                        let (mut ran, mut next, mut look) = (0usize, 0usize, 0usize);
+                        let run = |card: &mut [u64; 4], ran: &mut usize, look: &mut usize| {
+                            let more = (pace >> (*look % 3)) % 3;
+                            *look += 1;
+                            for _ in 0..more.max(usize::from(*look > 4 * len)) {
+                                if let Some(&i) = flights.get(*ran) {
+                                    card[i % 3] = i as u64 + 1;
+                                    *ran += 1;
+                                }
+                            }
+                        };
+                        let merge = |title: &mut [u64; 4], cpu: &mut [u64; 4], fetched: &[u64; 4], at: usize| {
+                            if fetched[at] != cpu[at] {
+                                title[at] = fetched[at];
+                                cpu[at] = fetched[at];
+                            }
+                        };
+                        let mut stamp = 1000u64;
+                        while next < len {
+                            run(&mut card, &mut ran, &mut look);
+                            let completed = ran.checked_sub(1).map_or(0, |r| flights[r] as u64 + 1);
+                            let n = landable(&line[next..], completed);
+                            if n == 0 {
+                                continue;
+                            }
+                            let fetched = card;
+                            let items = next..next + n;
+                            let cuts = if spread { segment_ends(&line[items.clone()]) } else { vec![n] };
+                            let mut from = 0;
+                            for end in cuts {
+                                for i in next + from..next + end {
+                                    if line[i].is_some() {
+                                        merge(&mut title, &mut cpu, &fetched, i % 3);
+                                    }
+                                }
+                                if !spread {
+                                    // (The old landing merges everything first.)
+                                    assert_eq!(end, n);
+                                }
+                                for i in next + from..next + end {
+                                    if line[i].is_none() {
+                                        for &j in flights.iter().filter(|&&j| j < i) {
+                                            assert!(title[j % 3] > j as u64, "stale: {line:?} tell {i} flight {j} pace {pace} spread {spread}");
+                                        }
+                                        told.push(i);
+                                        // The title goes on at once.
+                                        stamp += 1;
+                                        title[3] = stamp;
+                                    }
+                                }
+                                // The card runs on while the next segment merges.
+                                run(&mut card, &mut ran, &mut look);
+                                from = end;
+                            }
+                            next += n;
+                        }
+                        assert!(told.windows(2).all(|w| w[0] < w[1]));
+                        assert_eq!(title[3], 1000 + told.len() as u64, "the title's own byte stays");
+                        ends_of.push((title, told));
+                    }
+                    assert_eq!(ends_of[0], ends_of[1], "{line:?} pace {pace}");
+                }
+            }
+        }
+    }
+
+    /// A model of the relay with the copy inside the flight
+    /// (`VICTORY_FETCH_IN_FLIGHT=1`) against the old fetch: the flight at
+    /// place i of the line writes value i + 1 to piece i % 3 and flags it;
+    /// the card runs 0-2 flights between two looks of the relay (48
+    /// fixed-seed schedules a line), the submitting thread is up to two
+    /// flights ahead of it. Old: a landing
+    /// fetches the card's pieces as they are then. In flight: each flight's
+    /// piece is copied when it ends; a landing takes each piece from the last
+    /// flight in it that flags it, unless the landing has no place for one
+    /// (some landings, by the pace: a room too small) or an old fetch sent
+    /// behind a later flight than that one brought the piece (`Newer`): then
+    /// the old fetch. A merge stores only what differs from the copy's CPU
+    /// side. Over every line of up to 8 things: at every tell
+    /// every flight ahead of it is in title memory, title memory never goes
+    /// back to an older value, and both end with the same memory and tells.
+    /// Without the `Newer` rule a piece goes back: the rule is needed.
+    #[test]
+    fn copies_inside_the_flight_never_let_a_stale_byte_be_read() {
+        let mut went_back_without_rule = false;
+        for rule in [true, false] {
+            for len in 1..=8usize {
+                for bits in 0..1u32 << len {
+                    let line: Vec<Option<u64>> = (0..len).map(|i| (bits >> i & 1 == 1).then_some(i as u64 + 1)).collect();
+                    let flights: Vec<usize> = (0..len).filter(|&i| line[i].is_some()).collect();
+                    for pace in 0..48u64 {
+                        let mut ends_of = Vec::new();
+                        for in_flight in [false, true] {
+                            let (mut title, mut cpu, mut card, mut told) = ([0u64; 3], [0u64; 3], [0u64; 3], Vec::new());
+                            // Per flight (by place), its piece as it ended.
+                            let mut snap = vec![0u64; len];
+                            // Old fetches: the fence of the last flight sent then, the pieces.
+                            let mut newer: Vec<(u64, Vec<usize>)> = Vec::new();
+                            let (mut ran, mut next, mut look) = (0usize, 0usize, 0usize);
+                            // The schedule: fixed-seed choices, the same for both settings.
+                            let mut seed = 0x9e37_79b9_7f4a_7c15u64 ^ (pace << 20) ^ u64::from(bits);
+                            let mut pick = move |n: u64| {
+                                seed ^= seed << 13;
+                                seed ^= seed >> 7;
+                                seed ^= seed << 17;
+                                (seed % n) as usize
+                            };
+                            let mut back = false;
+                            while next < len {
+                                let more = pick(3);
+                                look += 1;
+                                for _ in 0..more.max(usize::from(look > 4 * len)) {
+                                    if let Some(&i) = flights.get(ran) {
+                                        card[i % 3] = i as u64 + 1;
+                                        snap[i] = card[i % 3];
+                                        ran += 1;
+                                    }
+                                }
+                                let completed = ran.checked_sub(1).map_or(0, |r| flights[r] as u64 + 1);
+                                let n = landable(&line[next..], completed);
+                                if n == 0 {
+                                    continue;
+                                }
+
+                                let mine: Vec<usize> = (next..next + n).filter(|&i| line[i].is_some()).collect();
+                                if let Some(&first) = mine.first() {
+                                    newer.retain(|f| f.0 > first as u64);
+                                }
+                                // The last flight of the landing that flags each piece.
+                                let mut last = [None; 3];
+                                for &i in &mine {
+                                    last[i % 3] = Some(i);
+                                }
+                                let no_place = pick(4) == 0;
+                                let refused = last.iter().enumerate().any(|(piece, k)| {
+                                    k.is_some_and(|k| rule && newer.iter().any(|f| f.0 > k as u64 + 1 && f.1.contains(&piece)))
+                                });
+                                let from_ring = in_flight && !no_place && !refused;
+                                // The card runs on until the fetch is on it,
+                                // and the flight under way then may have
+                                // written its piece already (the copy queue
+                                // fetches beside it).
+                                for _ in 0..pick(3) {
+                                    if let Some(&i) = flights.get(ran) {
+                                        card[i % 3] = i as u64 + 1;
+                                        snap[i] = card[i % 3];
+                                        ran += 1;
+                                    }
+                                }
+                                if pick(2) == 0
+                                    && let Some(&i) = flights.get(ran)
+                                {
+                                    card[i % 3] = i as u64 + 1;
+                                }
+                                let fetched = card;
+                                for (piece, k) in last.iter().enumerate() {
+                                    let Some(k) = *k else {
+                                        continue;
+                                    };
+                                    let value = if from_ring { snap[k] } else { fetched[piece] };
+                                    if value != cpu[piece] {
+                                        back |= value < title[piece];
+                                        title[piece] = value;
+                                        cpu[piece] = value;
+                                    }
+                                }
+                                if !from_ring && in_flight {
+                                    // Sent behind the flights sent by now.
+                                    let sent = (ran + 2).min(flights.len()).checked_sub(1).map_or(0, |s| flights[s] as u64 + 1);
+                                    newer.push((sent, last.iter().enumerate().filter(|p| p.1.is_some()).map(|p| p.0).collect()));
+                                }
+                                for i in next..next + n {
+                                    if line[i].is_none() {
+                                        for &j in flights.iter().filter(|&&j| j < i) {
+                                            assert!(title[j % 3] > j as u64, "stale: {line:?} tell {i} flight {j} pace {pace} {in_flight}");
+                                        }
+                                        told.push(i);
+                                    }
+                                }
+                                next += n;
+                            }
+                            if rule {
+                                assert!(!back, "a piece went back: {line:?} pace {pace} in flight {in_flight}");
+                            }
+                            went_back_without_rule |= back;
+                            ends_of.push((title, told));
+                        }
+                        if rule {
+                            assert_eq!(ends_of[0], ends_of[1], "{line:?} pace {pace}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(went_back_without_rule, "the model never needed the rule");
+    }
+
+    /// [`super::segment_parts`]: jobs cover the pieces in order, none across
+    /// a segment's end; parts cover the jobs in order, none across a
+    /// segment's end; every segment with pieces has a part. Fixed seeds.
+    #[test]
+    fn segment_parts_keep_to_their_segments() {
+        use super::segment_parts;
+        let mut seed = 0x51ed_270bu64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for round in 0..400 {
+            let count = [0, 1, 3, 40, 300][round % 5];
+            let mut at = next(1 << 20) & !0xffff;
+            let titles: Vec<(usize, usize)> = (0..count)
+                .map(|_| {
+                    at += next(4) << 16;
+                    let piece = (at, 4 + next(64 << 10));
+                    at += 64 << 10;
+                    piece
+                })
+                .collect();
+            let mut ends: Vec<usize> = (0..next(5)).map(|_| next(count + 1)).collect();
+            ends.push(count);
+            ends.sort_unstable();
+            let (jobs, parts) = segment_parts(&titles, &ends, 1 + next(8));
+            let mut covered = 0;
+            for job in &jobs {
+                assert_eq!(job.start, covered, "round {round}");
+                assert!(job.start < job.end);
+                assert!(!ends.iter().any(|&e| job.start < e && e < job.end), "round {round}: a job across a segment's end");
+                covered = job.end;
+            }
+            assert_eq!(covered, count);
+            let mut covered = 0;
+            for part in &parts {
+                assert_eq!(part.start, covered);
+                assert!(part.start < part.end);
+                let (from, to) = (jobs[part.start].start, jobs[part.end - 1].end);
+                assert!(!ends.iter().any(|&e| from < e && e < to), "round {round}: a part across a segment's end");
+                covered = part.end;
+            }
+            assert_eq!(covered, jobs.len());
+            for w in ends.windows(2).filter(|w| w[0] < w[1]) {
+                assert!(parts.iter().any(|p| jobs[p.start].start == w[0]), "round {round}: segment {w:?} has no part of its own");
+            }
+        }
+    }
+
+    /// [`super::ranges_minus`] against a plain map of bytes, fixed seeds.
+    #[test]
+    fn ranges_minus_is_the_plain_difference() {
+        use super::{join_ranges, ranges_minus};
+        let mut seed = 0x2f6b_4a1du64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for round in 0..2000 {
+            let (ka, kb) = (next(6), next(6));
+            let mut make = |k: usize| {
+                let mut r = Vec::new();
+                join_ranges(
+                    &mut r,
+                    (0..k).map(|_| {
+                        let a = next(500);
+                        (a, a + next(60))
+                    }),
+                );
+                r
+            };
+            let (a, b) = (make(ka), make(kb));
+            let got = ranges_minus(&a, &b);
+            let inside = |r: &[(usize, usize)], x: usize| r.iter().any(|&(f, t)| f <= x && x < t);
+            for x in 0..600 {
+                assert_eq!(inside(&got, x), inside(&a, x) && !inside(&b, x), "round {round} byte {x}: {a:?} - {b:?} = {got:?}");
+            }
+            assert!(got.windows(2).all(|w| w[0].1 <= w[1].0) && got.iter().all(|r| r.0 < r.1));
         }
     }
 
@@ -4127,6 +4595,10 @@ fn late_threads() {
             if let Err(e) = crate::named::spawn("victory-relay", relay_worker) {
                 fail(format_args!("no thread to land submissions sent ahead (VICTORY_RELAY=1): {e}"));
             }
+            #[cfg(feature = "diagnostics")]
+            if let Some(host) = host() {
+                tells::start(host);
+            }
             tracing::info!(
                 exact = relay_exact(),
                 "what shaders wrote is copied back by a thread of its own, beside the submitting thread (VICTORY_RELAY=1)"
@@ -4484,6 +4956,11 @@ fn late_line(frames: f64) {
         }
     }
     crate::land::log(frames);
+    #[cfg(feature = "diagnostics")]
+    if relay() {
+        tells::log(frames);
+    }
+    in_flight::log(frames);
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
@@ -4560,9 +5037,23 @@ pub(crate) mod spans;
 mod torn;
 #[cfg(feature = "diagnostics")]
 mod traffic;
+mod in_flight;
+#[cfg(test)]
+mod latency_bench;
+#[cfg(test)]
+pub(crate) use in_flight::{SLOT as SNAP_SLOT, SNAP as CARD_SNAP, place_begins as snap_place_begins};
 pub(crate) mod upcheck;
 #[cfg(feature = "diagnostics")]
 mod stamps;
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+mod tells;
+
+/// Diagnostics: the clock fences note the title's first ask with
+/// ([`tells`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn tell_clock() -> u64 {
+    tells::now_us()
+}
 #[cfg(feature = "diagnostics")]
 pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
 
@@ -5105,6 +5596,7 @@ impl Host {
                 fetched: None,
                 taken: 0,
                 out: 0,
+                snap: if in_flight::on() { in_flight::Snap::make(self, RESULTS) } else { None },
             })
         }
     }
@@ -5302,6 +5794,7 @@ impl Host {
             looks,
             sends: own.map(send::Own::memory),
             up,
+            snap: None,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -5358,6 +5851,13 @@ impl Host {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
             let (allocator, list) = &check;
+            // With `in_flight`: a room in the ring for what the compare flags.
+            let mut room = (flown && relay())
+                .then(|| {
+                    let ranges = plan.ranges.iter().filter(|r| r.compared && !r.picked);
+                    work.snap.as_mut()?.plan(ranges.map(|r| (r.shadow.id(), r.span.first, r.span.pieces)))
+                })
+                .flatten();
             // SAFETY: the list's last run finished (its submission was
             // waited for, and it came back after that); live buffers; the
             // compare's own root signature.
@@ -5389,12 +5889,32 @@ impl Host {
                         card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
+                    // With `in_flight`: the flagged pieces of the declared
+                    // ranges compared above, copied out right behind.
+                    if let (Some(snap), Some(room)) = (work.snap.as_ref(), room.as_mut()) {
+                        let sides: Vec<(&ID3D12Resource, u32, &crate::shadow::CardSpan, u32)> = plan
+                            .ranges
+                            .iter()
+                            .filter(|r| r.compared && !r.picked)
+                            .filter_map(|r| {
+                                let (Some((_, Some(_), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
+                                    return None;
+                                };
+                                Some((&r.shadow.buffer, size as u32, &r.span, r.at))
+                            })
+                            .collect();
+                        snap.record(list, &work.differs.0, room, &sides);
+                        room.ranges = sides.iter().map(|s| s.3).collect();
+                    }
                     list.Close()?;
                     list.cast()
                 })()
             };
             match recorded {
-                Ok(list) => plan.check = Some(list),
+                Ok(list) => {
+                    plan.check = Some(list);
+                    plan.snap = room;
+                }
                 Err(e) => fail(format_args!("the compare of host copies in the card's memory could not be recorded ({e})")),
             }
             plan.lists.push((true, check));
@@ -5432,6 +5952,10 @@ impl Host {
         let Some(work) = work.as_mut() else {
             return;
         };
+        // Its pieces in the ring are merged (or were not wanted).
+        if let (Some(room), Some(snap)) = (plan.snap, work.snap.as_mut()) {
+            snap.rooms.give_back(room.id);
+        }
         for (check, list) in plan.lists {
             if check { work.check.push(list) } else { work.sync.push(list) }
         }
@@ -5498,9 +6022,29 @@ impl Host {
     /// nothing is sent back up. `plans` come with the value signalled behind
     /// their flight. `meanwhile` is called while the fetch is on its way, if
     /// there is one.
-    fn relay_card_back(&self, plans: &[(&CardPlan, u64)], fetch: &mut Option<RelayFetch>, meanwhile: &mut dyn FnMut()) {
+    ///
+    /// With `spread` ([`merge_spread`]) the pieces go in the order of the
+    /// landing's segments (each segment's plans, then the next's pieces not
+    /// fetched yet), still in one fetch, and `spread.merged(s)` is called as
+    /// soon as every piece of segments up to `s` is merged.
+    fn relay_card_back(
+        &self,
+        plans: &[(&CardPlan, u64)],
+        fetch: &mut Option<RelayFetch>,
+        meanwhile: &mut dyn FnMut(),
+        mut spread: Option<Spread<'_>>,
+    ) {
         use crate::land;
         let gathering = std::time::Instant::now();
+        // With `spread`: the pieces gathered after each plan.
+        let mut after_plan: Vec<usize> = Vec::new();
+        // With `in_flight`: the pieces (copy, piece) each plan wants.
+        let mut wanted: Vec<Vec<(usize, u32)>> = Vec::new();
+        if in_flight::on()
+            && let Some(first) = plans.iter().map(|p| p.1).min()
+        {
+            in_flight::NEWER.lock().unwrap_or_else(|e| e.into_inner()).landing(first);
+        }
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
@@ -5533,6 +6077,9 @@ impl Host {
                     })
                     .collect();
                 let fetched = flagged_pieces(&flags);
+                if in_flight::on() {
+                    wanted.push(fetched.clone());
+                }
                 for r in plan.ranges.iter().filter(|r| !r.picked) {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     if upcheck::on() {
@@ -5562,25 +6109,53 @@ impl Host {
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                 }
+                after_plan.push(pieces.len());
             }
         }
+        // With `spread`: where each segment's pieces end, in the order given.
+        let mut segment_pieces: Vec<usize> = spread.as_ref().map_or_else(Vec::new, |s| {
+            s.plan_ends.iter().map(|&n| n.checked_sub(1).and_then(|k| after_plan.get(k).copied()).unwrap_or(0)).collect()
+        });
         if land::on() {
-            // In the order they are landed, each byte of a copy once.
+            // In the order they are landed, each byte of a copy once. (With
+            // `spread`: segment by segment, so that a segment's pieces are all
+            // ahead of the next one's.)
             let keys: Vec<land::Piece> =
                 pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)).collect();
             total = 0;
-            pieces = land::ordered(&keys)
-                .into_iter()
-                .map(|(i, title, len)| {
-                    let shadow = &pieces[i].0;
+            let cuts: Vec<std::ops::Range<usize>> = match spread {
+                Some(_) => segment_pieces.iter().scan(0, |from, &to| Some(std::mem::replace(from, to)..to)).collect(),
+                None => std::iter::once(0..keys.len()).collect(),
+            };
+            let mut ordered = Vec::with_capacity(pieces.len());
+            for (s, cut) in cuts.into_iter().enumerate() {
+                let from = cut.start;
+                ordered.extend(land::ordered(&keys[cut]).into_iter().map(|(i, title, len)| {
+                    let shadow = &pieces[from + i].0;
                     let lo = title - shadow.span().0 as usize;
                     let at = total;
                     total += len as u64;
                     (shadow.clone(), lo, lo + len, at)
-                })
-                .collect();
+                }));
+                if let Some(end) = segment_pieces.get_mut(s) {
+                    *end = ordered.len();
+                }
+            }
+            pieces = ordered;
         }
         land::spent(land::stat::GATHER, gathering);
+        // With `in_flight`: merged from the ring, if every piece is there.
+        if in_flight::on()
+            && !pieces.is_empty()
+            && wanted.len() == plans.len()
+            && let Some(routes) = self.snap_routes(plans, &wanted, &pieces)
+        {
+            let written = self.relay_merge_snapped(&pieces, &routes, &segment_pieces, &mut spread);
+            COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
+            let behind = plans.iter().map(|p| p.0.sent_as).max().unwrap_or(0);
+            crate::shadow::relay_fetched(behind);
+            return;
+        }
         if fetch.is_none() {
             *fetch = self.make_relay_fetch();
         }
@@ -5605,7 +6180,14 @@ impl Host {
                 true => behind,
                 false => *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
             };
-            crate::shadow::relay_fetched(after);
+            relay_fetched_to(after, behind);
+            if let Some(spread) = spread.as_mut() {
+                // (Each segment's copies in the PC's memory are looked
+                // through by its own merge: the first is told sooner.)
+                for s in 0..spread.plan_ends.len() {
+                    (spread.merged)(s);
+                }
+            }
             return;
         }
         let Some(f) = fetch.as_mut() else {
@@ -5629,13 +6211,15 @@ impl Host {
             None => line().target,
         };
         if fetch_parts() > 1 && land::on() && check.is_none() && pieces.len() > 1 {
-            let (after, written) = self.relay_fetch_in_parts(f, &pieces, &buffer, data, behind, meanwhile);
+            let segments = spread.as_mut().map(|s| (&segment_pieces[..], s));
+            let (after, written) = self.relay_fetch_in_parts(f, &pieces, &buffer, data, behind, meanwhile, segments);
             COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
             f.had.fetched(
                 ahead,
                 pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)),
             );
-            crate::shadow::relay_fetched(after);
+            in_flight::fetched_old(&pieces);
+            relay_fetched_to(after, behind);
             return;
         }
         // SAFETY: the list's last run was waited for by this thread; live
@@ -5659,6 +6243,8 @@ impl Host {
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
                     WaitForSingleObject(event, INFINITE);
+                    #[cfg(feature = "diagnostics")]
+                    tells::fetched();
                     return Ok(behind);
                 }
                 // In the order of the queue: the sends of title bytes so
@@ -5674,6 +6260,8 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(None);
                 WaitForSingleObject(event, INFINITE);
+                #[cfg(feature = "diagnostics")]
+                tells::fetched();
                 Ok(after)
             })()
         };
@@ -5696,31 +6284,42 @@ impl Host {
         if land::on() {
             let titles: Vec<(usize, usize)> =
                 pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, hi - lo)).collect();
-            let jobs = land::jobs(&titles);
             let put = std::sync::atomic::AtomicU64::new(0);
-            land::each(jobs.len(), &|j| {
-                let working = std::time::Instant::now();
-                if let Some(check) = &check {
-                    for i in jobs[j].clone() {
-                        // SAFETY: as below.
-                        unsafe { check.look(i, data) };
+            // With `spread`: segment by segment, each told when its pieces are in.
+            let cuts: Vec<std::ops::Range<usize>> = match spread {
+                Some(_) => segment_pieces.iter().scan(0, |from, &to| Some(std::mem::replace(from, to)..to)).collect(),
+                None => std::iter::once(0..titles.len()).collect(),
+            };
+            for (s, cut) in cuts.into_iter().enumerate() {
+                let jobs: Vec<std::ops::Range<usize>> =
+                    land::jobs(&titles[cut.clone()]).into_iter().map(|j| j.start + cut.start..j.end + cut.start).collect();
+                land::each(jobs.len(), &|j| {
+                    let working = std::time::Instant::now();
+                    if let Some(check) = &check {
+                        for i in jobs[j].clone() {
+                            // SAFETY: as below.
+                            unsafe { check.look(i, data) };
+                        }
                     }
+                    let mut notes = land::Notes::default();
+                    // (One list for the job's runs, not one each.)
+                    let mut addressed: Vec<(usize, usize, usize)> = Vec::new();
+                    for run in pieces[jobs[j].clone()].chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0)) {
+                        addressed.clear();
+                        addressed.extend(run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)));
+                        // SAFETY: the mapping of the fetched bytes, `total` of
+                        // them; the copy into it has run, and the next waits
+                        // for this call.
+                        put.fetch_add(unsafe { run[0].0.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
+                    }
+                    notes.flush();
+                    land::spent(land::stat::CARD_ALL, working);
+                });
+                land::count(land::stat::JOBS, jobs.len() as u64);
+                if let Some(spread) = spread.as_mut() {
+                    (spread.merged)(s);
                 }
-                let mut notes = land::Notes::default();
-                // (One list for the job's runs, not one each.)
-                let mut addressed: Vec<(usize, usize, usize)> = Vec::new();
-                for run in pieces[jobs[j].clone()].chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0)) {
-                    addressed.clear();
-                    addressed.extend(run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)));
-                    // SAFETY: the mapping of the fetched bytes, `total` of
-                    // them; the copy into it has run, and the next waits
-                    // for this call.
-                    put.fetch_add(unsafe { run[0].0.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
-                }
-                notes.flush();
-                land::spent(land::stat::CARD_ALL, working);
-            });
-            land::count(land::stat::JOBS, jobs.len() as u64);
+            }
             written = put.into_inner();
         } else {
             let mut title = Vec::new();
@@ -5748,8 +6347,134 @@ impl Host {
                 pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)),
             );
         }
+        in_flight::fetched_old(&pieces);
         // Sends up to `after` are of no use to any later merge.
-        crate::shadow::relay_fetched(after);
+        relay_fetched_to(after, behind);
+    }
+
+    /// [`in_flight`]: where each of `pieces` (in the order they are landed)
+    /// is in the ring and the send its bytes came after, if every one is
+    /// there and none is older than what an old fetch brought; `None`: the
+    /// landing is fetched as before. `wanted`: what each of `plans` wants
+    /// ([`flagged_pieces`]). A piece's bytes are those of the last plan that
+    /// wants it: the card's when that flight's compare ran.
+    fn snap_routes(
+        &self,
+        plans: &[(&CardPlan, u64)],
+        wanted: &[Vec<(usize, u32)>],
+        pieces: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)],
+    ) -> Option<Vec<(usize, u64)>> {
+        let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let work = work.as_mut()?;
+        let dwords = (work.differs.2 / 4) as usize;
+        // SAFETY: the mappings of the compare's results and of the places
+        // beside them, which these plans' passes (they have run) wrote, and
+        // which no other plan is given before these are done with.
+        let (differs, places) = unsafe {
+            (
+                std::slice::from_raw_parts(work.differs.1 as *const u32, dwords),
+                std::slice::from_raw_parts(work.snap.as_ref()?.places() as *const u32, dwords),
+            )
+        };
+        let snap = work.snap.as_mut()?;
+        // (copy, piece) -> the last plan that wants it, and where its bytes are.
+        let mut last: std::collections::HashMap<(usize, u32), (usize, Option<usize>)> = std::collections::HashMap::new();
+        for (k, ((plan, _), wants)) in plans.iter().zip(wanted).enumerate() {
+            for &key in wants {
+                last.insert(key, (k, None));
+            }
+            let mut flagged = 0;
+            for r in plan.ranges.iter().filter(|r| r.compared && !r.picked) {
+                let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                // (Only the ranges its pass was recorded for have places.)
+                let room = plan.snap.as_ref().filter(|room| room.ranges.contains(&r.at));
+                for p in 0..r.span.pieces {
+                    let at = (r.at + p) as usize;
+                    flagged += u64::from(differs.get(at).is_some_and(|&d| torn::flagged(d)));
+                    let (Some(room), Some(&place)) = (room, places.get(at)) else {
+                        continue;
+                    };
+                    if let Some(e) = last.get_mut(&(copy, r.span.first + p))
+                        && e.0 == k
+                        && let Some(bytes) = snap.bytes_at(room, place)
+                    {
+                        e.1 = Some(bytes);
+                    }
+                }
+            }
+            if let Some(room) = &plan.snap {
+                snap.flagged(room, flagged);
+            }
+        }
+        let newer = in_flight::NEWER.lock().unwrap_or_else(|e| e.into_inner());
+        let mut routes = Vec::with_capacity(pieces.len());
+        for (shadow, lo, _, _) in pieces {
+            let piece = shadow.card_piece_of(*lo);
+            let Some(&(k, Some(bytes))) = last.get(&(std::sync::Arc::as_ptr(shadow) as usize, piece)) else {
+                in_flight::STATS[in_flight::NO_PLACE].fetch_add(1, Ordering::Relaxed);
+                return None;
+            };
+            if newer.newer(plans[k].1, (shadow.id(), piece)) {
+                in_flight::STATS[in_flight::NEWER_THERE].fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            let skew = (shadow.span().0 % (64 << 10)) as u32;
+            routes.push((bytes + (*lo - in_flight::place_begins(piece, skew)), plans[k].0.sent_as));
+        }
+        Some(routes)
+    }
+
+    /// [`in_flight`]: `pieces` (in the order they are landed, with `spread`'s
+    /// segments ending at `segment_pieces`) go into title memory from where
+    /// `routes` say, as a fetch's would, each after the send its route names.
+    /// Returns the bytes put into title memory.
+    fn relay_merge_snapped(
+        &self,
+        pieces: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)],
+        routes: &[(usize, u64)],
+        segment_pieces: &[usize],
+        spread: &mut Option<Spread<'_>>,
+    ) -> u64 {
+        use crate::land;
+        let merging = std::time::Instant::now();
+        let _merging = crate::timeline::span("landing: merging pieces copied inside their flights");
+        let titles: Vec<(usize, usize)> = pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, hi - lo)).collect();
+        let cuts: Vec<std::ops::Range<usize>> = match spread {
+            Some(_) => segment_pieces.iter().scan(0, |from, &to| Some(std::mem::replace(from, to)..to)).collect(),
+            None => std::iter::once(0..titles.len()).collect(),
+        };
+        let put = std::sync::atomic::AtomicU64::new(0);
+        for (s, cut) in cuts.into_iter().enumerate() {
+            let jobs: Vec<std::ops::Range<usize>> =
+                land::jobs(&titles[cut.clone()]).into_iter().map(|j| j.start + cut.start..j.end + cut.start).collect();
+            land::each(jobs.len(), &|j| {
+                let working = std::time::Instant::now();
+                let mut notes = land::Notes::default();
+                let mut addressed: Vec<(usize, usize, usize)> = Vec::new();
+                let job: Vec<usize> = jobs[j].clone().collect();
+                // Runs of one copy and one send, as a fetch's runs are of one copy.
+                for run in job.chunk_by(|&a, &b| std::sync::Arc::ptr_eq(&pieces[a].0, &pieces[b].0) && routes[a].1 == routes[b].1) {
+                    addressed.clear();
+                    addressed.extend(run.iter().map(|&i| (pieces[i].1, pieces[i].2, routes[i].0)));
+                    // SAFETY: the ring's mapping; these plans' passes have run,
+                    // and their rooms are not given again before they are done
+                    // with (`card_done`, after this).
+                    put.fetch_add(unsafe { pieces[run[0]].0.land_card(&addressed, routes[run[0]].1, &mut notes) }, Ordering::Relaxed);
+                }
+                notes.flush();
+                land::spent(land::stat::CARD_ALL, working);
+            });
+            land::count(land::stat::JOBS, jobs.len() as u64);
+            if let Some(spread) = spread.as_mut() {
+                (spread.merged)(s);
+            }
+        }
+        let bytes: u64 = titles.iter().map(|t| t.1 as u64).sum();
+        for (at, n) in [(3, 1), (6, pieces.len() as u64), (7, bytes), (8, merging.elapsed().as_micros() as u64)] {
+            in_flight::STATS[at].fetch_add(n, Ordering::Relaxed);
+        }
+        land::spent(land::stat::CARD, merging);
+        put.into_inner()
     }
 
     /// A list for the relay's fetch: for the copy queue (`copy`) or the
@@ -5779,6 +6504,7 @@ impl Host {
     /// `meanwhile` are the caller's. `f.sent` is the value of the first
     /// part's signal. Returns the last send of title bytes the fetch ran
     /// behind (as for the fetch in one) and the bytes put into title memory.
+    #[allow(clippy::too_many_arguments, reason = "the fetch in one's own state, passed on as it is")]
     fn relay_fetch_in_parts(
         &self,
         f: &mut RelayFetch,
@@ -5787,11 +6513,29 @@ impl Host {
         data: usize,
         behind: u64,
         meanwhile: &mut dyn FnMut(),
+        mut segments: Option<(&[usize], &mut Spread<'_>)>,
     ) -> (u64, u64) {
         use crate::land;
         let titles: Vec<(usize, usize)> = pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, hi - lo)).collect();
-        let jobs = land::jobs(&titles);
-        let parts = fetch_parts_of(&jobs, &titles, fetch_parts());
+        let (jobs, parts) = match &segments {
+            None => {
+                let jobs = land::jobs(&titles);
+                let parts = fetch_parts_of(&jobs, &titles, fetch_parts());
+                (jobs, parts)
+            }
+            Some((ends, _)) => segment_parts(&titles, ends, fetch_parts()),
+        };
+        // With `segments`: the next segment to tell, and the merged told so
+        // far. Segments with no pieces before the first are told at once.
+        let mut next_told = 0;
+        let mut tell_up_to = |merged: usize, segments: &mut Option<(&[usize], &mut Spread<'_>)>| {
+            if let Some((ends, told)) = segments.as_mut() {
+                while next_told < ends.len() && ends[next_told] <= merged {
+                    (told.merged)(next_told);
+                    next_told += 1;
+                }
+            }
+        };
         let copy_queue = f.queue.clone();
         while f.parts.len() + 1 < parts.len() {
             let Some(list) = self.make_fetch_list(copy_queue.is_some()) else {
@@ -5848,6 +6592,7 @@ impl Host {
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_FETCH_PARTS)")),
         };
         meanwhile();
+        tell_up_to(0, &mut segments);
         let (mut waited, mut first_wait, mut merging_us) = (0u64, 0u64, 0u64);
         let put = std::sync::atomic::AtomicU64::new(0);
         let _merging = crate::timeline::span("landing: merging fetched pieces, part by part");
@@ -5864,6 +6609,8 @@ impl Host {
                 // SAFETY: this thread's event.
                 unsafe { WaitForSingleObject(event, INFINITE) };
             }
+            #[cfg(feature = "diagnostics")]
+            tells::fetched();
             if k == 0 {
                 // From the parts given to the queue, the look through the
                 // copies in the PC's memory with it, as the fetch in one.
@@ -5890,7 +6637,9 @@ impl Host {
                 land::spent(land::stat::CARD_ALL, working);
             });
             merging_us += merging.elapsed().as_micros() as u64;
+            tell_up_to(jobs[part.end - 1].end, &mut segments);
         }
+        tell_up_to(pieces.len(), &mut segments);
         land::count(land::stat::JOBS, jobs.len() as u64);
         land::count(land::stat::CARD, merging_us);
         RELAY_STATS[3].fetch_add(waited, Ordering::Relaxed);
@@ -5919,6 +6668,12 @@ impl Host {
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+        #[cfg(feature = "diagnostics")]
+        tells::begun();
+        if merge_spread() {
+            self.relay_land_spread(items, fetch);
+            return;
+        }
         let landing = std::time::Instant::now();
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         // With `VICTORY_LAND_HELD=2`: the copies that say what they hold once
@@ -5962,7 +6717,7 @@ impl Host {
                         let _looking = crate::timeline::span("landing: looking through copies, beside the fetch");
                         hand_back.look(crate::land::stat::SCAN_BESIDE);
                     }
-                });
+                }, None);
                 stage.next("landing: copies in the PC's memory");
                 hand_back.merge();
                 match crate::shadow::land_held_mode() {
@@ -5990,6 +6745,10 @@ impl Host {
         }
         // In the order given: what tells the title the card is done.
         stage.next("landing: read-backs, telling the title");
+        #[cfg(feature = "diagnostics")]
+        tells::merged();
+        #[cfg(feature = "diagnostics")]
+        let mut place = TellPlace::of(&items);
         let mut last = 0;
         let mut landed = Vec::new();
         let mut telling = std::time::Instant::now();
@@ -5997,6 +6756,8 @@ impl Host {
             telling = match item {
                 Late::Run(flight) => {
                     last = flight.number;
+                    #[cfg(feature = "diagnostics")]
+                    place.passed(flight.fence);
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
                     }
@@ -6013,14 +6774,217 @@ impl Host {
                 }
                 Late::Write(at, what, bytes) => {
                     what.write(at as *mut u8, bytes);
+                    #[cfg(feature = "diagnostics")]
+                    place.told(0, 0);
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
                 Late::Signal(fence, value) => {
+                    #[cfg(feature = "diagnostics")]
+                    place.told(fence, crate::fence::set_asked(fence as crate::object::This, value));
+                    #[cfg(not(feature = "diagnostics"))]
                     crate::fence::set(fence as crate::object::This, value);
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
             };
         }
+        self.relay_land_end(last, landed, telling, stage, landing, held_later);
+    }
+
+    /// [`Host::relay_land`] with [`merge_spread`]: the same steps, segment by
+    /// segment of `items` ([`segment_ends`]), each segment's tells as soon as
+    /// it is merged; the fetch one for all. What only gives back (the plans'
+    /// lists, card steps' lists) comes after the last tell.
+    fn relay_land_spread(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+        let landing = std::time::Instant::now();
+        let mut stage = crate::timeline::span("landing: what is to be looked through");
+        let fences: Vec<Option<u64>> = items
+            .iter()
+            .map(|l| match l {
+                Late::Run(flight) => Some(flight.fence),
+                _ => None,
+            })
+            .collect();
+        let ends = segment_ends(&fences);
+        let segment_of = |i: usize| ends.partition_point(|&e| e <= i);
+        let flights: Vec<(usize, &Flight)> = items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| match l {
+                Late::Run(flight) => Some((segment_of(i), flight)),
+                _ => None,
+            })
+            .collect();
+        #[cfg(feature = "diagnostics")]
+        let mut place = TellPlace::of(&items);
+        let mut telling = std::time::Instant::now();
+        // In the order given: what tells the title the card is done.
+        #[cfg_attr(not(feature = "diagnostics"), allow(unused_mut))]
+        let mut tell = |items: &[Late], telling: &mut std::time::Instant| {
+            for item in items {
+                *telling = match item {
+                    Late::Run(flight) => {
+                        #[cfg(feature = "diagnostics")]
+                        place.passed(flight.fence);
+                        for &i in &flight.order {
+                            read_backs(flight.lists[i].host());
+                        }
+                        crate::land::spent(crate::land::stat::READ_BACKS, *telling)
+                    }
+                    Late::Write(at, what, bytes) => {
+                        what.write(*at as *mut u8, *bytes);
+                        #[cfg(feature = "diagnostics")]
+                        place.told(0, 0);
+                        crate::land::spent(crate::land::stat::TOLD, *telling)
+                    }
+                    &Late::Signal(fence, value) => {
+                        #[cfg(feature = "diagnostics")]
+                        place.told(fence, crate::fence::set_asked(fence as crate::object::This, value));
+                        #[cfg(not(feature = "diagnostics"))]
+                        crate::fence::set(fence as crate::object::This, value);
+                        crate::land::spent(crate::land::stat::TOLD, *telling)
+                    }
+                };
+            }
+        };
+        let mut held_later = Vec::new();
+        if flights.is_empty() {
+            stage.next("landing: read-backs, telling the title");
+            #[cfg(feature = "diagnostics")]
+            tells::merged();
+            tell(&items, &mut telling);
+        } else {
+            // SAFETY: a plain query.
+            if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                let runs: Vec<&HostList> = flights.iter().flat_map(|f| f.1.order.iter().map(|&i| f.1.lists[i].host())).collect();
+                fail(format_args!(
+                    "host GPU device removed after {} submissions sent ahead (VICTORY_RELAY=1) of {} lists{}{}",
+                    flights.len(),
+                    runs.len(),
+                    self.removal_data(&runs),
+                    last_notes(&runs)
+                ));
+            }
+            let mut plans: Vec<(&CardPlan, u64)> = Vec::new();
+            let mut plan_ends = vec![0usize; ends.len()];
+            for &(s, flight) in &flights {
+                if let Some(card) = &flight.card {
+                    plans.push((card, flight.fence));
+                }
+                plan_ends[s] = plans.len();
+            }
+            // (A segment without plans ends where the one before it does.)
+            let mut most = 0;
+            for end in &mut plan_ends {
+                most = most.max(*end);
+                *end = most;
+            }
+            // Copies in the PC's memory, segment by segment: what an earlier
+            // segment looks through is not looked through again (it is
+            // looked at once the card has run every flight of the landing,
+            // so it holds what later segments' shaders wrote there too).
+            let mut looked: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+            let mut backs: Vec<Option<RelayBack>> = Vec::with_capacity(ends.len());
+            for s in 0..ends.len() {
+                let mut back: Vec<Declared> = Vec::new();
+                for (_, flight) in flights.iter().filter(|f| f.0 == s) {
+                    for (shadow, ranges) in flight.back.iter().filter(|(shadow, _)| !shadow.carded()) {
+                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                            Some((_, all)) => all.extend_from_slice(ranges),
+                            None => back.push((shadow.clone(), ranges.clone())),
+                        }
+                    }
+                }
+                for (shadow, ranges) in &mut back {
+                    let mut joined = Vec::new();
+                    join_ranges(&mut joined, ranges.iter().copied());
+                    match looked.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                        Some((_, before)) => {
+                            *ranges = ranges_minus(&joined, before);
+                            join_ranges(before, joined);
+                        }
+                        None => {
+                            looked.push((shadow.clone(), joined.clone()));
+                            *ranges = joined;
+                        }
+                    }
+                }
+                back.retain(|(_, ranges)| !ranges.is_empty());
+                backs.push(Some(relay_hand_back(&back)));
+            }
+            let backs = std::cell::RefCell::new(backs);
+            stage.next("landing: copies in the card's memory");
+            let held_now = crate::shadow::land_held_mode() == 1;
+            let mut merged = |s: usize| {
+                let _merging = crate::timeline::span("landing: a segment's copies in the PC's memory, told");
+                if let Some(back) = backs.borrow_mut()[s].take() {
+                    back.merge();
+                }
+                let from = s.checked_sub(1).map_or(0, |p| ends[p]);
+                let mine: Vec<&Flight> = flights.iter().filter(|f| f.0 == s).map(|f| f.1).collect();
+                if held_now {
+                    relay_hold_landed(&landed_copies(&mine));
+                }
+                let finishing = std::time::Instant::now();
+                for flight in &mine {
+                    for (shadow, ranges) in &flight.back {
+                        shadow.copy_back_done(ranges);
+                    }
+                }
+                crate::land::spent(crate::land::stat::DONE, finishing);
+                #[cfg(feature = "diagnostics")]
+                tells::merged();
+                tell(&items[from..ends[s]], &mut telling);
+            };
+            self.relay_card_back(
+                &plans,
+                fetch,
+                &mut || {
+                    let _looking = crate::timeline::span("landing: looking through copies, beside the fetch");
+                    for back in backs.borrow_mut().iter_mut().flatten() {
+                        back.look(crate::land::stat::SCAN_BESIDE);
+                    }
+                },
+                Some(Spread { plan_ends: &plan_ends, merged: &mut merged }),
+            );
+            if crate::shadow::land_held_mode() == 2 {
+                held_later = landed_copies(&flights.iter().map(|f| f.1).collect::<Vec<_>>());
+            }
+            COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+            RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
+            RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
+        }
+        drop(flights);
+        stage.next("landing: what is given back");
+        let mut last = 0;
+        let mut landed = Vec::new();
+        for item in items {
+            if let Late::Run(flight) = item {
+                last = flight.number;
+                let done_from = std::time::Instant::now();
+                if let Some(card) = flight.card {
+                    self.card_done(card);
+                }
+                if let Some(own) = flight.own {
+                    own.landed();
+                }
+                crate::land::spent(crate::land::stat::RB_DONE, done_from);
+                landed.push((flight.lists, flight.order));
+            }
+        }
+        self.relay_land_end(last, landed, telling, stage, landing, held_later);
+    }
+
+    /// [`Host::relay_land`] once the title is told: the landed lists kept,
+    /// the line brought up to date, and those who wait told.
+    fn relay_land_end(
+        &self,
+        last: u64,
+        landed: Vec<(Vec<crate::list::Detached>, Vec<usize>)>,
+        telling: std::time::Instant,
+        mut stage: crate::timeline::Span,
+        landing: std::time::Instant,
+        held_later: Vec<std::sync::Arc<crate::shadow::Shadow>>,
+    ) {
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
             bury(last);

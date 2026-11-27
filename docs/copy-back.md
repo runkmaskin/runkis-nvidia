@@ -123,13 +123,32 @@ What this does not do: it does not land less. The census cannot say whether the 
 read-back touched every sampled private page first, and the census watches only the first touch. With
 `VICTORY_LAND_HELD` on, that read-back is gone, so a census run with both on says what the title's own threads touch
 first (T %), which is what landing on demand (2. below) needs to know before it is worth its risks.
+
+**Shipped, off: `VICTORY_FETCH_IN_FLIGHT=1`** (`host/in_flight.rs`; `VICTORY_FETCH_IN_FLIGHT_MB`, 64). Design 1
+below, built. The pieces the relay fetches are not known when the flight is recorded (they are what the card's
+compare flags), so a pass behind the compare, in the same list, uses the compare's own output: for each flagged
+piece a place in the flight's room of a ring in memory the PC reads (custom heap, write-back, L0, as UAV), taken with
+an atomic counter in card memory and noted beside the compare's result, and the piece copied there. At the landing
+the relay merges from the ring: no list, no fence, no wait. A flight's room is sized from what the last flight of its
+shape flagged; when a landing needs a piece that has no place (room full, range not compared), or that an old fetch
+since may have brought newer (`Newer`), the whole landing is fetched as before. Line: "pieces copied inside their
+flight per frame (VICTORY_FETCH_IN_FLIGHT=1): rooms for N flights (P places), M flights without; L landings merged
+from the ring (pieces, MB, ms merging), F fetched as before (for a piece without a place, for a piece an old fetch
+brought newer)". Tests, benchmark and risks: `docs/changes-2026-11-27.md`, "What the title's fences wait for".
+
+**Shipped, off: `VICTORY_MERGE_SPREAD=1`** (`merge_spread`, `relay_land_spread`). `VICTORY_LAND_SEGMENTS`' cut
+without its cost: one fetch for the landing, its pieces segment by segment, and each segment's tells right after its
+merge (its card pieces, its PC copies, its ranges done with), while later segments are still merged.
+
+**The latency line** (diagnostics builds): "the title is told per frame: ... card done to told X ms each: card done to
+landing begun a, to the fetch in b, to merged c, to told d; ... behind flight F of N in their landing; fences asked
+most: ...". It splits what a fence the title asked for (its address or value since the last set) waits for after the
+card ran the flight ahead of it.
+
 **Designed, not shipped:**
 
-1. *Fetch inside the flight* (the largest saving if the fetch wait is queueing). After the card's compare, a compute
-   pass in the same flight copies the flagged 64 KiB pieces into a CPU-visible buffer (custom heap, write-back, L0,
-   as UAV), compacted by an atomic counter. When the flight's fence is reached the pieces are there: no second
-   list, no wait behind later flights. Needs the submit path (the compare is recorded there) and a worst-case
-   buffer per flight; not testable offline for queue behaviour. Until then try `VICTORY_RELAY_COPY=1`.
+1. *Fetch inside the flight*: shipped above behind `VICTORY_FETCH_IN_FLIGHT=1`. Its queue behaviour (the copy's cost
+   inside the flight, the ring's room) is not testable offline.
 2. *Copy back on demand.* Signal the fence before landing; guard the declared ranges `PAGE_NOACCESS`; the first touch
    lands that range in the fault handler. Holes: view memory is the guards' (`watch.rs`) and its handler and
    `writable()` would have to know a second kind of guard; the fault handler would wait for a fetch and take the
@@ -161,6 +180,11 @@ the relay line, "landing per frame", "landed per frame".
 4. **`VICTORY_LAND_SEGMENTS=1`**, with and without 3. Watch "landings cut ..." (0 means the card is the pace and it
    cannot help), fence waits, "copying back" (it may rise: more fetches), fps and 1 % lows.
 5. **`VICTORY_FETCH_PARTS=4`** with the best of 3 and 4: the merge beside the copy.
+6. **`VICTORY_FETCH_IN_FLIGHT=1`**, then **`VICTORY_MERGE_SPREAD=1`**, each alone and both, against the defaults
+   (diagnostics build). Read the latency line ("card done to told", and which of its parts falls), the in-flight line
+   (landings fetched as before should be few; many "without a place": raise `VICTORY_FETCH_IN_FLIGHT_MB`), the relay
+   line ("waited N ms for fetches" should fall towards 0 with in-flight copies), the frame line's "on the GPU" (rises
+   by the copies inside the flights), fps and 1 % lows.
 
 Decide (1) of section 3 by step 1 and 3; decide (2) by step 2 (it only pays if T is small and the private share is
 large); decide (4) by the landed line's pieces against pages.
