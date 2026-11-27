@@ -62,6 +62,10 @@ $settings = @{
     # from Yaekai): idle on a PC with room, keeps a full 32 GB PC from paging (4-5 fps seen on one). Forced on always
     # in test Q7 it cost re-loads; at the default threshold it does nothing until RAM is short.
     VICTORY_POOL_DISCARD = '1'
+    # local: 8 GB card: the texture queue keeps 1.5 GB free for render targets, not 3 GB (render targets alive at 540p:
+    # ~1.1 GB). Q9: textures on the card 1.2 -> 2.3 GB, re-made 0.5-0.9 GB -> 0.07-0.2 GB, fps 14.7/12.5 -> 15.6/16.4,
+    # worst frame 0.7-1.2 s -> 0.2 s; card in use 6.1 of 6.7-6.9 GB.
+    VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1536'
     # local: write down every pipeline the title creates (pipeline/known.rs), so -Warm can build them all into the
     # driver's cache before play: fewer hitches the first time a place is seen.
     VICTORY_PIPELINE_BOOK = '1'
@@ -100,6 +104,11 @@ if (-not $RayTracing -and (Test-Path $rtList)) {
     # local, optional: the strand hair's physics left out (VN_SKIP_HAIRSIM=1): hair does not sway, saves GPU time
     $hairList = Join-Path $PSScriptRoot 'skip_hairsim.txt'
     if ($env:VN_SKIP_HAIRSIM -eq '1' -and (Test-Path $hairList)) { $settings.VICTORY_SKIP_PIPELINES += ',' + (Get-Content $hairList -Raw).Trim() }
+    # local (VN_LEAVE_OUT=1): two passes foxhound and Yaekai leave out by default (their VICTORY_LEAVE_OUT): the decal
+    # heap's defragmentation (02384a60fda6f2d0, 11.85 ms of the card a frame) and the heat-haze / in-scattering pass
+    # (731a39171b568298, smears blocks of pixels into a brown haze without ray-traced light).
+    $leaveList = Join-Path $PSScriptRoot 'skip_leaveout.txt'
+    if ($env:VN_LEAVE_OUT -eq '1' -and (Test-Path $leaveList)) { $settings.VICTORY_SKIP_PIPELINES += ',' + (Get-Content $leaveList -Raw).Trim() }
 }
 if ($Quality) {
     # Stretched/jumping bodies: relay stage 1 and no card steps (avatarmanz/VIctory-7900XTX issue 13,
