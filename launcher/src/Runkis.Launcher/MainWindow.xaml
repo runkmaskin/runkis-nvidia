@@ -371,6 +371,12 @@
                   <ComboBox Grid.Column="1" ItemsSource="{Binding ResolutionChoices}" DisplayMemberPath="Label" SelectedValuePath="Value"
                             SelectedValue="{Binding Profile.Resolution}" Width="260" HorizontalAlignment="Left"/>
                 </Grid>
+                <Grid Style="{StaticResource Row}">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                  <StackPanel><TextBlock Text="Upscaler"/><TextBlock Style="{StaticResource Hint}" Text="What scales the render height to 1080p. Temporal (TAAU) and DLSS rebuild detail over frames; DLSS needs NVIDIA's files (scripts\get-dlss.ps1)."/></StackPanel>
+                  <ComboBox Grid.Column="1" ItemsSource="{Binding UpscalerChoices}" DisplayMemberPath="Label" SelectedValuePath="Value"
+                            SelectedValue="{Binding Profile.Upscaler}" Width="260" HorizontalAlignment="Left"/>
+                </Grid>
 
                 <Grid Style="{StaticResource Row}">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>

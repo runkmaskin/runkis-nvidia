@@ -122,6 +122,7 @@ public static class Presets
             // How the frame reaches the screen goes with the screen, not with a preset.
             PresentScale = basis.PresentScale,
             PresentSharpen = basis.PresentSharpen,
+            Upscaler = basis.Upscaler,
         };
         preset.Apply(p);
         return p;

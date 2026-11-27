@@ -10,6 +10,17 @@ public enum RunMode { Play, Warm, Precompile }
 /// <summary>VICTORY_WINDOW (display.rs): a framed window, a borderless one covering the monitor, or full screen (borderless too).</summary>
 public enum WindowMode { Windowed, Borderless, Fullscreen }
 
+/// <summary>What scales the rendered picture to the game's 1080p plane.</summary>
+public enum UpscalerMode
+{
+    /// <summary>The title's anti-aliasing at render size, then a spatial upscale (as before).</summary>
+    Game,
+    /// <summary>The title's own temporal upscaler (VICTORY_OWN_TAAU=1).</summary>
+    GameTemporal,
+    /// <summary>NVIDIA DLSS in place of the title's temporal upscaler, with Reflex (VICTORY_DLSS=1).</summary>
+    Dlss,
+}
+
 /// <summary>
 /// One saved way to start the title. The base settings come from scripts\play-nvidia.ps1 (its switches are the
 /// first group below); the overrides are settings the layer reads (each names the file that reads it) and are left
@@ -58,6 +69,8 @@ public sealed class LaunchProfile
     public bool PresentScale { get; set; }
     /// <summary>VICTORY_PRESENT_SHARPEN (0..1), with <see cref="PresentScale"/> only.</summary>
     public double PresentSharpen { get; set; } = 0.3;
+    /// <summary>VICTORY_OWN_TAAU / VICTORY_DLSS (docs/dlss.md): the upscaler.</summary>
+    public UpscalerMode Upscaler { get; set; } = UpscalerMode.Game;
     // ---- Display (display.rs; the defaults set nothing, so the window is made as before) ----
     /// <summary>VICTORY_WINDOW: set only when not <see cref="WindowMode.Windowed"/>.</summary>
     public WindowMode Window { get; set; } = WindowMode.Windowed;

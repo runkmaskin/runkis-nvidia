@@ -136,6 +136,8 @@ public sealed class MainViewModel : Observable, IDisposable
     // ---------------------------------------------------------------- display
     public List<DisplayMonitor> Monitors { get; }
     public List<Choice> MonitorChoices { get; }
+    public List<Choice> UpscalerChoices { get; } =
+        [new("Game (spatial, as before)", UpscalerMode.Game), new("Game temporal upscaler (TAAU)", UpscalerMode.GameTemporal), new("NVIDIA DLSS + Reflex", UpscalerMode.Dlss)];
     public List<Choice> WindowModeChoices { get; } =
         [new("Windowed", WindowMode.Windowed), new("Borderless window", WindowMode.Borderless), new("Fullscreen", WindowMode.Fullscreen)];
     private DisplayMonitor? ChosenMonitor => Displays.Pick(Monitors, profile.Monitor);

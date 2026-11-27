@@ -160,6 +160,13 @@ public sealed class PlanBuilder(RepoLayout repo)
         if (p.Window != WindowMode.Windowed) o["VICTORY_WINDOW"] = p.Window.ToString().ToLowerInvariant();
         else if (Displays.TryParseSize(p.WindowSize, out var w, out var h)) o["VICTORY_WINDOW_SIZE"] = Displays.Size(w, h);
         if (p.Monitor > 0) Int("VICTORY_MONITOR", p.Monitor);
+        // The title's temporal upscaler, and DLSS in its place (crates/victory-gpu/src/dlss.rs).
+        if (p.Upscaler is UpscalerMode.GameTemporal or UpscalerMode.Dlss) o["VICTORY_OWN_TAAU"] = "1";
+        if (p.Upscaler == UpscalerMode.Dlss)
+        {
+            o["VICTORY_DLSS"] = "1";
+            o["VICTORY_DLSS_REFLEX"] = "1";
+        }
         if (p.Mouse)
         {
             o["VICTORY_MOUSE"] = "1";
