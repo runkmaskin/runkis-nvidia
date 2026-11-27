@@ -1153,8 +1153,13 @@ mod tests {
             });
             let makers: Vec<_> = (0..4u32)
                 .map(|t| {
-                    let (saving, later, stored) = (&saving, &later, &stored);
+                    let (saving, later, stored, saves) = (&saving, &later, &stored, &saves);
                     s.spawn(move || {
+                        // (Under load the makers could finish before the saver first took the lock,
+                        // and the test showed nothing; start once a save has been under way.)
+                        while saves.load(Ordering::Relaxed) == 0 {
+                            std::thread::yield_now();
+                        }
                         let mut kept = 0;
                         for i in 0..5000 {
                             let store = |i: u32| {
