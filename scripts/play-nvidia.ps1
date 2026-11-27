@@ -35,7 +35,7 @@ $settings = @{
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '0'
     # local: the keep-awake compute queue off: on an RTX 2070 SUPER 17.7 -> 18.7 fps, hitches over 100 ms 58 -> 33 (2026-11-27)
-    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = $(if ($env:VN_DRED) { $env:VN_DRED } else { '0' }); VICTORY_SKIP_PIPELINES = 'none'
+    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = $(if ($env:VN_AMBIENT) { $env:VN_AMBIENT } else { '0.8' }); VICTORY_D3D12_DRED = $(if ($env:VN_DRED) { $env:VN_DRED } else { '0' }); VICTORY_SKIP_PIPELINES = 'none'
     # local: DRED 'light' cost an RTX 2070 SUPER 2-4x GPU time, so it is off ($env:VN_DRED='light' turns it on)
     VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '8'; VICTORY_UPLOAD_AHEAD = '1'
     # Cheap picture fixes, on in both sets:
