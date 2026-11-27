@@ -583,7 +583,10 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = make::shared(make::Pending::new(shaders.clone(), graphics));
+    let host = {
+        let pending = make::Pending::new(shaders.clone(), graphics);
+        if make::share_pipelines() { make::shared(pending) } else { std::sync::Arc::new(pending) }
+    };
     #[cfg(windows)]
     known::note(host.key(), &shaders, host.graphics.as_deref());
     #[cfg(windows)]

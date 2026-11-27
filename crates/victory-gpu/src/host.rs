@@ -1239,7 +1239,7 @@ mod tests {
         sizes.extend([20; 40]);
         for classed in [true, false] {
             let before = private_now();
-            let mut pool = crate::list::Classed::new();
+            let mut pool = crate::list::Classed::sized();
             let mut lifo: Vec<HostList> = Vec::new();
             let mut hosts: Vec<HostList> = sizes.iter().map(|_| host.new_list().unwrap()).collect();
             let mut made = hosts.len();

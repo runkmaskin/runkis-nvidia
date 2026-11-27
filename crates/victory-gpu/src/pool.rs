@@ -43,9 +43,21 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
-    let now = now();
-    settle(&TEXTURES, now);
-    settle(&STAGING, now);
+    if settle_each_second() {
+        let now = now();
+        settle(&TEXTURES, now);
+        settle(&STAGING, now);
+    }
+}
+
+/// `VICTORY_POOL_SETTLE=1`: [`settle`] once a second as well. Off by default:
+/// freeing empty blocks while nothing is taken means making them again at the
+/// next streaming burst, mid-frame; a first game run of builds with it on had
+/// more frames over 100 ms. Until a run shows which way it goes, blocks go only
+/// at a take, as before.
+fn settle_each_second() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_POOL_SETTLE"))
 }
 
 /// What a take does first ([`Pool::rested`]), also while nothing is taken:

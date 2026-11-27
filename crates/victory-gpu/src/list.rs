@@ -257,11 +257,33 @@ pub(crate) struct Classed<T> {
     by_class: [Vec<(T, u64)>; CLASSES],
     count: usize,
     bytes: u64,
+    /// By size class, or one stack, the last given taken first, as before
+    /// classes (`None`: [`list_classes`] says).
+    sized: Option<bool>,
+}
+
+/// `VICTORY_LIST_CLASSES=1`: idle lists are taken by the size of what they
+/// held ([`Classed`]). Off by default: it changes when allocators grow and
+/// are reset, and a first game run of builds with it on had more frames over
+/// 100 ms; until a run shows which way it goes, the one stack of before.
+pub(crate) fn list_classes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_LIST_CLASSES"))
 }
 
 impl<T> Classed<T> {
     pub(crate) const fn new() -> Self {
-        Classed { by_class: [const { Vec::new() }; CLASSES], count: 0, bytes: 0 }
+        Classed { by_class: [const { Vec::new() }; CLASSES], count: 0, bytes: 0, sized: None }
+    }
+
+    /// Always by size class, whatever [`list_classes`] says (tests, measurements).
+    #[cfg(test)]
+    pub(crate) const fn sized() -> Self {
+        Classed { by_class: [const { Vec::new() }; CLASSES], count: 0, bytes: 0, sized: Some(true) }
+    }
+
+    fn by_size(&self) -> bool {
+        self.sized.unwrap_or_else(list_classes)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -275,7 +297,7 @@ impl<T> Classed<T> {
     /// The thing for a recording of class `wanted` ([`nearest`]); the one
     /// given last of its class.
     pub(crate) fn take(&mut self, wanted: usize) -> Option<T> {
-        let c = nearest(|c| !self.by_class[c].is_empty(), wanted)?;
+        let c = if self.by_size() { nearest(|c| !self.by_class[c].is_empty(), wanted)? } else { 0 };
         let (thing, bytes) = self.by_class[c].pop()?;
         self.count -= 1;
         self.bytes -= bytes;
@@ -283,7 +305,8 @@ impl<T> Classed<T> {
     }
 
     pub(crate) fn give(&mut self, thing: T, class: usize, bytes: u64) {
-        self.by_class[class.min(CLASSES - 1)].push((thing, bytes));
+        let class = if self.by_size() { class.min(CLASSES - 1) } else { 0 };
+        self.by_class[class].push((thing, bytes));
         self.count += 1;
         self.bytes += bytes;
     }
@@ -2531,7 +2554,7 @@ mod tests {
         assert_eq!(class(512), 1);
         assert_eq!(class(1024), 2);
         assert_eq!(class(u32::MAX), CLASSES - 1);
-        let mut pool = Classed::new();
+        let mut pool = Classed::sized();
         for (name, calls) in [("small", 10), ("mid", 5_000), ("big", 100_000)] {
             pool.give(name, class(calls), 1);
         }
@@ -2552,7 +2575,7 @@ mod tests {
     fn rotate(classed: bool, sizes: &[u32], frames: usize) -> (u64, usize) {
         let mut peaks: Vec<u32> = Vec::new();
         let mut lifo: Vec<usize> = Vec::new();
-        let mut pool = Classed::new();
+        let mut pool = Classed::sized();
         let mut hosts: Vec<usize> = (0..sizes.len()).collect();
         peaks.resize(sizes.len(), 0);
         let mut seed = 0x2545_f491_4f6c_dd1du64;

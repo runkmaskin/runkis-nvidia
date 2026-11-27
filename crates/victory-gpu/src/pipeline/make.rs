@@ -126,6 +126,16 @@ static SHARED: Mutex<Option<(std::collections::HashMap<String, std::sync::Weak<P
 /// shares its host pipeline. Each had a host pipeline of its own, made
 /// again by a worker (compiled again where the library did not have it
 /// yet, as when both are made at once).
+/// `VICTORY_SHARE_PIPELINES=1`: title pipelines of the same shaders and state
+/// share one [`Pending`] ([`shared`]), and with it its wait budget and its
+/// place in the queues. Off by default: that changes which draws wait and for
+/// how long, and a first game run of builds with it on had more frames over
+/// 100 ms; until a run shows which way it goes, one each, as before.
+pub(crate) fn share_pipelines() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SHARE_PIPELINES"))
+}
+
 pub(crate) fn shared(p: Pending) -> Arc<Pending> {
     let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
     let (by_key, prune_at) = shared.get_or_insert_with(|| (Default::default(), 1024));
