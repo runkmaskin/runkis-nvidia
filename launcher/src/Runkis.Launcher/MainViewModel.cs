@@ -14,7 +14,10 @@ using Runkis.Launcher.Core;
 
 namespace Runkis.Launcher;
 
-public sealed record Choice(string Label, object? Value);
+public sealed record Choice(string Label, object? Value)
+{
+    public override string ToString() => Label;
+}
 
 public sealed class GpuRow(GpuAdapter adapter) : Observable
 {
@@ -63,6 +66,7 @@ public sealed class MainViewModel : Observable, IDisposable
                               && (LogSearch.Length == 0 || l.Text.Contains(LogSearch, StringComparison.OrdinalIgnoreCase));
         LoadProfiles();
         Machine = SystemInfo.Read();
+        Bench = new BenchmarkViewModel(this);
 
         Launch = new Command(() => _ = StartAsync(RunMode.Play), () => CanStart);
         Warm = new Command(() => _ = StartAsync(RunMode.Warm), () => CanStart);
@@ -102,8 +106,8 @@ public sealed class MainViewModel : Observable, IDisposable
     }
 
     // ---------------------------------------------------------------- navigation and state
-    public string Page { get => page; set { if (Set(ref page, value)) Raise(nameof(PageIndex)); } }
-    public int PageIndex => Page switch { "Settings" => 1, "Diagnostics" => 2, "Logs" => 3, "System" => 4, _ => 0 };
+    public string Page { get => page; set { if (Set(ref page, value)) { Raise(nameof(PageIndex)); if (value == "Benchmark") Bench.RefreshSources(); } } }
+    public int PageIndex => Page switch { "Settings" => 1, "Diagnostics" => 2, "Logs" => 3, "System" => 4, "Benchmark" => 5, _ => 0 };
     public string RepoText => repo?.Root ?? "Not found: choose the runkis-nvidia folder";
     public bool RepoFound => repo != null;
     public SystemSnapshot Machine { get; private set; }
@@ -117,7 +121,8 @@ public sealed class MainViewModel : Observable, IDisposable
     private bool busy;
     public bool Busy { get => busy; private set { Set(ref busy, value); Raise(nameof(CanStart)); } }
     public bool IsRunning => session is { State: SessionState.Running or SessionState.Starting or SessionState.Stopping };
-    public bool CanStart => !Busy && !IsRunning && repo != null;
+    public bool CanStart => !Busy && !IsRunning && !Bench.Running && repo != null;
+    public BenchmarkViewModel Bench { get; }
     private string runTitle = "";
     public string RunTitle { get => runTitle; private set => Set(ref runTitle, value); }
 
@@ -614,13 +619,13 @@ public sealed class MainViewModel : Observable, IDisposable
         t.Start();
     }
 
-    private static void OpenFolder(string path)
+    internal static void OpenFolder(string path)
     {
         Directory.CreateDirectory(path);
         Process.Start(new ProcessStartInfo("explorer.exe", $"\"{path}\"") { UseShellExecute = true })?.Dispose();
     }
 
-    private static void OpenFile(string? path)
+    internal static void OpenFile(string? path)
     {
         if (path != null && File.Exists(path)) Process.Start(new ProcessStartInfo(path) { UseShellExecute = true })?.Dispose();
     }
@@ -654,9 +659,27 @@ public sealed class MainViewModel : Observable, IDisposable
     public Command WarmUp { get; }
     private bool warmUpNext;
 
+    // ---------------------------------------------------------------- for the Benchmark page
+    internal RepoLayout? Repo => repo;
+    internal ProfileStore Store => store;
+    /// <summary>A play, warm-up or plan in progress: a benchmark may not start beside it.</summary>
+    internal bool EmulatorBusy => Busy || IsRunning;
+    internal void Notify(string text) => Toast(text);
+    internal void BenchChanged() { Raise(nameof(CanStart)); CommandManager.InvalidateRequerySuggested(); }
+    internal void ShowState(string s, string detail, string tone, string title) { SetState(s, detail, tone); RunTitle = title; }
+    internal string MachineText => $"{Machine.CpuName}, {Machine.LogicalProcessors} threads, {Machine.TotalRam / MB / 1024:0} GB RAM, "
+                                   + (Dxgi.Resolve(adapters, profile.Adapter).Adapter?.Name ?? "no card");
+
     /// <summary>True when the window may close; asks what to do with a run still going.</summary>
     public bool ConfirmClose()
     {
+        if (Bench.Running)
+        {
+            if (MessageBox.Show("A benchmark is running.\n\nStop it and close? The current run is stopped the normal way first.", "Runkis Launcher",
+                    MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return false;
+            Bench.CancelAndWait(TimeSpan.FromSeconds(25));
+            return true;
+        }
         if (!IsRunning) return true;
         var answer = MessageBox.Show("The game is still running.\n\nYes: stop it and close.\nNo: close the launcher and leave the game running.\nCancel: stay.",
             "Runkis Launcher", MessageBoxButton.YesNoCancel, MessageBoxImage.Question);

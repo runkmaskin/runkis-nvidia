@@ -23,7 +23,7 @@ public class ProfileTests
     public void Default_profile_with_a_game_is_valid()
     {
         using var d = new TempDir();
-        Assert.Empty(ProfileValidator.Validate(Valid(d)).Where(i => i.Blocking));
+        Assert.DoesNotContain(ProfileValidator.Validate(Valid(d)), i => i.Blocking);
     }
 
     [Theory]

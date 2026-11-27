@@ -14,6 +14,7 @@
     <l:LineBrush x:Key="LineBrush"/>
     <l:VisibleIf x:Key="Vis"/>
     <l:IsPage x:Key="IsPage"/>
+    <l:CellTone x:Key="CellTone"/>
 
     <!-- A setting row: name and explanation on the left, the control on the right. -->
     <Style x:Key="Row" TargetType="Grid">
@@ -67,6 +68,7 @@
         </Border>
         <StackPanel>
           <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Play" Command="{Binding Go}" CommandParameter="Play" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=0}"/>
+          <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Benchmark" Command="{Binding Go}" CommandParameter="Benchmark" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=5}"/>
           <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Settings" Command="{Binding Go}" CommandParameter="Settings" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=1}"/>
           <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Diagnostics" Command="{Binding Go}" CommandParameter="Diagnostics" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=2}"/>
           <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Logs" Command="{Binding Go}" CommandParameter="Logs" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=3}"/>
@@ -570,6 +572,235 @@
                 </DataTemplate>
               </ItemsControl.ItemTemplate>
             </ItemsControl>
+          </StackPanel>
+        </ScrollViewer>
+      </TabItem>
+      <!-- ============================== BENCHMARK ============================== -->
+      <TabItem>
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+          <StackPanel Margin="32,8,32,32" DataContext="{Binding Bench}">
+            <DockPanel Margin="0,0,0,6">
+              <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" VerticalAlignment="Center">
+                <Button Style="{StaticResource Primary}" Command="{Binding Start}" Padding="26,10"
+                        Visibility="{Binding Running, Converter={StaticResource Vis}, ConverterParameter=not}">
+                  <TextBlock Text="▶  Start benchmark" Foreground="White" FontWeight="SemiBold"/>
+                </Button>
+                <Button Style="{StaticResource Danger}" Command="{Binding Cancel}" Padding="26,10"
+                        Visibility="{Binding Running, Converter={StaticResource Vis}}">
+                  <TextBlock Text="■  Cancel" Foreground="White" FontWeight="SemiBold"/>
+                </Button>
+              </StackPanel>
+              <TextBlock Text="Benchmark" Style="{StaticResource H1}"/>
+            </DockPanel>
+            <TextBlock Style="{StaticResource Hint}" Margin="0,0,0,18">
+              The project's own method: the same save, the same scripted input, a warm-up from the first picture, then a measured
+              window read from the layer's per-frame log and its five-second lines. Each candidate runs in turn (A B A B), one game
+              at a time, and is stopped the normal way. Four identical runs vary by about ±0.4 fps, so smaller differences are noise.
+            </TextBlock>
+
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,16" Visibility="{Binding ProgressText, Converter={StaticResource Vis}}">
+              <StackPanel>
+                <TextBlock Text="{Binding ProgressText}" TextWrapping="Wrap"/>
+                <ProgressBar Value="{Binding ProgressValue, Mode=OneWay}" Maximum="1" Height="6" Margin="0,10,0,0"
+                             Background="{StaticResource Line}" Foreground="{StaticResource Accent}" BorderThickness="0"/>
+              </StackPanel>
+            </Border>
+
+            <Grid Margin="0,0,0,16">
+              <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="16"/><ColumnDefinition/></Grid.ColumnDefinitions>
+              <Border Style="{StaticResource CardBorder}">
+                <StackPanel>
+                  <TextBlock Text="Candidates" Style="{StaticResource H2}"/>
+                  <TextBlock Style="{StaticResource Hint}" Margin="0,0,0,10"
+                             Text="A preset (applied over your profile's game, folders and card), a saved profile, or either with raw layer switches on top. The first one is the baseline the others are compared with."/>
+                  <ComboBox ItemsSource="{Binding Sources}" SelectedItem="{Binding SelectedSource}" DisplayMemberPath="Label"/>
+                  <TextBlock Text="Extra settings, one VICTORY_NAME=value a line (optional)" Style="{StaticResource Label}" Margin="0,10,0,4"/>
+                  <TextBox Text="{Binding ExtraText, UpdateSourceTrigger=PropertyChanged}" AcceptsReturn="True" Height="64"
+                           FontFamily="{StaticResource Mono}" FontSize="12" VerticalScrollBarVisibility="Auto"/>
+                  <TextBlock Text="{Binding ExtraErrors}" Foreground="{StaticResource Bad}" TextWrapping="Wrap" Margin="0,6,0,0"
+                             Visibility="{Binding ExtraErrors, Converter={StaticResource Vis}}"/>
+                  <Button Content="Add candidate" Command="{Binding Add}" HorizontalAlignment="Left" Margin="0,10,0,12"/>
+                  <ItemsControl ItemsSource="{Binding Candidates}">
+                    <ItemsControl.ItemTemplate>
+                      <DataTemplate>
+                        <Border Background="{StaticResource InputBg}" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="8" Padding="12,8" Margin="0,0,0,8">
+                          <DockPanel>
+                            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                              <Button Content="Make first" Padding="10,4" FontSize="12" Margin="8,0,6,0" CommandParameter="{Binding}"
+                                      Command="{Binding DataContext.MakeBaseline, RelativeSource={RelativeSource AncestorType=ItemsControl}}"/>
+                              <Button Content="Remove" Padding="10,4" FontSize="12" CommandParameter="{Binding}"
+                                      Command="{Binding DataContext.Remove, RelativeSource={RelativeSource AncestorType=ItemsControl}}"/>
+                            </StackPanel>
+                            <StackPanel>
+                              <TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                              <TextBlock Style="{StaticResource Hint}" TextTrimming="CharacterEllipsis" TextWrapping="NoWrap">
+                                <Run Text="{Binding Kind, Mode=OneWay}"/> <Run Text="{Binding Source, Mode=OneWay}"/> <Run Text="{Binding ExtraText, Mode=OneWay}"/>
+                              </TextBlock>
+                            </StackPanel>
+                          </DockPanel>
+                        </Border>
+                      </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                  </ItemsControl>
+                </StackPanel>
+              </Border>
+
+              <Border Grid.Column="2" Style="{StaticResource CardBorder}">
+                <StackPanel>
+                  <TextBlock Text="Timing and input" Style="{StaticResource H2}"/>
+                  <UniformGrid Columns="3" Margin="0,0,-10,0">
+                    <StackPanel Margin="0,0,10,0">
+                      <TextBlock Text="Warm-up (s)" Style="{StaticResource Label}" Margin="0,0,0,4"/>
+                      <TextBox Text="{Binding WarmupText, UpdateSourceTrigger=PropertyChanged}"/>
+                    </StackPanel>
+                    <StackPanel Margin="0,0,10,0">
+                      <TextBlock Text="Measured (s)" Style="{StaticResource Label}" Margin="0,0,0,4"/>
+                      <TextBox Text="{Binding MeasureText, UpdateSourceTrigger=PropertyChanged}"/>
+                    </StackPanel>
+                    <StackPanel Margin="0,0,10,0">
+                      <TextBlock Text="Repeats" Style="{StaticResource Label}" Margin="0,0,0,4"/>
+                      <TextBox Text="{Binding RepeatsText, UpdateSourceTrigger=PropertyChanged}"/>
+                    </StackPanel>
+                  </UniformGrid>
+                  <TextBlock Text="{Binding PlanText}" Style="{StaticResource Hint}" Margin="0,6,0,14"/>
+                  <DockPanel Margin="0,0,0,4">
+                    <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                      <Button Content="Load…" Command="{Binding LoadKeys}" Padding="10,4" FontSize="12" Margin="0,0,6,0"/>
+                      <Button Content="Save…" Command="{Binding SaveKeys}" Padding="10,4" FontSize="12"/>
+                    </StackPanel>
+                    <TextBlock Text="Key script (VICTORY_KEYS, optional)" Style="{StaticResource Label}" VerticalAlignment="Bottom"/>
+                  </DockPanel>
+                  <TextBox Text="{Binding KeysText, UpdateSourceTrigger=PropertyChanged}" AcceptsReturn="True" Height="110"
+                           FontFamily="{StaticResource Mono}" FontSize="12" VerticalScrollBarVisibility="Auto"
+                           ToolTip="seconds:key (held 0.2 s) or from-to:key, on lines or comma-separated; # starts a comment. Keys: a letter, a digit, Enter, Esc, Tab, Back, Up, Down, Left, Right."/>
+                  <TextBlock Style="{StaticResource Hint}" Text="seconds:key holds it 0.2 s; from-to:key holds it all that time. Keys: a letter, a digit, Enter, Esc, Tab, Back, Up, Down, Left, Right. # starts a comment."/>
+                  <TextBlock Text="{Binding KeysCheck}" Foreground="{Binding KeysTone}" TextWrapping="Wrap" FontSize="12" Margin="0,8,0,0"/>
+                </StackPanel>
+              </Border>
+            </Grid>
+
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,16">
+              <StackPanel>
+                <DockPanel Margin="0,0,0,10">
+                  <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                    <Button Content="Export CSV…" Command="{Binding ExportCsv}" Margin="0,0,8,0"/>
+                    <Button Content="Benchmarks folder" Command="{Binding OpenFolder}"/>
+                  </StackPanel>
+                  <StackPanel>
+                    <TextBlock Text="Results" Style="{StaticResource H2}" Margin="0"/>
+                    <TextBlock Text="{Binding ResultTitle}" Style="{StaticResource Hint}"/>
+                  </StackPanel>
+                </DockPanel>
+                <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled"
+                              Visibility="{Binding Report, Converter={StaticResource Vis}}">
+                  <StackPanel>
+                    <DockPanel Margin="0,0,0,6">
+                      <TextBlock Text="Candidate" Width="220" Style="{StaticResource Label}"/>
+                      <ItemsControl ItemsSource="{Binding Report.Columns}">
+                        <ItemsControl.ItemsPanel><ItemsPanelTemplate><StackPanel Orientation="Horizontal"/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                          <DataTemplate><TextBlock Text="{Binding}" Width="128" Style="{StaticResource Label}" TextWrapping="Wrap" Padding="0,0,8,0"/></DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                      </ItemsControl>
+                    </DockPanel>
+                    <ItemsControl ItemsSource="{Binding Report.Rows}">
+                      <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                          <Border BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Padding="0,8">
+                            <DockPanel>
+                              <StackPanel Width="220">
+                                <TextBlock Text="{Binding Candidate}" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,10,0"/>
+                                <TextBlock Text="{Binding Runs}" Style="{StaticResource Hint}"/>
+                              </StackPanel>
+                              <ItemsControl ItemsSource="{Binding Cells}">
+                                <ItemsControl.ItemsPanel><ItemsPanelTemplate><StackPanel Orientation="Horizontal"/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+                                <ItemsControl.ItemTemplate>
+                                  <DataTemplate>
+                                    <StackPanel Width="128">
+                                      <TextBlock Text="{Binding Value}" FontWeight="SemiBold"/>
+                                      <TextBlock Text="{Binding Diff}" FontSize="11.5" Foreground="{Binding Converter={StaticResource CellTone}}" TextWrapping="Wrap" Margin="0,2,8,0"/>
+                                    </StackPanel>
+                                  </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                              </ItemsControl>
+                            </DockPanel>
+                          </Border>
+                        </DataTemplate>
+                      </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                  </StackPanel>
+                </ScrollViewer>
+                <TextBlock Text="Verdict" Style="{StaticResource H2}" Margin="0,12,0,6" Visibility="{Binding Report, Converter={StaticResource Vis}}"/>
+                <ItemsControl ItemsSource="{Binding Report.Verdicts}">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate><TextBlock Text="{Binding}" TextWrapping="Wrap" Foreground="{StaticResource Muted}" Margin="0,0,0,3"/></DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <TextBlock Style="{StaticResource Hint}" Margin="0,10,0,0" Visibility="{Binding Report, Converter={StaticResource Vis}}"
+                           Text="Mean ± spread (half the range) over the good runs. A difference is within noise under max(0.5 fps, 2 × the larger spread); the other figures use floors of 1 ms (median), 10 ms (worst), 1 hitch, 0.5 ms (preparing, GPU, copying back) and 64 MB. —: not measured."/>
+              </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,16" Visibility="{Binding Runs.Count, Converter={StaticResource Vis}}">
+              <StackPanel>
+                <TextBlock Text="Runs" Style="{StaticResource H2}"/>
+                <ItemsControl ItemsSource="{Binding Runs}">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                      <Border BorderBrush="{StaticResource Line}" BorderThickness="0,0,0,1" Padding="0,6">
+                        <DockPanel>
+                          <Button DockPanel.Dock="Right" Content="Log" Padding="10,3" FontSize="12" VerticalAlignment="Top" CommandParameter="{Binding LogPath}"
+                                  Command="{Binding DataContext.OpenRunLog, RelativeSource={RelativeSource AncestorType=ItemsControl}}"/>
+                          <Border Width="3" CornerRadius="2" Background="{Binding Tone}" Margin="0,0,10,0"/>
+                          <StackPanel>
+                            <TextBlock FontWeight="SemiBold"><Run Text="{Binding Title, Mode=OneWay}"/> · <Run Text="{Binding Status, Mode=OneWay}" Foreground="{Binding Tone, Mode=OneWay}"/></TextBlock>
+                            <TextBlock Text="{Binding Detail}" Style="{StaticResource Hint}" Foreground="{StaticResource Muted}"/>
+                          </StackPanel>
+                        </DockPanel>
+                      </Border>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+              </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource CardBorder}">
+              <StackPanel>
+                <DockPanel Margin="0,0,0,10">
+                  <Button DockPanel.Dock="Right" Content="Refresh" Command="{Binding Refresh}" Padding="10,4" FontSize="12"/>
+                  <TextBlock Text="Past benchmarks" Style="{StaticResource H2}" Margin="0"/>
+                </DockPanel>
+                <TextBlock Text="None yet. Each benchmark is saved in %LOCALAPPDATA%\RunkisLauncher\benchmarks." Style="{StaticResource Hint}"
+                           Visibility="{Binding Past.Count, Converter={StaticResource Vis}, ConverterParameter=not}"/>
+                <ListBox ItemsSource="{Binding Past}" SelectedItem="{Binding SelectedPast}" MaxHeight="300"
+                         ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                  <ListBox.ItemContainerStyle>
+                    <Style TargetType="ListBoxItem">
+                      <Setter Property="Cursor" Value="Hand"/>
+                      <Setter Property="Template">
+                        <Setter.Value>
+                          <ControlTemplate TargetType="ListBoxItem">
+                            <Border x:Name="b" Background="Transparent" CornerRadius="7" Padding="10,7" Margin="0,0,0,2"><ContentPresenter/></Border>
+                            <ControlTemplate.Triggers>
+                              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Background" Value="{StaticResource CardHover}"/></Trigger>
+                              <Trigger Property="IsSelected" Value="True"><Setter TargetName="b" Property="Background" Value="#1C2A45"/></Trigger>
+                            </ControlTemplate.Triggers>
+                          </ControlTemplate>
+                        </Setter.Value>
+                      </Setter>
+                    </Style>
+                  </ListBox.ItemContainerStyle>
+                  <ListBox.ItemTemplate>
+                    <DataTemplate>
+                      <StackPanel>
+                        <TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                        <TextBlock Text="{Binding Summary}" Style="{StaticResource Hint}"/>
+                      </StackPanel>
+                    </DataTemplate>
+                  </ListBox.ItemTemplate>
+                </ListBox>
+              </StackPanel>
+            </Border>
           </StackPanel>
         </ScrollViewer>
       </TabItem>

@@ -57,16 +57,10 @@ public sealed class FrameStats
             window = frames.Where(f => end - f.At <= seconds).ToArray();
         }
         // (The log's first line has a gap of about 0: the log opens at the first present.)
-        var times = window.Select(f => f.Ms).Where(ms => ms > 0.01).ToArray();
-        if (times.Length < 2) return new(null, null, null, null, 0, times.Length);
-        var total = times.Sum();
-        var avg = total / times.Length;
-        var fps = total > 0 ? 1000.0 * times.Length / total : (double?)null;
         // 1 % low: the frame rate of the slowest 1 % of frames (at least one), averaged. A percentile would step over
-        // the few long frames that make a stutter, which are what this figure is for.
-        var sorted = times.Order().ToArray();
-        var slowest = sorted.TakeLast(Math.Max(1, sorted.Length / 100)).Average();
-        return new(fps, avg, slowest > 0 ? 1000.0 / slowest : null, sorted[^1], times.Count(t => t >= HitchMs), times.Length);
+        // the few long frames that make a stutter, which are what this figure is for. The benchmark uses the same.
+        var f = FramePacing.Of(window.Select(s => s.Ms));
+        return new(f.AvgFps, f.AvgMs, f.Low1Fps, f.WorstMs, f.Hitches ?? 0, f.Frames);
     }
 
     public void Clear() { lock (gate) frames.Clear(); }

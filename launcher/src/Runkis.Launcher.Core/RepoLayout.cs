@@ -55,6 +55,7 @@ public static class AppPaths
     public static string Local => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RunkisLauncher");
     public static string Profiles => Path.Combine(Roaming, "profiles");
     public static string Logs => Path.Combine(Local, "logs");
+    public static string Benchmarks => Path.Combine(Local, "benchmarks");
     public static string SettingsFile => Path.Combine(Roaming, "launcher.json");
 
     /// <summary>The layer's own defaults when no cache or data folder is set (crates/victory-core/src/config.rs default_dir).</summary>

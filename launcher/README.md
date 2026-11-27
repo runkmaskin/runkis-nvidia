@@ -72,6 +72,81 @@ During and after a run, known messages from the layer are explained on the Play 
 limit, unimplemented import, missing DLLs, panic, the policy, the adapter, AVX2. `crashes.log` is read when the
 run ends.
 
+## Benchmark
+
+The Benchmark page measures settings on your own PC, by the README's method: the same save, scripted input, a
+warm-up, then a measured window read from the layer's own logs. Load the save you want to measure in the game
+first (or let the key script get there), so every run starts from the same place.
+
+**Candidates.** A candidate is a preset ("Recommended for this PC" and the others, applied over your profile's
+game, folders, card and build), a saved profile, or either with raw layer switches on top: one `VICTORY_NAME=value`
+a line, checked against `^VICTORY_[A-Z0-9_]+=.*$`. `VICTORY_FRAME_LOG` and `VICTORY_KEYS` are the benchmark's own
+and are refused there. The first candidate is the baseline the others are compared with ("Make first" changes it).
+
+**A run.** Defaults: 40 s warm-up, 90 s measured, 2 repeats. The runs go interleaved, A B A B, so drift over the
+session (heat, caches, background work) averages out.
+
+1. victory.exe starts through the same path as Play: `play-nvidia.ps1 -PrintEnv`, the profile's overrides, then
+   the candidate's raw settings and the key script. Its logs are `logs\<time>-bench.log` and `.frames.txt`.
+2. The warm-up counts from the **first picture**: the frame log's second 0, which the layer writes at the first
+   present. Shader translation before it does not eat into the warm-up.
+3. At warm-up + measured seconds, the run is stopped the normal way: the window is asked to close, and the process
+   tree is ended after 8 s. The next run starts only once that process is gone, and never beside another victory
+   process (it waits 15 s for one, then that run fails).
+4. A run fails, and the next one goes on, when it ends before the measurement is done (a crash: the message names
+   the exit and the problems found in the log), shows no picture within warm-up + 120 s of its start, shows no
+   picture in the last 10 s of the window (frozen), or has fewer than two frames in the window. Cancel stops the
+   current run the same graceful way and starts no other; what was measured is saved, marked cancelled.
+5. If the title restarts itself, the new process writes the frame log again; the run's clock starts again with it.
+
+**The figures**, over the measured window only:
+
+| Figure | Source |
+|---|---|
+| Average fps, 1 % low, median frame time, worst frame, hitches ≥100 ms | The frame log: frames presented after warm-up s and up to warm-up + measured s. Average fps is frames over their total time; 1 % low is the frame rate of the slowest 1 % of frames, averaged, as on the Play page |
+| Preparing, on the GPU, copying back (ms per frame) | The mean over the window of the layer's five-second line `{fps} fps, {ms} ms/frame ({cpu} preparing: copies … ms … MB, textures … ms … MB; {gpu} on the GPU; {back_ms} copying back {back_mb} MB), …` (victory-gpu `host.rs`, `Meter::frame`). Each line's figures are of the second before it; a line counts when that second lies in the window |
+| Peak private, peak VRAM (MB) | The highest `private` and `gpu_used` of the `memory by subsystem:` lines in the window (`host.rs` `memory_line`). Not the lines' own `_peak` fields, which include the warm-up |
+
+A figure the source did not give is empty in the file and "—" on the page; nothing is estimated. Tests format the
+two `host.rs` format strings the way Rust does and parse them back, so a change to either line fails a test.
+
+**Results.** Per candidate: mean ± spread over its good runs, where the spread is half the range,
+(max − min) / 2. Each other candidate shows its difference from the first, marked "within noise" when it is under
+max(0.5 fps, 2 × the larger of the two spreads). The 0.5 floor is the README's ±0.4 fps between identical runs;
+for the other figures the launcher uses floors of 1 ms (median), 10 ms (worst frame), 1 hitch, 0.5 ms (preparing,
+GPU, copying back) and 64 MB (memory). With fewer than two good runs on either side, the noise is unknown and is
+shown as such. A verdict line per figure sums it up.
+
+Each benchmark is saved as `%LOCALAPPDATA%\RunkisLauncher\benchmarks\<yyyyMMdd-HHmmss>.json` (options, candidates
+with their full profiles, every run) and listed under "Past benchmarks". "Export CSV" writes one row per run, then
+per candidate its mean, spread, difference from the first and whether that is within noise.
+
+### Key script (`VICTORY_KEYS`)
+
+The layer presses keys from `VICTORY_KEYS` (`crates/victory-hle/src/modules/gameinput.rs`, `scripted()`), with or
+without focus. The format, exactly as the layer reads it:
+
+- Entries are separated by commas: `VICTORY_KEYS=30:Enter,35:X,40-70:W`.
+- `<seconds>:<key>` holds the key for 0.2 s from that second. `<from>-<to>:<key>` holds it from `from` up to,
+  not including, `to`. Seconds are decimal numbers (`2.5`); spaces around them and the key are ignored.
+- A key is one letter or digit (either case), or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right`.
+  These names are case-sensitive.
+- The keys are keyboard keys to the title, and they drive the keyboard's stand-in pad (`fallback()`): Enter A,
+  Back B, Esc Menu, Tab View, X X, Y Y, arrows the d-pad, Q/E the shoulders, F/H the stick clicks, W/A/S/D the
+  left stick, I/J/K/L the right stick, Z/C the triggers. By default (`VICTORY_ONE_PAD` unset) the title sees one
+  pad fed by the stand-in and every real pad, so all of these work with a pad connected too. With
+  `VICTORY_ONE_PAD=0` and a real pad connected, only the buttons reach it (pad 0), not the sticks or triggers.
+- **The clock** starts when the title first opens its input (`GameInputCreate`), not when the process starts and
+  not at the first picture. A key script has no other time base.
+- The layer skips an entry it cannot read, without a word. The launcher refuses to start with one, and names it.
+
+In the launcher, the script can be typed or loaded from a `.txt` file, with entries on lines of their own or
+comma-separated and `#` starting a comment; it is passed on as one comma-separated value, shown under the box. The
+page warns about keys that come after the run is stopped (warm-up + measured) or are never held (`to` not after
+`from`), and says whether any key is held during the measured window. The script's clock and the warm-up's
+(first picture) both start during start-up, at moments the launcher cannot see, so their offset is not known in
+advance: each run records when its first picture came after the process started, to fit a script after one trial.
+
 ## Profiles
 
 Profiles are JSON files in `%APPDATA%\RunkisLauncher\profiles`.
@@ -86,7 +161,8 @@ The first profile holds PLAY.bat's values.
 ## Layout
 
 - `src/Runkis.Launcher.Core`: everything that is not UI. Profiles, the launch plan, the session, frame stats,
-  hardware, diagnostics. It is tested.
+  hardware, diagnostics, the benchmark (`Benchmark/`: the runner, with an injectable session factory, the key
+  script and log-line parsers, the statistics and the store). It is tested.
 - `src/Runkis.Launcher`: WPF views and one view model.
 - `tests/Runkis.Launcher.Tests`: `dotnet test launcher\RunkisLauncher.slnx`. Includes a real run of the script and
   an end-to-end start of `victory.exe`.

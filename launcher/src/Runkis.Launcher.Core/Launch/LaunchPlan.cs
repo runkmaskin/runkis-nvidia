@@ -24,6 +24,24 @@ public sealed class LaunchPlan
 
     public string CommandLine => Quote(Victory) + " " + string.Join(" ", Args.Select(Quote));
 
+    /// <summary>The same plan with <paramref name="extra"/> set over its settings, and its logs at <paramref name="logPath"/>.</summary>
+    public LaunchPlan With(IReadOnlyDictionary<string, string> extra, string logPath, string? frameLogPath)
+    {
+        var settings = new Dictionary<string, string>(Settings);
+        var overridden = Overridden.ToList();
+        foreach (var (k, v) in extra)
+        {
+            if (!settings.TryGetValue(k, out var was) || was != v) overridden.Add(k);
+            settings[k] = v;
+        }
+        if (frameLogPath != null) settings["VICTORY_FRAME_LOG"] = frameLogPath;
+        return new LaunchPlan
+        {
+            Mode = Mode, Victory = Victory, WorkDir = WorkDir, Args = Args, Settings = settings, Overridden = overridden.Distinct().ToList(),
+            LogPath = logPath, FrameLogPath = frameLogPath, GameExe = GameExe, DataDir = DataDir, CacheDir = CacheDir,
+        };
+    }
+
     private static string Quote(string a) => a.Contains(' ') ? $"\"{a}\"" : a;
 }
 
