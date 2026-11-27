@@ -357,12 +357,12 @@ public class PlanTests
     }
 
     [Fact]
-    public void Upscale_to_the_window_is_not_in_the_pc_preset()
+    public void Upscale_to_the_window_follows_the_profile_not_the_preset()
     {
         var preset = Presets.ForThisPc([new GpuAdapter(0, "NVIDIA GeForce RTX 4070 SUPER", 0x10DE, 1, 12UL << 30, 0, 0, false, "32.0.16.2114")],
             new SystemSnapshot("cpu", 8, 16, 32UL << 30, 0, 64UL << 30, 0, "win", true, "Balanced", false), null);
         var p = Presets.Make(preset, new LaunchProfile { GameExe = "x.exe", PresentScale = true });
-        Assert.False(p.PresentScale);   // the user turns it on in a profile
+        Assert.True(p.PresentScale);    // kept from the profile, like the window mode
         Assert.All(Presets.All, x => Assert.False(Presets.Make(x, new LaunchProfile()).PresentScale));
     }
 

@@ -112,6 +112,9 @@ public static class Presets
             Window = basis.Window,
             WindowSize = basis.WindowSize,
             Monitor = basis.Monitor,
+            // How the frame reaches the screen goes with the screen, not with a preset.
+            PresentScale = basis.PresentScale,
+            PresentSharpen = basis.PresentSharpen,
         };
         preset.Apply(p);
         return p;
