@@ -15,9 +15,9 @@ public static class Presets
             + "Helps most when the graphics card is the limit; little when the CPU is.",
             p => { p.Resolution = 480; p.SkipHairSim = true; p.LeaveOut = true; }),
         new("sharp", "Sharp (10 GB+ VRAM)",
-            "720p and full-size textures: the 8 GB-card limits (texture mip drop, small render-target reserve) are lifted. "
-            + "For cards with 10 GB or more; costs some fps for the higher resolution.",
-            p => { p.Resolution = 720; p.MipDrop = 0; p.TargetRoomMb = 3072; }),
+            "720p and full-size textures, for cards with 10 GB or more. Not measured: on 8 GB full-size textures ran the card out "
+            + "of room. Expect fewer fps and possibly more hitches; a picture setting, not a speed one.",
+            p => { p.Resolution = 720; p.MipDrop = 0; }),
         new("quality", "Fewer glitches",
             "Quality mode: stops stretched or jumping bodies, textures through walls and rainbow skin. About 29 % fewer fps.",
             p => { p.Quality = true; }),
@@ -52,22 +52,21 @@ public static class Presets
         }
         var gb = (chosen?.DedicatedVideoMemory ?? 0) / (double)(1UL << 30);
         int? resolution = null, mipDrop = null, mipMin = null, targetRoom = null;
-        if (gb >= 9.5)
-        {
-            // The mip drop and the 1.5 GB reserve were chosen because an 8 GB card ran out of texture room.
-            (mipDrop, targetRoom) = (0, 3072);
-            why.Add($"{gb:0} GB of video memory: full-size textures and the layer's own 3 GB render-target reserve (the 8 GB limits are not needed)");
-        }
-        else if (gb > 0 && gb < 7.5)
+        // 7.5 GB and more: the measured set. Its 1.5 GB render-target reserve is not a limit to lift on a bigger card: a
+        // smaller reserve leaves more room for textures (README: the 3 GB reserve had worst frames of 0.7-1.2 s,
+        // 1.5 GB 0.2 s), and full-size textures were never measured to be faster. Bigger cards keep it until a run
+        // on one shows otherwise.
+        if (gb > 0 && gb < 7.5)
         {
             // README: a mip drop from 1024 px "removes VRAM overflow completely, but visibly blurrier".
             (resolution, mipDrop, mipMin) = (480, 1, 1024);
             why.Add($"{gb:0.#} GB of video memory: 480p and smaller large textures, so the card does not run out");
         }
         else if (gb > 0)
-            why.Add($"{gb:0} GB of video memory: the 8 GB set as measured");
-        // The measured set kept 6 of 12 threads for the big memory compares: half of them, at most 8 here.
-        var wide = Math.Clamp(sys.LogicalProcessors / 2, 2, 8);
+            why.Add($"{gb:0} GB of video memory: the video-memory settings as measured");
+        // The measured set kept 6 of 12 threads for the big memory compares. Fewer threads: half of them; 12 and more:
+        // the measured 6 (more was never measured).
+        var wide = sys.LogicalProcessors >= 12 ? 6 : Math.Clamp(sys.LogicalProcessors / 2, 2, 6);
         if (wide != 6) why.Add($"{sys.LogicalProcessors} CPU threads: {wide} kept for memory compares (the measured set kept 6 of 12)");
         if (sys.LogicalProcessors < 12)
             why.Add("fewer than 12 CPU threads: expect lower fps than the README's figures; the game is CPU-bound");

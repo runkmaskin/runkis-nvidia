@@ -157,13 +157,15 @@ public class ThisPcPresetTests
         new("cpu", threads / 2, threads, (ulong)(ramGb * GB), 0, (ulong)(ramGb * 2 * GB), 0, "win", true, "Balanced", false);
 
     [Fact]
-    public void A_12_gb_card_and_16_threads_lift_the_8_gb_limits()
+    public void A_bigger_pc_keeps_the_measured_set()
     {
+        // Nothing measured says a 12 GB card or 16 threads want other values: the measured ones stay (a 3 GB
+        // render-target reserve and full-size textures had made frames worse).
         var preset = Presets.ForThisPc([Card(0, "NVIDIA GeForce RTX 4070 SUPER", 12)], Pc(16, 32), null);
         var p = Presets.Make(preset, new LaunchProfile { GameExe = "x.exe" });
-        Assert.Equal(0, p.MipDrop);
-        Assert.Equal(3072, p.TargetRoomMb);
-        Assert.Equal(8, p.WideThreads);
+        Assert.Null(p.MipDrop);
+        Assert.Null(p.TargetRoomMb);
+        Assert.Null(p.WideThreads);
         Assert.Equal(540, p.Resolution);
         Assert.Contains("12 GB", preset.Description);
     }
@@ -184,7 +186,7 @@ public class ThisPcPresetTests
         Assert.Equal(480, p.Resolution);
         Assert.Equal(1, p.MipDrop);
         Assert.Equal(1024, p.MipDropMinSize);
-        Assert.Equal(4, p.WideThreads);
+        Assert.Equal(4, p.WideThreads);   // 8 threads: half
     }
 
     [Fact]

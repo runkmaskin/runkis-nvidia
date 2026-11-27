@@ -1,4 +1,4 @@
-# Runkis Launcher
+﻿# Runkis Launcher
 
 A Windows desktop app that sets up, starts, watches and troubleshoots the layer. It is a front end only: it
 changes nothing in how `victory.exe` runs beyond the settings you pick, and every setting it shows is one the
@@ -11,7 +11,7 @@ the .NET 8 SDK). Afterwards `launcher\dist\RunkisLauncher.exe` runs on the .NET 
 
 1. **Settings.** `scripts\play-nvidia.ps1 -PrintEnv` prints the tuned settings as JSON and starts nothing. These
    are the same settings PLAY.bat uses, so there is one source and the two cannot drift apart. The profile's
-   switches (`-SeriesX`, `-Quality`, `-Resolution`, `-Adapter`, `-Build`, …) and its `VN_*` values go into that call.
+   switches (`-SeriesX`, `-Quality`, `-Resolution`, `-Adapter`, `-Build`, â€¦) and its `VN_*` values go into that call.
 2. **Overrides.** The profile's own overrides go on top: pipeline wait, mip drop, compare threads, render-target
    room, pool discard, pipeline book, panel, log filter. Empty fields keep the script's value. "Show effective
    settings" lists the result, with a mark on what the profile changed.
@@ -31,17 +31,17 @@ saved as a profile.
 
 | Preset | What it sets |
 |---|---|
-| **Recommended for this PC** (the default) | Worked out from this PC, starting from the measured set (RTX 2070 SUPER 8 GB, 12 threads). Changes only what that set chose for its own hardware. **10 GB or more of VRAM:** full-size textures and the layer's 3 GB render-target reserve. **Under 7.5 GB:** 480p, with large textures dropped from 1024 px. **CPU threads:** half of them, at most 8, kept for memory compares (the measured set kept 6 of 12). **Card:** if Windows' default card isn't the NVIDIA one, the NVIDIA card with the most memory is picked. The description lists each step. The result is not measured on your PC: compare it with Standard |
+| **Recommended for this PC** (the default) | Worked out from this PC, starting from the measured set (RTX 2070 SUPER 8 GB, 12 threads). Changes only what that set chose for its own hardware. **Under 7.5 GB:** 480p, with large textures dropped from 1024 px. **CPU threads:** half of them, at most 8, kept for memory compares (the measured set kept 6 of 12). **Card:** if Windows' default card isn't the NVIDIA one, the NVIDIA card with the most memory is picked. The description lists each step. The result is not measured on your PC: compare it with Standard |
 | Standard | The measured PLAY.bat set |
 | Max FPS | 480p; hair physics, decal defragmentation and heat haze left out |
 | Sharp (10 GB+ VRAM) | 720p, full-size textures, 3 GB render-target reserve |
-| Fewer glitches | Quality mode (about −29 % fps) |
+| Fewer glitches | Quality mode (about âˆ’29 % fps) |
 | Series X | The Series X profile at 1080p |
 | Troubleshoot | Quality mode, every shader waited for, DRED light (diag build) |
 
 ## Where the numbers come from
 
-Nothing is estimated. A figure that is not available shows "—", and its tooltip says why.
+Nothing is estimated. A figure that is not available shows "â€”", and its tooltip says why.
 
 | Figure | Source |
 |---|---|
@@ -90,3 +90,4 @@ The first profile holds PLAY.bat's values.
 - `src/Runkis.Launcher`: WPF views and one view model.
 - `tests/Runkis.Launcher.Tests`: `dotnet test launcher\RunkisLauncher.slnx`. Includes a real run of the script and
   an end-to-end start of `victory.exe`.
+
