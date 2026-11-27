@@ -11269,6 +11269,13 @@ impl Meter {
                      (VICTORY_TEXTURE_RECHECK=1): {rechecked:.1}"
                 );
             }
+            let early = crate::texture::PARTIAL_EARLY.swap(0, Ordering::Relaxed);
+            if early > 0 {
+                tracing::info!(
+                    "partly mapped textures read before their window was up, as a write was seen or a bake read them, \
+                     since the last line (VICTORY_PARTIAL_WRITTEN=1): {early}"
+                );
+            }
             let bake = crate::texture::BAKE_WAITED.swap(0, Ordering::Relaxed);
             if bake > 0 {
                 tracing::info!(

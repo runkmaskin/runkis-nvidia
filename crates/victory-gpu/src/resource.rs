@@ -2354,11 +2354,13 @@ pub(crate) fn audit() {
     // Counts: looked at, their bytes, equal, differ, differ and partly
     // mapped, differ and stable, of them with a staging buffer, no hash
     // kept, oldest stable age in frames, stable bytes.
-    let mut c = [0u64; 10];
+    let mut c = [0u64; 12];
     let mut said = 0;
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let seen = seen.get_or_insert_with(Default::default);
-    let mut differing = std::collections::HashMap::new();
+    static LOW: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
+    let mut low = LOW.lock().unwrap_or_else(|e| e.into_inner());
+    let low = low.get_or_insert_with(Default::default);
     let all = textures();
     let from = FROM.load(Relaxed);
     let mut last = None;
@@ -2376,6 +2378,20 @@ pub(crate) fn audit() {
             Some((host, _)) => host.clone(),
             None => continue,
         };
+        // A host copy that starts at a larger level than a view shows now:
+        // that view is drawn from a smaller level (big texels) until a copy
+        // with the level is made and filled.
+        if host.base > 0
+            && r.host.placed.load(Relaxed)
+            && let Some(viewed) = crate::descriptor::host::first_viewed(r.data() as u64)
+            && viewed < host.base
+        {
+            let since = *low.entry(at).or_insert(frame);
+            c[10] += 1;
+            c[11] = c[11].max(frame.saturating_sub(since));
+        } else {
+            low.remove(&at);
+        }
         let Some((first, held)) = *host.holds.lock().unwrap_or_else(|e| e.into_inner()) else {
             c[7] += 1;
             continue;
@@ -2390,6 +2406,7 @@ pub(crate) fn audit() {
         c[1] += size as u64;
         if now == held {
             c[2] += 1;
+            seen.remove(&at);
             continue;
         }
         c[3] += 1;
@@ -2428,13 +2445,12 @@ pub(crate) fn audit() {
             }
             _ => frame,
         };
-        differing.insert(at, (now, first_seen));
+        seen.insert(at, (now, first_seen));
     }
     drop(all);
     FROM.store(last.map_or(0, |at| at + 1), Relaxed);
-    *seen = differing;
     tracing::info!(
-        "texture audit (VICTORY_TEXTURE_AUDIT): {} used host copies looked at ({} MB) in {} ms: {} as filled, {} differ from title memory now ({} of them partly mapped), {} stale with the title's memory unchanged since the last look ({} MB, {} with a staging buffer, the oldest {} frames); {} with no hash kept (not looked at)",
+        "texture audit (VICTORY_TEXTURE_AUDIT): {} used host copies looked at ({} MB) in {} ms: {} as filled, {} differ from title memory now ({} of them partly mapped), {} stale with the title's memory unchanged since the last look ({} MB, {} with a staging buffer, the oldest {} frames); {} with no hash kept (not looked at); {} host copies start at a larger level than a view of them shows now (the oldest {} frames)",
         c[0],
         c[1] >> 20,
         began.elapsed().as_millis(),
@@ -2445,7 +2461,9 @@ pub(crate) fn audit() {
         c[9] >> 20,
         c[6],
         c[8],
-        c[7]
+        c[7],
+        c[10],
+        c[11]
     );
 }
 

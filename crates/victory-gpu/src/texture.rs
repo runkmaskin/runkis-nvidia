@@ -137,6 +137,37 @@ fn partial_every() -> u64 {
     })
 }
 
+/// Whether a partly mapped texture is read again at its next refresh when
+/// the guard saw a write to it, or a bake reads it, instead of waiting out
+/// [`partial_every`] (`VICTORY_PARTIAL_WRITTEN=1`; off by default).
+///
+/// Why: a texture streams into pages that held another texture's bytes. A
+/// refresh while only some of its pages are mapped reads those bytes, and
+/// the texture's own texels land a moment later. The guard sees that write,
+/// but the refresh in the partial-read window returned without reading and
+/// noted the asking as done, so the write was forgotten: the texture kept
+/// the other bytes (blocks of noise in compressed colour) until its hash
+/// turn, and a bake that read it then kept them for the run. With the switch
+/// such a texture is read in the next frame, and the write stays noted until
+/// it is. From 101Leafy/victory-leafy 5225014 (and DoubleGhosty/cool_fox
+/// c341046 for the bake's reads), GPL-3.0.
+fn partial_written() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PARTIAL_WRITTEN").is_some_and(|v| v == "1"))
+}
+
+/// Whether a partly mapped texture last read in frame `at` is read in
+/// `frame`: in any later frame when `soon` (a write was seen), else once
+/// `every` frames have passed.
+fn partial_due(at: Option<u64>, frame: u64, soon: bool, every: u64) -> bool {
+    at.is_none_or(|at| if soon { frame != at } else { frame >= at + every })
+}
+
+/// Since the last frame line: partly mapped textures read before their
+/// window was up because a write was seen or a bake read them
+/// ([`partial_written`]).
+pub(crate) static PARTIAL_EARLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn blind_hot_frames() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -1343,6 +1374,8 @@ impl Staging {
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // The guard saw no write: a change the hash finds came another way.
         let mut blind = false;
+        // The guard saw a write since the last refresh.
+        let mut seen = false;
         if !alone
             && self.guard_view
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
@@ -1369,6 +1402,7 @@ impl Staging {
                 return 0;
             }
             blind = unwritten;
+            seen = !unwritten;
         }
         // A change the guard did not see: hashed at every check for a while.
         let found_blind = |last: &mut Last| {
@@ -1410,8 +1444,17 @@ impl Staging {
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + partial_every()) {
+            let soon = partial_written() && (seen || exact);
+            if !partial_due(last.partial, frame, soon, partial_every()) {
+                if soon {
+                    // The write the guard saw is not forgotten: the next
+                    // refresh reads the texture (`partial_written`).
+                    last.asked = 0;
+                }
                 return 0;
+            }
+            if soon && !partial_due(last.partial, frame, false, partial_every()) {
+                PARTIAL_EARLY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             last.partial = Some(frame);
             #[cfg(feature = "diagnostics")]
@@ -2047,6 +2090,25 @@ mod recheck_tests {
         for (no_wait, exact, waits) in cases {
             assert_eq!(waits_for_remap(no_wait, exact), waits, "{no_wait} {exact}");
         }
+    }
+
+    /// A partly mapped texture whose write the guard saw (or that a bake
+    /// reads) is read in the next frame, not after the window; with no write,
+    /// once the window is up, as before (the old test: `frame < at + every`
+    /// passes it over).
+    #[test]
+    fn a_partly_mapped_texture_is_read_again_after_a_write() {
+        use super::partial_due;
+        let old = |at: Option<u64>, frame: u64| !at.is_some_and(|at| frame < at + 30);
+        for at in [None, Some(100)] {
+            for frame in 100..140 {
+                assert_eq!(partial_due(at, frame, false, 30), old(at, frame), "{at:?} {frame}");
+            }
+        }
+        assert!(partial_due(None, 100, true, 30));
+        assert!(!partial_due(Some(100), 100, true, 30), "not twice in a frame");
+        assert!(partial_due(Some(100), 101, true, 30), "the next frame");
+        assert!(!old(Some(100), 101), "before: 29 frames later");
     }
 
     /// A read through the kernel is read again exactly when the change count

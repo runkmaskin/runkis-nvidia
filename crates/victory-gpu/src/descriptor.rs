@@ -1044,6 +1044,14 @@ static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomi
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
     crate::port_descriptors::line(frames);
+    let [in_place, alone] = [0, 1].map(|i| crate::draw::IN_PLACE_INDIRECT[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    if in_place > 0 {
+        tracing::info!(
+            "renderer port 1: indirect executions with arguments or count read in place per frame: {:.0}, of them {:.0} clamped alone right before they ran (VICTORY_PORT_CONSTANTS_ORDER=1)",
+            in_place as f64 / frames,
+            alone as f64 / frames
+        );
+    }
     let [twins, moved, lost] = [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if twins > 0 {
         tracing::info!(
@@ -1884,6 +1892,70 @@ pub(crate) extern "system" fn create_uav(
     record(handle, view);
 }
 
+/// Whether placed views keep only the words their kind uses
+/// (`VICTORY_PLACED_PADDING=1`; off by default).
+///
+/// Why: the title leaves padding unwritten in the two descriptions it passes:
+/// words 1 and 13 of the resource description, word 3 of a shader resource
+/// view (the union after the component mapping starts on 8 bytes) and the
+/// tail of the view's union that its dimension does not use. The same view
+/// then comes in with other bytes there, and each is a new view: a new shape
+/// (731,596 after five minutes of a run here; past 4,194,304 every placed
+/// view is a table entry kept for the run), a new record, and a slot that
+/// shows it counts as written with another texture. Those words are zero
+/// now. From trustno1-coder/VIctory-NVIDIA pull request 58 (4eead678,
+/// 144aca0f; first in JMAN730/project-flamingo b1e0cd1d), GPL-3.0.
+fn placed_padding() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_PADDING").is_some_and(|v| v == "1"))
+}
+
+/// The resource description's fields, its padding words (1 and 13) zero.
+fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
+    let mut d = words(desc)?;
+    (d[1], d[13]) = (0, 0);
+    Some(d)
+}
+
+/// A placed view's words with those its kind does not use zero. The first
+/// ten words are the PC's view description: for a shader resource view the
+/// format, the dimension, the component mapping, a word of padding and the
+/// union's six words; for an unordered access view the format, the dimension
+/// and the union's eight words. Each dimension uses the head of the union
+/// only (`D3D12_TEX2D_SRV` and the like). Words 10 on (the address and the
+/// console's own fields) are kept; an unknown dimension keeps every word.
+fn placed_view_words(desc: *const [u32; 16], unordered: bool) -> Option<[u32; 16]> {
+    let mut d = words(desc)?;
+    let (start, used) = if unordered {
+        // Buffer, 1D, 1D array, 2D, 2D array, 2D MS, 2D MS array, 3D.
+        const USED: [usize; 9] = [0, 7, 1, 3, 2, 4, 0, 2, 3];
+        (2, USED.get(d[1] as usize).copied())
+    } else {
+        // Buffer, 1D, 1D array, 2D, 2D array, 2D MS, 2D MS array, 3D, cube,
+        // cube array, acceleration structure.
+        const USED: [usize; 12] = [0, 5, 3, 5, 4, 6, 0, 2, 3, 3, 5, 2];
+        (4, USED.get(d[1] as usize).copied())
+    };
+    if let Some(used) = used.filter(|_| d[1] != 0) {
+        if !unordered {
+            d[3] = 0;
+        }
+        d[start + used..10].fill(0);
+    }
+    Some(d)
+}
+
+/// The words of a placed view as recorded: as given, or with
+/// [`placed_padding`] the unused ones zero.
+fn placed_view(resource: *const [u32; 14], desc: *const [u32; 16], unordered: bool) -> Option<View> {
+    let (resource, desc) = if placed_padding() {
+        (placed_resource_words(resource)?, placed_view_words(desc, unordered)?)
+    } else {
+        (words(resource)?, words(desc)?)
+    };
+    Some(View::Placed(unordered, resource, desc))
+}
+
 /// Device methods 0x230 and 0x238: shader resource and unordered access
 /// views of memory the title placed itself, `(resource desc, view desc,
 /// handle)`.
@@ -1893,8 +1965,8 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
-        record(handle, View::Placed(false, resource, desc));
+    if let Some(view) = placed_view(resource, desc, false) {
+        record(handle, view);
     }
 }
 
@@ -1904,8 +1976,8 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
-        record(handle, View::Placed(true, resource, desc));
+    if let Some(view) = placed_view(resource, desc, true) {
+        record(handle, view);
     }
 }
 
@@ -2117,6 +2189,44 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// Two placed views alike but for the words the title leaves unwritten
+    /// (the resource description's padding, the view's padding word and its
+    /// union's unused tail) are one view with `VICTORY_PLACED_PADDING`; a
+    /// word that is used still tells them apart. As given, they were two.
+    #[test]
+    fn placed_views_alike_but_for_unwritten_words_are_one() {
+        let resource = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        // A 2D texture view: format, dimension, mapping, padding, the four
+        // words of D3D12_TEX2D_SRV, two unused, the address, the console's.
+        let view = [98u32, 4, 5768, 0, 2, 7, 0, 0, 0, 0, 0x2000, 0x6, 0, 0, 0, 0];
+        let mut noisy_resource = resource;
+        (noisy_resource[1], noisy_resource[13]) = (0xaaaa_aaaa, 0xbbbb_bbbb);
+        let mut noisy_view = view;
+        (noisy_view[3], noisy_view[8], noisy_view[9]) = (0x77, 0x55, 0x66);
+        assert_ne!(
+            View::Placed(false, resource, view),
+            View::Placed(false, noisy_resource, noisy_view),
+            "as given: two views"
+        );
+        let one = |r: &[u32; 14], v: &[u32; 16], unordered| {
+            (placed_resource_words(r).expect("words"), placed_view_words(v, unordered).expect("words"))
+        };
+        assert_eq!(one(&resource, &view, false), one(&noisy_resource, &noisy_view, false));
+        assert_eq!(one(&noisy_resource, &noisy_view, false), (resource, view));
+        // The first level (word 4) is used.
+        let mut other = view;
+        other[4] = 3;
+        assert_ne!(one(&resource, &other, false), one(&resource, &view, false));
+        // An unordered 2D view uses two words of its union (2-3): 4 to 9 go.
+        let uav = [98u32, 4, 1, 0, 0x33, 0, 0, 0, 0, 0x44, 0x2000, 0x6, 0, 0, 0, 0];
+        let (_, made) = one(&resource, &uav, true);
+        assert_eq!(made[..10], [98, 4, 1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(made[10..], uav[10..]);
+        // A dimension not known keeps every word.
+        let odd = [98u32, 40, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+        assert_eq!(placed_view_words(&odd, false), Some(odd));
+    }
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.
