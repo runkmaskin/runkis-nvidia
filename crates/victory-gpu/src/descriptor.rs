@@ -12,6 +12,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+mod rounds;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -332,11 +334,78 @@ fn heap_sync_priority(raised: bool) -> Option<i32> {
 #[cfg(windows)]
 pub(crate) struct SyncedHeaps(Option<u64>);
 
+/// LOCAL: whether rounds are also asked at the top of a submission, and a
+/// submission whose round has not begun when it is needed runs it itself
+/// (`VICTORY_HEAP_ROUNDS_EARLY=1`; off, as before: [`rounds`]). The submitting
+/// thread waited 10.7-13.3 ms a frame for 17 rounds of 0.5 ms, each begun
+/// 0.3 ms after it was asked for (measured in game, 8d8db49). Not with
+/// `VICTORY_HEAP_SYNC_GPU=1`, whose card waits on the old rounds' fence.
+#[cfg(windows)]
+pub(crate) fn rounds_early() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        sync_aside() && !sync_on_card() && std::env::var_os("VICTORY_HEAP_ROUNDS_EARLY").is_some_and(|v| v == "1")
+    })
+}
+
+/// The rounds of [`rounds_early`].
+#[cfg(windows)]
+static EARLY: rounds::Rounds = rounds::Rounds::new();
+
+/// Since the last frame line, with [`rounds_early`]: rounds asked at the top of
+/// a submission; submissions' rounds run on the submitting thread, their
+/// microseconds, and the microseconds those waited first for a round under way.
+#[cfg(windows)]
+static EARLY_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// [`rounds_early`]: the round's thread, started once. Without it the
+/// submissions run every round themselves.
+#[cfg(windows)]
+fn start_early_rounds() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = crate::named::spawn("victory-heap-sync", || {
+            if let Some(priority) = heap_sync_priority(crate::land::raised()) {
+                use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+                // SAFETY: this thread's own priority.
+                unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+            }
+            crate::cores::keep_on_fast_cores("victory-heap-sync");
+            EARLY.serve(sync_early(), |asked| {
+                let _round =
+                    crate::timeline::span(if asked { "the heaps' records, for a submission" } else { "the heaps' records, early" });
+                let _ = std::panic::catch_unwind(|| sync_round(Some(asked)));
+            });
+        });
+    });
+}
+
+/// [`rounds_early`]: asks for a round at the top of a submission, so that it
+/// runs beside the card steps and the wait for flights. The submission still
+/// waits for the round asked in [`begin_sync_heaps`], which finds only what was
+/// written since. Nothing without the switch.
+#[cfg(windows)]
+pub(crate) fn ask_sync_heaps_ahead() {
+    if !rounds_early() {
+        return;
+    }
+    start_early_rounds();
+    EARLY.ask();
+    ROUND_ASKED_US.store(crate::host::now_us(), std::sync::atomic::Ordering::Relaxed);
+    EARLY_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(windows)]
 pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     if !sync_aside() {
         sync_heaps();
         return SyncedHeaps(None);
+    }
+    if rounds_early() {
+        start_early_rounds();
+        let mine = EARLY.ask();
+        ROUND_ASKED_US.store(crate::host::now_us(), std::sync::atomic::Ordering::Relaxed);
+        return SyncedHeaps(Some(mine));
     }
     static STARTED: std::sync::Once = std::sync::Once::new();
     static THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -442,6 +511,21 @@ impl Drop for SyncedHeaps {
             return;
         };
         let began = std::time::Instant::now();
+        if rounds_early() {
+            use std::sync::atomic::Ordering::Relaxed;
+            // Not begun yet: run here rather than wait for the thread to wake.
+            let had = EARLY.wait_or_run(mine, || {
+                let _round = crate::timeline::span("the heaps' records, for a submission, on its thread");
+                let _ = std::panic::catch_unwind(|| sync_round(Some(true)));
+            });
+            if had.ran {
+                EARLY_STATS[1].fetch_add(1, Relaxed);
+                EARLY_STATS[2].fetch_add(had.round_us, Relaxed);
+                EARLY_STATS[3].fetch_add(had.behind_us, Relaxed);
+            }
+            SYNCED[6].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+            return;
+        }
         let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
         while rounds.1 < mine {
             rounds = SYNC_ROUNDS.1.wait(rounds).unwrap_or_else(|e| e.into_inner());
@@ -462,15 +546,27 @@ impl Drop for SyncedHeaps {
 /// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
+    sync_round(None);
+}
+
+/// [`sync_heaps`]; `asked`: whether a submission asked for it, if the caller
+/// knows ([`rounds_early`]).
+#[cfg(windows)]
+fn sync_round(asked: Option<bool>) {
     use std::sync::atomic::Ordering::Relaxed;
     if !sync_on() {
         return;
     }
     let started = std::time::Instant::now();
     // For a submission that waits (asked and not done), or early.
-    let for_submission = sync_aside() && {
-        let rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-        rounds.0 != rounds.1
+    let for_submission = match asked {
+        Some(asked) => asked,
+        None => {
+            sync_aside() && {
+                let rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+                rounds.0 != rounds.1
+            }
+        }
     };
     let began_us = crate::host::now_us();
     let (mut pages, mut looked, mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64, 0u64, 0u64);
@@ -805,6 +901,20 @@ static ROUNDS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::A
 fn rounds_line(frames: f64, waited_us: u64) {
     let [asked, asked_us, late_us, early, early_us, waiting_us] =
         [0, 1, 2, 3, 4, 5].map(|i| ROUNDS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
+    if rounds_early() {
+        let [ahead, ran, ran_us, behind_us] = [0, 1, 2, 3].map(|i| EARLY_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
+        let per = |us: f64, n: f64| if n > 0.0 { us / n / 1e3 } else { 0.0 };
+        tracing::info!(
+            "the heaps' records' rounds asked early (VICTORY_HEAP_ROUNDS_EARLY=1) per frame: {:.1} asked at the top of a submission; \
+             {:.1} submissions ran their round themselves, of {:.2} ms each after {:.2} ms behind a round under way; \
+             the submitting thread waited {:.2} ms in all for them (off: the same figure of the next line)",
+            ahead / frames,
+            ran / frames,
+            per(ran_us, ran),
+            per(behind_us, ran),
+            waited_us as f64 / 1e3 / frames,
+        );
+    }
     if asked + early == 0.0 {
         return;
     }

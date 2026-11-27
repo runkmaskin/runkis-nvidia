@@ -6498,6 +6498,9 @@ impl Host {
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
+        // LOCAL (`VICTORY_HEAP_ROUNDS_EARLY=1`): the heaps' records begun now,
+        // beside the card steps and the wait for flights, not at the ask below.
+        crate::descriptor::ask_sync_heaps_ahead();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");

@@ -128,3 +128,12 @@ Same scene, interleaved:
 - **`VICTORY_PORT_DESCRIPTORS_APART=1`, then `VICTORY_HEAP_SYNC_GPU=1`** (each alone, then both): "preparing per
   frame, the submitting thread: at the end ... waiting for the heaps' records" should fall. For GPU, also fps and
   "on the GPU", and no "took over 400 ms" warning.
+
+## Asked early (`VICTORY_HEAP_ROUNDS_EARLY=1`, off)
+
+The rounds line of 8d8db49 (in game): 17 rounds a frame, begun 0.3 ms after the ask, 0.5 ms each, and 10.7-13.3 ms
+waited. The wait was the wake-up and the round, one after the other. With the switch, `Host::submit` asks a round
+at its top as well, and at the wait a round nobody has begun runs on the submitting thread
+(`descriptor/rounds.rs`). The wait still ends only after a round that began after the old ask, so the records a
+submission sees are those it saw. The changes file has the tests and the offline figures. The line to read is
+"the heaps' records' rounds asked early", printed just before the rounds line.

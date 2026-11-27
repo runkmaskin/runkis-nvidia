@@ -95,7 +95,7 @@ Measured in game on 8d8db49 (5500X3D, 2 runs each, all-off 16.98 fps) and now on
 `VICTORY_FETCH_PARTS=4` (+0.65), `VICTORY_POOL_SETTLE=1` (+0.45). Measured and left off: `VICTORY_LAND_SEGMENTS=1`
 (+0.34, noisy), `VICTORY_RETIRE_APART=1` (+0.21, worse 1 % low), `VICTORY_RELAY_COPY` stays as the script sets it,
 `VICTORY_PORT_DESCRIPTORS_APART=1` (0), `VICTORY_POOL_PRIORITY=1` and `VICTORY_HEAP_SYNC_GPU=1` (worse 1 % lows).
-Not yet measured: `VICTORY_LIST_CLASSES=1`, `VICTORY_SHARE_PIPELINES=1`. Measurement-only switches for the next profile: `VICTORY_DRAW_PARTS=1`, `VICTORY_BACK_CENSUS=1`, `VICTORY_CROSS_WAIT=count`; more A/B candidates (`VICTORY_RETIRE_APART`, `VICTORY_LAND_SEGMENTS`, `VICTORY_AHEAD_GAP_KIB`, `VICTORY_POOL_PRIORITY`, `VICTORY_SET_CACHE`, `VICTORY_CALL_TIMES=0`) are in `docs/changes-2026-11-27.md`, `docs/heap-records.md` and `docs/copy-back.md`.
+Not yet measured: `VICTORY_LIST_CLASSES=1`, `VICTORY_SHARE_PIPELINES=1`, `VICTORY_HEAP_ROUNDS_EARLY=1`. Measurement-only switches for the next profile: `VICTORY_DRAW_PARTS=1`, `VICTORY_BACK_CENSUS=1`, `VICTORY_CROSS_WAIT=count`; more A/B candidates (`VICTORY_RETIRE_APART`, `VICTORY_LAND_SEGMENTS`, `VICTORY_AHEAD_GAP_KIB`, `VICTORY_POOL_PRIORITY`, `VICTORY_SET_CACHE`, `VICTORY_CALL_TIMES=0`) are in `docs/changes-2026-11-27.md`, `docs/heap-records.md` and `docs/copy-back.md`.
 
 ## Open work, in priority order
 
