@@ -1363,3 +1363,50 @@ fn records_the_halves_share_across_rounds_are_refused() {
     let (_, wave) = lowered_wave(&strided_records(32));
     assert_eq!(wave, Some(64));
 }
+
+/// A console wave32 program with console lanes (`v_mbcnt`) in a 32 x 2 group: each thread
+/// adds 1 to counter[x + 32 y] and stores its console lane at 64 + x + 32 y. NVIDIA fills 2-D
+/// groups from 16 x 2 tiles, so a host wave's first flat id rounded down to 32 is the same for
+/// both waves: without `VICTORY_THREAD_TICKET` some console threads ran twice and others never
+/// (block artifacts). Port of trustno1-coder/VIctory-NVIDIA 854f57f.
+#[test]
+fn every_console_thread_of_a_2d_group_runs_exactly_once() {
+    let words = [
+        0xD765_0003,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v3, -1, 0: the console lane
+        0x3408_0285, // v_lshlrev_b32 v4, 5, v1
+        0x4A08_0900, // v_add_nc_u32 v4, v0, v4: x + 32 y
+        0x340A_0882, // v_lshlrev_b32 v5, 2, v4
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0xE0C8_1000,
+        0x8002_0205, // buffer_atomic_add v2, v5, s[8:11], 0 offen
+        0xE070_1100,
+        0x8002_0305, // buffer_store_dword v3, v5, s[8:11], 0 offen offset:256
+    ];
+    let mut native = native_of(&words, false, 32);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.threads = [32, 2, 1];
+        cs.rsrc2 |= 1 << 11; // thread ids x and y in v0 and v1
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    for ticket in [false, true] {
+        let was = lower::TEST_THREAD_TICKET.replace(Some(ticket));
+        let shader = lowered(&native, &p, &HashSet::new());
+        lower::TEST_THREAD_TICKET.set(was);
+        let shader = shader.expect("lower");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        let Some(out) = dispatched_all(&shader, 0, 128) else { return };
+        let counts = &out[..64];
+        let lanes = &out[64..128];
+        let right = counts.iter().all(|&c| c == 1) && lanes.iter().enumerate().all(|(t, &l)| l == t as u32 % 32);
+        if ticket {
+            assert!(right, "with the ticket: counts {counts:?}, lanes {lanes:?}");
+            eprintln!("ran on the hardware device: every console thread of the 32 x 2 group once");
+        } else if !right {
+            eprintln!("without the ticket this host ran console threads twice or never: {counts:?}");
+        }
+    }
+}

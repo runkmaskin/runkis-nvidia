@@ -595,6 +595,8 @@ fn record(
 struct Own {
     list: HostList,
     between: ID3D12Resource,
+    /// What the buffer between held, read back ([`late`]).
+    back: Option<ID3D12Resource>,
 }
 
 // SAFETY: D3D12 objects are free-threaded, and the list is touched by one
@@ -616,6 +618,150 @@ pub(super) struct Taken {
     own: Own,
     steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     copied: Vec<(Arc<Shadow>, usize, usize)>,
+    /// The fills' places, lengths and places in the buffer between
+    /// ([`late`]).
+    sent: Vec<(usize, usize, u64)>,
+    /// The fills of the submission done on the CPU: upload memory, place,
+    /// length ([`late`]).
+    cpu: Vec<(usize, usize, usize)>,
+}
+
+/// Places the title writes after the submission that reads them was sent
+/// (`VICTORY_CARD_STEPS_LEARN=1`; off by default).
+///
+/// Without card steps a submission behind flights waits for them, and all its
+/// fills read title memory after that; on the console the card reads a
+/// constant buffer when the draw runs. Taken, the submission is sent at once:
+/// the fills done on the card take their bytes then, and so do the ones left
+/// to the CPU, which no flight writes and are done while it is prepared. The
+/// title counts on the later moment: some constant buffers are written again
+/// by its CPU between sending and landing, and the draws get the bytes of
+/// before. Skinned characters and vehicles throw vertices off (the stretched
+/// bodies of `docs/speed-mode-bugs.md`).
+///
+/// So what each fill of a taken submission read (on the card: read back from
+/// the buffer between; on the CPU: the upload memory it filled) is compared
+/// with title memory when the submission has landed. The title has not been
+/// told yet, so what it wrote meanwhile it wrote before the card was to read
+/// it. Pages where they differ are learned, and a later submission with any
+/// fill there waits as without card steps. The first time is drawn with the
+/// old bytes; from then on it is exact.
+///
+/// Port of AvatarManz #434 by Jake, as ported in 101Leafy/victory-leafy
+/// 5ae96a4 and dfmbrollins/victory-linux-nvidia 33c37e2 (GPL-3.0).
+mod late {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    const PAGE: usize = 4096;
+
+    static PAGES: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+    /// Fills done on the card compared, found written again, submissions
+    /// refused for a learned page; pages learned in all; fills done on the CPU
+    /// compared, found written again.
+    pub(super) static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+    pub(super) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_STEPS_LEARN").is_some_and(|v| v == "1"))
+    }
+
+    /// Whether the title was found writing a page of `[from, to)` late.
+    pub(super) fn written(from: usize, to: usize) -> bool {
+        let pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        pages.as_ref().is_some_and(|p| (from / PAGE..to.div_ceil(PAGE)).any(|page| p.contains(&page)))
+    }
+
+    /// The submission has landed: what the fills of `sent` (place, length,
+    /// place in the buffer between) read, in `back`, compared with title
+    /// memory now.
+    pub(super) fn landed(sent: &[(usize, usize, u64)], back: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RANGE;
+        let Some(end) = sent.iter().map(|&(_, len, at)| at as usize + len).max() else {
+            return;
+        };
+        let mut mapped: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: a read-back buffer the landed list wrote, `end` bytes of it.
+        if unsafe { back.Map(0, Some(&D3D12_RANGE { Begin: 0, End: end }), Some(&mut mapped)) }.is_err() || mapped.is_null() {
+            return;
+        }
+        // SAFETY: mapped, `end` bytes.
+        compare(sent, unsafe { std::slice::from_raw_parts(mapped as *const u8, end) });
+        // SAFETY: mapped above; nothing written.
+        unsafe { back.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 })) };
+    }
+
+    /// [`landed`] with what the card read in `card`.
+    pub(super) fn compare(sent: &[(usize, usize, u64)], card: &[u8]) {
+        let mut now = Vec::new();
+        for &(src, len, at) in sent {
+            let Some(read) = card.get(at as usize..at as usize + len) else { continue };
+            now.clear();
+            now.resize(len, 0);
+            if !crate::host::read_into(src as *const u8, &mut now) {
+                continue;
+            }
+            COUNTS[0].fetch_add(1, Ordering::Relaxed);
+            if now == read {
+                continue;
+            }
+            COUNTS[1].fetch_add(1, Ordering::Relaxed);
+            learn(src, src + len, "on the card");
+        }
+    }
+
+    /// The submission has landed: the fills of it the CPU did when it was
+    /// sent (upload memory, place, length) compared with title memory now.
+    pub(super) fn landed_cpu(cpu: &[(usize, usize, usize)]) {
+        let mut now = Vec::new();
+        for &(dst, src, len) in cpu {
+            now.clear();
+            now.resize(len, 0);
+            if !crate::host::read_into(src as *const u8, &mut now) {
+                continue;
+            }
+            // SAFETY: the submission's upload memory, alive until its lists
+            // are reset, after this.
+            let read = unsafe { std::slice::from_raw_parts(dst as *const u8, len) };
+            COUNTS[4].fetch_add(1, Ordering::Relaxed);
+            if now == read {
+                continue;
+            }
+            COUNTS[5].fetch_add(1, Ordering::Relaxed);
+            learn(src, src + len, "on the CPU");
+        }
+    }
+
+    /// Tests: nothing learned (the pages are one set for the process).
+    #[cfg(test)]
+    pub(super) fn forget() {
+        *PAGES.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn learn(from: usize, to: usize, by: &str) {
+        let mut pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        let pages = pages.get_or_insert_with(Default::default);
+        for page in from / PAGE..to.div_ceil(PAGE) {
+            if pages.insert(page) {
+                COUNTS[3].fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    page = format_args!("{:#x}", page * PAGE),
+                    fill = format_args!("{from:#x}+{:#x}", to - from),
+                    by,
+                    "card steps: the title wrote a constant buffer after the submission that reads it was sent; fills \
+                     there wait from now on"
+                );
+            }
+        }
+    }
+}
+
+/// Why a submission is refused for [`late`].
+const WRITTEN_LATE: &str = "a fill reads a place the title was found writing after sending";
+
+/// Whether a fill of `does` reads a page [`late`] learned.
+fn reads_late(does: &[Does]) -> bool {
+    does.iter().any(|d| matches!(*d, Does::Fill { src, len, .. } if late::written(src, src + len)))
 }
 
 impl Taken {
@@ -645,6 +791,10 @@ impl Taken {
 
     /// The submission has run and landed: the list and its buffer are free.
     pub(super) fn landed(self) {
+        if let Some(back) = &self.own.back {
+            late::landed(&self.sent, back);
+        }
+        late::landed_cpu(&self.cpu);
         // The host copies its steps held go; its commands stay until the
         // next use resets it.
         drop(std::mem::take(&mut *self.own.list.deferred()));
@@ -689,6 +839,10 @@ impl Host {
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
         let (does, steps) = does_of(written, runs);
+        if late::on() && reads_late(&does) {
+            late::COUNTS[2].fetch_add(1, Ordering::Relaxed);
+            return Err(WRITTEN_LATE);
+        }
         let chosen = plan(&does, stage(), placed_order(), &mut None)?;
         if chosen.is_empty() {
             return Ok(None);
@@ -830,6 +984,21 @@ impl Host {
             }
             record(level == 0, &own.list.list, &own.between, &reads, &writes);
         }
+        // What the fills read, read back ([`late`]): each place once, and
+        // where its bytes are in the buffer between.
+        let mut sent: Vec<(usize, usize, u64)> = Vec::new();
+        if let Some(back) = own.back.as_ref().filter(|_| late::on() && end > 0) {
+            // (The buffer between is readable as constants and as a copy
+            // source after the last level.)
+            // SAFETY: an open list; both buffers live and `BETWEEN` long.
+            unsafe { own.list.list.CopyBufferRegion(back, 0, &own.between, 0, end) };
+            let mut seen: HashMap<(usize, usize), ()> = HashMap::default();
+            for op in ops.iter().filter(|op| !matches!(op.to, To::Copy(..))) {
+                if seen.insert((op.from.1, op.len), ()).is_none() {
+                    sent.push((op.from.1, op.len, op.at));
+                }
+            }
+        }
         own.list.close();
         // SAFETY: a live buffer.
         let gpu = unsafe { own.between.GetGPUVirtualAddress() };
@@ -855,11 +1024,24 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         noted(&ops);
         spent.end();
-        Ok(Some(Taken {
-            own,
-            steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
-            copied,
-        }))
+        let steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>> =
+            chosen.iter().map(|&(i, _)| steps[i]).collect();
+        // The fills left to the CPU: done when the submission is prepared,
+        // into upload memory that holds them until its lists are reset.
+        let mut cpu = Vec::new();
+        if late::on() {
+            for list in runs {
+                let at = std::ptr::from_ref::<HostList>(list) as usize;
+                for (i, step) in list.deferred().copies.iter().enumerate() {
+                    if let &Step::Fill(dst, src, len, _) = step
+                        && !steps.contains(&(at, i))
+                    {
+                        cpu.push((dst, src, len));
+                    }
+                }
+            }
+        }
+        Ok(Some(Taken { own, steps, copied, sent, cpu }))
     }
 
     /// A list of ours open for recording, and its buffer.
@@ -872,7 +1054,8 @@ impl Host {
         let between = self.uav_buffer(BETWEEN)?;
         name(&between, || "copies of title memory on the card".into());
         let list = self.new_list().ok()?;
-        Some(Own { list, between })
+        let back = if late::on() { self.read_back_buffer(BETWEEN) } else { None };
+        Some(Own { list, between, back })
     }
 }
 
@@ -913,6 +1096,25 @@ pub(super) fn log(frames: f64) {
         d[2] / 1024.0,
         d[3],
     );
+    if late::on() {
+        // (Index 3 counts in all, the others since the last line.)
+        let c: Vec<f64> = late::COUNTS
+            .iter()
+            .enumerate()
+            .map(|(i, c)| if i == 3 { 0.0 } else { c.swap(0, Ordering::Relaxed) as f64 / frames })
+            .collect();
+        tracing::info!(
+            "card steps, places the title writes after sending (VICTORY_CARD_STEPS_LEARN), per frame: {:.1} fills on the card \
+             and {:.1} on the CPU compared at landing, {:.2} and {:.2} found written again, {:.2} submissions waited for a \
+             learned page; {} pages learned",
+            c[0],
+            c[4],
+            c[1],
+            c[5],
+            c[2],
+            late::COUNTS[3].load(Ordering::Relaxed)
+        );
+    }
     #[cfg(feature = "diagnostics")]
     {
         let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
@@ -955,6 +1157,65 @@ mod tests {
     /// What is done on the card, as (place, level), in stage 2.
     fn planned(does: &[Does]) -> Vec<(usize, u32)> {
         plan(does, 2, true, &mut None).unwrap()
+    }
+    /// The tests of [`late`] one at a time: its pages are one set for the
+    /// process.
+    static LATE: Mutex<()> = Mutex::new(());
+
+    /// A model of a frame: a taken submission's fills read title memory when
+    /// it is sent (two on the card, two on the CPU); the title writes two of
+    /// those places again before it lands. At landing exactly those are
+    /// learned, page by page, and the next submission with a fill on one of
+    /// those pages waits, while one that reads elsewhere is still taken.
+    #[test]
+    fn fills_of_places_the_title_writes_before_landing_wait_next_time() {
+        let _one = LATE.lock().unwrap_or_else(|e| e.into_inner());
+        late::forget();
+        // Eight pages of our own, page-aligned, as title memory.
+        let mut memory = vec![0u8; 9 * 4096];
+        let page = (memory.as_ptr() as usize).next_multiple_of(4096);
+        let at = |k: usize, off: usize| page + k * 4096 + off;
+        let (card_kept, card_changed) = ((at(0, 0), 32), (at(1, 64), 240));
+        let (cpu_kept, cpu_changed) = ((at(2, 16), 32), (at(3, 0xbd0), 0x220));
+        // Sent: the card copies what the fills read into the buffer between
+        // (at 0 and 256), the CPU into upload memory.
+        let read = |(src, len): (usize, usize)| -> Vec<u8> {
+            // SAFETY: inside `memory`.
+            unsafe { std::slice::from_raw_parts(src as *const u8, len) }.to_vec()
+        };
+        let mut between = vec![0u8; 512];
+        between[..32].copy_from_slice(&read(card_kept));
+        between[256..256 + 240].copy_from_slice(&read(card_changed));
+        let upload = [read(cpu_kept), read(cpu_changed)];
+        let sent = [(card_kept.0, card_kept.1, 0), (card_changed.0, card_changed.1, 256)];
+        let cpu = [
+            (upload[0].as_ptr() as usize, cpu_kept.0, cpu_kept.1),
+            (upload[1].as_ptr() as usize, cpu_changed.0, cpu_changed.1),
+        ];
+        // Before it lands nothing is known: every fill would be taken.
+        let next = |src: usize, len: usize| [fill(src, len, true), Does::Run];
+        assert!(!reads_late(&next(card_changed.0, 16)) && !reads_late(&next(cpu_changed.0, 16)));
+        // The title writes two of the places again between sending and landing.
+        let base = memory.as_ptr() as usize;
+        memory[card_changed.0 - base + 88] = 1;
+        memory[cpu_changed.0 - base + 0x100] = 7;
+        late::compare(&sent, &between);
+        late::landed_cpu(&cpu);
+        assert!(!late::written(card_kept.0, card_kept.0 + card_kept.1));
+        assert!(!late::written(cpu_kept.0, cpu_kept.0 + cpu_kept.1));
+        assert!(late::written(card_changed.0, card_changed.0 + card_changed.1));
+        assert!(late::written(cpu_changed.0, cpu_changed.0 + cpu_changed.1));
+        // The next frame: a fill anywhere on those pages waits; elsewhere not.
+        assert!(reads_late(&next(at(1, 2048), 64)));
+        assert!(reads_late(&next(at(3, 0), 4)));
+        assert!(!reads_late(&next(at(0, 0), 32)));
+        assert!(!reads_late(&next(at(5, 0), 4096)));
+        // (a fill that crosses into a learned page waits too)
+        assert!(reads_late(&next(at(0, 4000), 200)));
+        // Copies and other reads are not what was learned.
+        assert!(!reads_late(&[copy(at(6, 0), at(1, 64), 240, true)]));
+        late::forget();
+        drop(memory);
     }
 
     /// Only what is asked for is taken, all of it, and a step that stands

@@ -112,6 +112,8 @@ fn build() -> [u8; 32] {
             // LOCAL: signature rows of one interpolation mode each.
             "VICTORY_SIG_ROWS",
             "VICTORY_LOD_ARRAY",
+            // Port: console threads from a group counter (trustno1 854f57f).
+            "VICTORY_THREAD_TICKET",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
