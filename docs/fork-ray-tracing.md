@@ -38,7 +38,7 @@ shaders and emulates the one instruction.
 ## What this fork adds
 
 1. **The builder programs translate** (all 52, with host pipelines on the RX
-   7900 XTX; the title creates 53 such pipelines). They pass buffer addresses in a spilled parameter table
+   7900 XTX and, since 2026-11-27, on a 32-lane RTX 4070 SUPER; the title creates 53 such pipelines). They pass buffer addresses in a spilled parameter table
    rather than in descriptors. Added: the spilled user-data table, root
    unordered-access views (translator and host binding), byte and 16-bit buffer
    accesses, and several control-flow shapes.

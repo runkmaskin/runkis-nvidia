@@ -738,3 +738,210 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
         }
     }
 }
+
+/// A block-wide prefix sum of a group of several console waves, as the ray-tracing structure
+/// builder's scans are made: each console wave sums its lanes (inside each half with
+/// `ds_swizzle`, then the lower half's total read with `v_readlane` and added to the upper
+/// half), its last lane writes the wave's total to LDS, and after `s_barrier` each wave adds
+/// the totals of the waves before it in a loop. The loop starts under `v_cmpx` (wave 0 does
+/// not enter it), leaves through `v_cmpx` / `s_andn2` / `s_cbranch_scc1`, and carries its sum
+/// in a scalar with `v_readfirstlane`. Thread t adds 5t + s0; it stores its inclusive sum.
+/// `lane_varying`: the loop's sum also adds the lane's own number, so the first-lane read
+/// takes a value that differs between the lanes. `write_after`: each wave writes its total to
+/// LDS again after the loop, so LDS may still change where the loop reads it.
+fn block_scan(threads: u32, lane_varying: bool, write_after: bool) -> NativeProgram {
+    let mut w: Vec<u32> = vec![
+        0x340A_0082, // v_lshlrev_b32 v5, 2, v0
+        0x4A0A_0B00, // v_add_nc_u32 v5, v0, v5
+        0x4A0A_0A00, // v_add_nc_u32 v5, s0, v5: the thread's term
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1: the lane's number
+        0x7E0C_0305, // v_mov_b32 v6, v5
+    ];
+    // in each half: lanes with bit k of their number set add the last lane below that bit's block
+    for k in [1u32, 2, 4, 8, 16] {
+        let swizzle = (0x1F ^ (2 * k - 1)) | (k - 1) << 5;
+        w.extend_from_slice(&[
+            0xD8D4_0000 | swizzle,
+            0x0200_0006,      // ds_swizzle_b32 v2, v6 (and_mask, or_mask)
+            0xBF8C_C07F,      // s_waitcnt lgkmcnt(0)
+            0x3606_0200 | (0x80 + k), // v_and_b32 v3, k, v1
+            0x7D8A_0680,      // v_cmp_ne_u32 vcc, 0, v3
+            0x0204_0480,      // v_cndmask_b32 v2, 0, v2, vcc
+            0x4A0C_0D02,      // v_add_nc_u32 v6, v2, v6
+        ]);
+    }
+    w.extend_from_slice(&[
+        0xD760_000C,
+        0x0001_3F06, // v_readlane_b32 s12, v6, 31: the lower half's total
+        0x7D82_029F, // v_cmp_lt_u32 vcc, 31, v1
+        0xD501_0002,
+        0x01A8_1880, // v_cndmask_b32 v2, 0, s12, vcc
+        0x4A0C_0D02, // v_add_nc_u32 v6, v2, v6: the sum over the console wave's lanes so far
+        0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0: the console wave's number
+        0xBE80_047E, // s_mov_b64 s[0:1], exec
+        0x7DA4_02BF, // v_cmpx_eq_u32 exec, 63, v1
+        0x3406_0E82, // v_lshlrev_b32 v3, 2, v7
+        0xD834_0000,
+        0x0000_0603, // ds_write_b32 v3, v6: the wave's total
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        0x7E10_0280, // v_mov_b32 v8, 0
+        0xBE80_047E, // s_mov_b64 s[0:1], exec
+        0x7DA2_0E80, // v_cmpx_lt_u32 exec, 0, v7
+    ]);
+    let skip = w.len();
+    w.extend_from_slice(&[
+        0,           // s_cbranch_execz done (filled in below)
+        0xBE86_047E, // s_mov_b64 s[6:7], exec: the lanes still in the loop
+        0xBE92_0380, // s_mov_b32 s18, 0: the wave whose total is next
+        0xBE91_0380, // s_mov_b32 s17, 0: the sum of the totals so far
+        0xBF82_0002, // s_branch body
+    ]);
+    let latch = w.len();
+    w.extend_from_slice(&[
+        0x87FE_0614, // latch: s_and_b64 exec, s[20:21], s[6:7]
+        0x7E22_0508, // v_readfirstlane_b32 s17, v8
+        0x8F10_8212, // body: s_lshl_b32 s16, s18, 2
+        0x8112_8112, // s_add_i32 s18, s18, 1
+        0x7E12_0210, // v_mov_b32 v9, s16
+        0xD8D8_0000,
+        0x0900_0009, // ds_read_b32 v9, v9
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x4A10_1211, // v_add_nc_u32 v8, s17, v9
+    ]);
+    if lane_varying {
+        w.push(0x4A10_1101); // v_add_nc_u32 v8, v1, v8
+    }
+    w.extend_from_slice(&[
+        0xBE94_047E, // s_mov_b64 s[20:21], exec
+        0x7DA4_0E12, // v_cmpx_eq_u32 exec, s18, v7: the lanes whose waves are all summed
+        0x8A86_7E06, // s_andn2_b64 s[6:7], s[6:7], exec
+    ]);
+    let back = w.len();
+    w.push(0xBF85_0000 | (latch as i32 - back as i32 - 1) as u16 as u32); // s_cbranch_scc1 latch
+    let done = w.len();
+    w[skip] = 0xBF88_0000 | (done - skip - 1) as u32; // s_cbranch_execz done
+    w.extend_from_slice(&[
+        0xBEFE_0400, // done: s_mov_b64 exec, s[0:1]
+        0x4A0C_0D08, // v_add_nc_u32 v6, v8, v6
+    ]);
+    if write_after {
+        w.extend_from_slice(&[
+            0xD834_0000,
+            0x0000_0603, // ds_write_b32 v3, v6
+        ]);
+    }
+    w.extend_from_slice(&[
+        0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+        0xE070_1000,
+        0x8002_0607, // buffer_store_dword v6, v7, s[8:11], 0 offen
+    ]);
+    let mut native = native_of(&w, true, threads);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    native
+}
+
+/// The whole UAV of `dwords` dwords after `shader` ran once with root constant s0 = `s0`;
+/// None (and a line) without a device that takes it.
+fn dispatched_all(shader: &HostShader, s0: u32, dwords: u32) -> Option<Vec<u32>> {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return None;
+    };
+    let (root, pso) = match host.compute_pipeline(shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
+            return None;
+        }
+    };
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+            ud[u.index as usize] = s0;
+        }
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(dwords)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    Some(out[0].clone())
+}
+
+/// The loop over the waves before this one runs a different number of rounds in each
+/// console wave, so the two host waves of one cannot meet in it; but the value the first-lane
+/// read takes there is the same in every lane that holds it (scalars, and an LDS read at a
+/// scalar address once no thread writes LDS any more), so each host wave's own first lane
+/// gives the console's. Exact on a host of 32-lane waves, against the sum on the CPU.
+#[test]
+fn a_block_prefix_sum_over_console_waves_runs_in_waves_of_32() {
+    for threads in [256u32, 512] {
+        let native = block_scan(threads, false, false);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        assert_eq!(p.blocks.iter().flat_map(|b| &b.insts).filter(|i| i.name() == "v_readfirstlane_b32").count(), 1);
+        let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        for s0 in [0u32, 7, 0x7FFF_FFF0] {
+            let mut sum = 0u32;
+            let want: Vec<u32> = (0..threads)
+                .map(|t| {
+                    sum = sum.wrapping_add((5 * t).wrapping_add(s0));
+                    sum
+                })
+                .collect();
+            let Some(out) = dispatched_all(&shader, s0, threads) else {
+                return;
+            };
+            for t in 0..threads as usize {
+                assert_eq!(out[t], want[t], "{threads} threads, s0 = {s0}: thread {t}");
+            }
+        }
+        eprintln!("ran on the hardware device: the block prefix sum of {threads} threads");
+    }
+}
+
+/// The same loop where the value read is the lane's own: the console takes the first lane in
+/// EXEC, which may be in the other host wave, and the two cannot meet in the loop. Refused.
+#[test]
+fn a_first_lane_read_of_a_lane_value_in_a_loop_per_console_wave_is_refused() {
+    let native = block_scan(256, true, false);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let r = lowered(&native, &p, &HashSet::new());
+    assert!(
+        matches!(&r, Err(ShaderError::Unsupported { what, .. }) if *what == "a first-lane read where not every lane runs"),
+        "{:?}",
+        r.err()
+    );
+}
+
+/// The same loop where a thread may still write LDS after the barrier: another console wave
+/// may change what the loop reads between the reads of its two host waves. Refused.
+#[test]
+fn a_first_lane_read_of_lds_that_may_still_change_is_refused() {
+    let native = block_scan(256, false, true);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let r = lowered(&native, &p, &HashSet::new());
+    assert!(
+        matches!(&r, Err(ShaderError::Unsupported { what, .. }) if *what == "a first-lane read where not every lane runs"),
+        "{:?}",
+        r.err()
+    );
+}

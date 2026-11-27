@@ -369,6 +369,9 @@ struct Lower<'a> {
     /// With `exchange`: VGPR values every lane holds alike ([`lane_uniform`]); a first-lane
     /// read of one needs nothing from the other host wave.
     uniform: HashSet<Value>,
+    /// With `exchange`: first-lane reads, by IR block and offset, whose source every lane there
+    /// holds alike where not every lane runs ([`first_lane_alike`]).
+    first_alike: HashSet<(usize, usize)>,
     /// With `exchange`: the wave ORs that only steer a loop over each lane's own bits, which
     /// a host wave takes over its own lanes wherever they stand ([`super::own_bits`]).
     own_bits: super::own_bits::OwnBits,
@@ -628,6 +631,221 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
     }
     same
+}
+
+/// Where the host's group barriers stand, for [`first_lane_alike`]: whether the title's
+/// `s_barrier` in a block waits for the group, whether every LDS access gets a barrier before
+/// it (`split_lds`, in the blocks of `lds_meet`'s first part when it is there), the barriers
+/// at the start and before the exit of blocks (`lds_meet`'s second part), and whether those
+/// added barriers wait at all ([`meeting_mode`]).
+struct Barriers<'a> {
+    title_waits: &'a dyn Fn(usize) -> bool,
+    split_lds: bool,
+    lds_meet: Option<&'a (Vec<bool>, Vec<(bool, bool)>)>,
+    meetings_wait: bool,
+}
+
+/// The `v_readfirstlane_b32` instructions (by block and offset) whose source is the same in
+/// every lane that is there, where the lowering would otherwise refuse them (a console wave
+/// run as two host waves, in a block not every lane runs). Each host wave's own first lane
+/// then gives the console's value, and nothing passes between the two host waves.
+///
+/// The ray-tracing structure builder's scans read their running sum this way, in a loop over
+/// the waves before this one: the loop runs a different number of rounds in each console
+/// wave, so the host waves cannot meet in it, but the sum is made of scalars and LDS reads at
+/// scalar addresses.
+///
+/// A value counts when every lane that runs one execution of its instruction gets the same
+/// result: a VALU instruction without a guard, lane by lane, of scalars and such values; or an
+/// LDS read without a guard at such an address, where LDS no longer changes. That is the case
+/// where every path from the entry passes a group barrier from which no LDS write can be
+/// reached: every thread has made its last write before the barrier lets any thread on. A
+/// first-lane read counts when its source counts and every loop around the source's
+/// instruction is also around the read: the instruction dominates the read (a direct use), so
+/// the lanes at the read in one round of those loops got the value in that same round.
+/// Joins (phis) never count.
+/// shortcut: the host's barriers are taken to be run by every thread of the group in the same
+/// order, which D3D12 asks of them; the translation's other barriers stand on that too.
+fn first_lane_alike(p: &Program, st: &Structured, bars: &Barriers) -> HashSet<(usize, usize)> {
+    let n = p.blocks.len();
+    let succ = |b: usize| p.blocks[b].exit.successors();
+    let lds = |i: &Inst| {
+        matches!(i.fields, Fields::Ds { .. })
+            && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
+    };
+    let writes = |i: &Inst| lds(i) && !i.name().starts_with("ds_read");
+    // per block and position (before instruction k; the last one before the exit): a barrier
+    // that waits for the group
+    let mut bar: Vec<Vec<bool>> = p.blocks.iter().map(|b| vec![false; b.insts.len() + 1]).collect();
+    for (b, block) in p.blocks.iter().enumerate() {
+        let sections = super::wave::sections(p, b);
+        let in_section = |k: usize| sections.iter().any(|(s, sec)| k > *s && k < sec.end);
+        if bars.meetings_wait && let Some((_, meet)) = bars.lds_meet {
+            bar[b][0] |= meet[b].0;
+            bar[b][block.insts.len()] |= meet[b].1;
+        }
+        for (k, inst) in block.insts.iter().enumerate() {
+            if inst.name() == "s_barrier" && (bars.title_waits)(b) && !in_section(k) {
+                bar[b][k] = true;
+            }
+            let split_here = bars.lds_meet.is_none_or(|(all, _)| all[b]);
+            if bars.split_lds && bars.meetings_wait && split_here && lds(inst) && !in_section(k) {
+                bar[b][k] = true;
+            }
+        }
+    }
+    // blocks from whose start an LDS write can be reached
+    let mut reach_w: Vec<bool> = p.blocks.iter().map(|b| b.insts.iter().any(writes)).collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in 0..n {
+            if !reach_w[b] && succ(b).iter().any(|&t| reach_w[t]) {
+                reach_w[b] = true;
+                changed = true;
+            }
+        }
+    }
+    // a barrier at (b, k) after which no thread writes LDS
+    let last = |b: usize, k: usize| {
+        bar[b][k] && !p.blocks[b].insts[k..].iter().any(writes) && !succ(b).iter().any(|&t| reach_w[t])
+    };
+    // every path from the entry to the block's start passed such a barrier
+    let mut passed = vec![true; n];
+    passed[0] = false;
+    let out = |passed: &[bool], b: usize| passed[b] || (0..=p.blocks[b].insts.len()).any(|k| last(b, k));
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in 1..n {
+            let v = p.blocks[b].preds.iter().all(|&q| out(&passed, q));
+            if v != passed[b] {
+                passed[b] = v;
+                changed = true;
+            }
+        }
+    }
+    // the loops (natural loops of the back edges), as their blocks
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut index = vec![usize::MAX; n];
+    for (k, &b) in order.iter().enumerate() {
+        index[b] = k;
+    }
+    let idom = crate::ir::idoms(&p.blocks, &order, &index);
+    let dominates = |a: usize, mut b: usize| loop {
+        if a == b {
+            break true;
+        }
+        if idom[b] == usize::MAX || idom[b] == b {
+            break false;
+        }
+        b = idom[b];
+    };
+    let mut loops: Vec<Vec<bool>> = Vec::new();
+    for &b in &order {
+        for t in succ(b) {
+            if !dominates(t, b) {
+                continue;
+            }
+            let mut body = vec![false; n];
+            body[t] = true;
+            let mut stack = vec![b];
+            while let Some(x) = stack.pop() {
+                if !body[x] {
+                    body[x] = true;
+                    stack.extend(p.blocks[x].preds.iter().copied());
+                }
+            }
+            loops.push(body);
+        }
+    }
+    let mut def: HashMap<Value, usize> = HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        def.extend(block.phis.iter().map(|phi| (phi.value, b)));
+        for inst in &block.insts {
+            def.extend(inst.writes.iter().map(|w| (w.1, b)));
+        }
+    }
+    // the value's instruction lies in no loop that leaves out block `u`
+    let within = |x: Value, u: usize| def.get(&x).is_none_or(|&d| loops.iter().all(|l| !l[d] || l[u]));
+    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    const READS: [&str; 12] = [
+        "ds_read_b32", "ds_read_b64", "ds_read_b96", "ds_read_b128", "ds_read2_b32", "ds_read2_b64",
+        "ds_read2st64_b32", "ds_read2st64_b64", "ds_read_u8", "ds_read_i8", "ds_read_u16", "ds_read_i16",
+    ];
+    let mut same: HashSet<Value> = HashSet::new();
+    for &b in &order {
+        for (k, inst) in p.blocks[b].insts.iter().enumerate() {
+            if st.guards[b][k].is_some() {
+                continue; // lanes outside EXEC keep another value
+            }
+            let name = inst.name();
+            let kind = match &inst.fields {
+                Fields::Valu(v)
+                    if v.dpp.is_none()
+                        && v.sdwa.is_none()
+                        && !name.starts_with("v_mbcnt")
+                        && !name.starts_with("v_cmpx")
+                        && !name.starts_with("v_interp")
+                        && !name.contains("lane") =>
+                {
+                    true
+                }
+                Fields::Ds { gds: false, .. } if READS.contains(&name) && (passed[b] || (0..=k).any(|j| last(b, j))) => true,
+                _ => false,
+            };
+            if !kind {
+                continue;
+            }
+            // The old value of a VGPR it writes is read for the lanes outside EXEC, which keep
+            // it; a lane that runs the instruction writes the whole dword (not with a 16-bit
+            // result, which may keep the other half). Not a register it also reads as a source.
+            let sources: Vec<u8> = match &inst.fields {
+                Fields::Valu(v) => v
+                    .src
+                    .iter()
+                    .filter_map(|o| match *o {
+                        Operand::Vector { reg, .. } => Some(reg),
+                        _ => None,
+                    })
+                    .flat_map(|r| r..=r.saturating_add(3))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let kept = |r: Reg| {
+                matches!(inst.fields, Fields::Valu(_))
+                    && !name.contains("16")
+                    && matches!(r, Reg::V(v) if !sources.contains(&v))
+                    && inst.writes.iter().any(|w| w.0 == r)
+            };
+            let alike = inst.reads.iter().all(|&(r, x)| match r {
+                Reg::S(c) if c == EXEC || c == EXEC + 1 => true,
+                _ if kept(r) => true,
+                Reg::V(_) => same.contains(&x) && within(x, b),
+                // a scalar is one value; a lane mask is not, unless a compare of such values made it
+                Reg::S(_) => (!is_mask(x) || same.contains(&x)) && within(x, b),
+                Reg::Scc => within(x, b),
+            });
+            if alike {
+                same.extend(inst.writes.iter().filter(|w| !matches!(w.0, Reg::Scc)).map(|w| w.1));
+            }
+        }
+    }
+    let mut sites = HashSet::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for inst in &block.insts {
+            let Fields::Valu(v) = &inst.fields else { continue };
+            if inst.name() != "v_readfirstlane_b32" {
+                continue;
+            }
+            if let Some(&Operand::Vector { reg, .. }) = v.src.first()
+                && inst.read(Reg::V(reg)).is_some_and(|x| same.contains(&x) && within(x, b))
+            {
+                sites.insert((b, inst.machine.offset));
+            }
+        }
+    }
+    sites
 }
 
 /// What a register value holds, for [`wave_local`].
@@ -1642,6 +1860,23 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let first_alike = match &exchange {
+            Some((_, false, _)) if !LOCAL_WAVES.get() => {
+                // (the same test as the lowering of `s_barrier`)
+                let title_waits = |b: usize| match super::group_sync() {
+                    0 => false,
+                    1 => !fence_only.contains(&b),
+                    _ => true,
+                };
+                first_lane_alike(p, x.st, &Barriers {
+                    title_waits: &title_waits,
+                    split_lds,
+                    lds_meet: lds_meet.as_ref(),
+                    meetings_wait: super::group_sync() != 0,
+                })
+            }
+            _ => HashSet::new(),
+        };
         Lower {
             s,
             x,
@@ -1718,6 +1953,7 @@ impl<'a> Lower<'a> {
                 Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
                 _ => HashSet::new(),
             },
+            first_alike,
             own_bits: match &exchange {
                 Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() => {
                     super::own_bits::find(p, x.st, std::env::var_os("VICTORY_WAVE_WHY").is_some())
@@ -9075,6 +9311,11 @@ impl<'a> Lower<'a> {
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
                 let r = if halves && !alike {
                     if !self.all_lanes(self.cur_ir) {
+                        // every lane there holds the same value: this host wave's first lane
+                        // has the console's ([`first_lane_alike`])
+                        if self.first_alike.contains(&(self.cur_ir, inst.machine.offset)) {
+                            return int(self, mine);
+                        }
                         // shortcut: `VICTORY_FIRSTLANE_OWN=1` takes the host wave's own
                         // first lane, exact when the value is the same in every lane of
                         // the console wave (the ray-tracing builder's scans read a sum of
