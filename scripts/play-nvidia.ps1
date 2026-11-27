@@ -46,6 +46,9 @@ $settings = @{
     # local: measured in game 2026-11-27 (7800X3D, RTX 4070 SUPER, 540p, one run each, seconds 150-240): 25.95 fps,
     # 1 % low 8.0, 5 frames over 100 ms -> 27.14 fps, 1 % low 14.0, none; heap-record wait 4.2 -> 2.8 ms
     VICTORY_TABLE_CACHE = '1'; VICTORY_HEAP_ROUNDS_EARLY = '1'
+    # local: the title's 30 fps lock (33,333 us frame interval) lifted to 60: 27.1 -> 35.5 fps at 540p in the same
+    # stretch; the game keeps its speed at 60 (checked in play 2026-11-27)
+    VICTORY_FRAME_INTERVAL_US = '16667'
     # local: the mouse turns the camera (right stick), left button fires, right aims (gameinput.rs)
     VICTORY_MOUSE = '1'
     # Cheap picture fixes, on in both sets:
