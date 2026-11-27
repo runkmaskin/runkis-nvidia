@@ -25,15 +25,15 @@ translates its graphics work and shaders to host D3D12. This fork is based on
 
 Measured on the PC above with an automated run: the title is started, scripted key presses take it through the
 menus into the first gameplay scene (the prison), and frames are read from the layer's own per-frame log between
-seconds 150 and 240. One run each, so treat differences under about 1 fps as noise.
+seconds 150 and 240. With the 60 fps cap the title reaches different scenes in that time, so runs vary by several fps; treat single runs as rough.
 
 | Build | fps | 1 % low | frames over 100 ms |
 |---|---|---|---|
 | Defaults at commit 0458641 | 25.95 | 8.0 | 5 |
 | + descriptor-table cache and early heap-record rounds | 27.14 | 14.0 | 0 |
-| + the title's 30 fps lock lifted to 60 | **35.5** | 9.6 | 5 |
+| + the title's 30 fps lock lifted to 60 (two runs) | **26.9 / 35.5** | 14.0 / 9.6 | 0 / 5 |
 
-- Menus and loading screens now run at the 60 fps cap. Gameplay runs at about **25–35 fps**, heavier scenes lower.
+- Menus and loading screens now run at the 60 fps cap. Gameplay runs at about **25–35 fps** depending on the scene.
   The game keeps its speed at 60 fps (it steps its world by elapsed time).
 - **The GPU is not the limit**: it is busy 1–2 ms of a frame. The CPU work of the layer is.
 - A first play session without warm-up hitched mostly on pipelines built during play (244 of 264 frames over
