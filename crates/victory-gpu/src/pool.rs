@@ -35,6 +35,10 @@ const SPARE_KEPT: usize = 64;
 /// The same of blocks of staging buffers, which are the PC's memory: run
 /// crash-1 held 5.2 GB of them.
 const STAGING_KEPT: usize = 8;
+/// The same of blocks of staging buffers while the PC is short of memory
+/// (`crate::host::ram_short`, `VICTORY_RAM_TRIM=1`): one, for the next
+/// texture.
+const STAGING_SHORT: usize = 1;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
@@ -47,6 +51,11 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         let now = now();
         settle(&TEXTURES, now);
         settle(&STAGING, now);
+    } else if crate::host::ram_short() {
+        // The staging blocks go without a take too while the PC is short
+        // of memory: streaming may have stopped. (Texture blocks are the
+        // card's memory, and stay as they were.)
+        settle(&STAGING, now());
     }
 }
 
@@ -204,11 +213,20 @@ struct Pool<B> {
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
+    /// The most it keeps while `short` says the PC is short of memory.
+    most_short: usize,
+    short: fn() -> bool,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most }
+        Pool::with_short(most, most, never)
+    }
+
+    /// A pool that keeps at most `most_short` empty blocks while `short`
+    /// says so.
+    const fn with_short(most: usize, most_short: usize, short: fn() -> bool) -> Pool<B> {
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, most_short, short }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -307,7 +325,8 @@ impl<B: Clone> Pool<B> {
             }
         }
         // (Without a piece given back too, once there is less room.)
-        let most = SPARES.load(Ordering::Relaxed).min(self.most);
+        let short = (self.short)();
+        let most = SPARES.load(Ordering::Relaxed).min(if short { self.most_short } else { self.most });
         if any || most < self.spare {
             self.spare = most;
             let mut spare = 0;
@@ -316,6 +335,9 @@ impl<B: Clone> Pool<B> {
                     spare += 1;
                     if spare > most {
                         *block = None;
+                        if short {
+                            crate::host::RAM_TRIMS[1].fetch_add(BLOCK, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -327,6 +349,11 @@ impl<B: Clone> Pool<B> {
     }
 }
 
+/// Never short of memory: pools that keep their spares whatever the PC has.
+fn never() -> bool {
+    false
+}
+
 /// A mapped upload buffer's memory.
 #[derive(Clone)]
 struct Upload(ID3D12Resource, *mut u8);
@@ -334,7 +361,7 @@ struct Upload(ID3D12Resource, *mut u8);
 unsafe impl Send for Upload {}
 
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
-static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::with_short(STAGING_KEPT, STAGING_SHORT, crate::host::ram_short));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -683,6 +710,167 @@ mod tests {
         assert_eq!(pool.take(BLOCK / 2, 65536, 0, make).unwrap().1, 6);
         assert_eq!(made.get(), n);
         assert!(pool.take(BLOCK, 65536, 0, make).is_none());
+    }
+
+    std::thread_local! {
+        /// What [`short_here`] says, for the pools of this thread's test.
+        static SHORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn short_here() -> bool {
+        SHORT.with(std::cell::Cell::get)
+    }
+
+    /// A fixed-seed xorshift.
+    fn next(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    /// Staging as `staging` uses the pool, on memory of the test's own (a
+    /// block is a vector of zeros when made, as an upload buffer is), with
+    /// the PC short of memory part of the time or never. Returns the bytes
+    /// each piece held when its copy was recorded (in order of the takes),
+    /// the most empty blocks seen after a settle while short (or in all, if
+    /// never short), and the blocks made.
+    fn staging_run(seed: u64, short_sometimes: bool) -> (Vec<Vec<u8>>, usize, usize) {
+        use std::collections::HashMap;
+        // Small blocks' worth of bytes: the pool cuts 64 MiB blocks, but
+        // only pieces' own bytes are simulated.
+        let mut seed = seed;
+        let mut pool: Pool<u64> = Pool::with_short(STAGING_KEPT, STAGING_SHORT, short_here);
+        let memory: std::cell::RefCell<HashMap<(u64, u64), Vec<u8>>> = Default::default();
+        let made = std::cell::Cell::new(0u64);
+        let mut live: Vec<(Piece, u64, u8)> = Vec::new();
+        let mut uploaded = Vec::new();
+        let mut most_empty_short = 0;
+        let mut now = 0u64;
+        for step in 0..3000u64 {
+            now += next(&mut seed) % 400;
+            if short_sometimes {
+                // Short for stretches of steps.
+                SHORT.with(|s| s.set(step / 250 % 2 == 1));
+            }
+            // Bursts of takes (a world streaming in), then quiet.
+            let burst = step % 500 < 120;
+            if burst || next(&mut seed).is_multiple_of(4) {
+                let len = (1 + next(&mut seed) % 24) << 20;
+                let (piece, block, again) = pool.take(len, 512, now, || {
+                    made.set(made.get() + 1);
+                    Some(made.get())
+                }).unwrap();
+                // No live piece overlaps it.
+                assert!(live.iter().all(|(q, b, _)| *b != block || piece.start + piece.len <= q.start || q.start + q.len <= piece.start));
+                let mut memory = memory.borrow_mut();
+                let bytes = memory.entry((block, piece.start)).or_insert_with(|| vec![0; 64]);
+                if again {
+                    bytes.fill(0);
+                }
+                // As a block made anew: zeros before the detile writes.
+                assert!(bytes.iter().all(|&b| b == 0), "a piece begins as zeros");
+                let fill = next(&mut seed) as u8 | 1;
+                bytes.fill(fill);
+                uploaded.push(bytes.clone());
+                live.push((piece, block, fill));
+            }
+            // Pieces given back (their texture's copy has run).
+            if !live.is_empty() && (!burst || next(&mut seed).is_multiple_of(3)) {
+                let at = (next(&mut seed) % live.len() as u64) as usize;
+                let (piece, block, fill) = live.swap_remove(at);
+                let memory = memory.borrow();
+                // Nothing else wrote it while it was taken.
+                assert!(memory[&(block, piece.start)].iter().all(|&b| b == fill));
+                pool.give(piece, now);
+            }
+            // Once a second: the settle.
+            if step % 3 == 0 {
+                pool.rested(now);
+                let empty = pool.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
+                // (Without stretches short: the most kept as before.)
+                if short_here() || !short_sometimes {
+                    most_empty_short = most_empty_short.max(empty);
+                }
+            }
+            // No block that holds a piece taken, or resting, went.
+            for (piece, block, _) in &live {
+                assert_eq!(pool.blocks[piece.block].as_ref().map(|b| b.memory), Some(*block));
+            }
+            for (_, piece) in &pool.resting {
+                assert!(pool.blocks[piece.block].is_some());
+            }
+            // A block that went is gone from the simulated memory too.
+            let alive: Vec<u64> = pool.blocks.iter().flatten().map(|b| b.memory).collect();
+            memory.borrow_mut().retain(|(block, _), _| alive.contains(block));
+        }
+        SHORT.with(|s| s.set(false));
+        (uploaded, most_empty_short, made.get() as usize)
+    }
+
+    /// While the PC is short of memory the staging pool keeps one empty
+    /// block, and only empty ones go: every piece begins as zeros, keeps
+    /// the bytes written into it until it is given back, and the bytes each
+    /// copy records are those of the run with spares kept as before
+    /// (fixed seeds).
+    #[test]
+    fn staging_spares_go_while_short_and_bytes_stay_the_same() {
+        // As the card's room allows in the game run (8 staging blocks).
+        SPARES.store(SPARE_KEPT, Ordering::Relaxed);
+        for seed in [0x9E37_79B9_7F4A_7C15u64, 0x1234_5678, 0xDEAD_BEEF_CAFE, 77] {
+            let (before, kept_before, made_before) = staging_run(seed, false);
+            assert!(kept_before > STAGING_SHORT, "seed {seed:#x}: the run keeps spares as before ({kept_before})");
+            let (now, most_empty, made_now) = staging_run(seed, true);
+            assert_eq!(before, now, "seed {seed:#x}: the same bytes reach the card");
+            assert!(most_empty <= STAGING_SHORT, "seed {seed:#x}: {most_empty} empty blocks kept while short");
+            assert!(made_now >= made_before, "seed {seed:#x}");
+        }
+    }
+
+    /// What the staging blocks hold after a burst of streaming, with spares
+    /// kept as before and while the PC is short of memory (ignored: a
+    /// measurement on this PC's card; `cargo test --release -p victory-gpu
+    /// --lib -- --ignored --nocapture staging_spares_after_a_burst`).
+    #[test]
+    #[ignore = "measures; prints"]
+    fn staging_spares_after_a_burst() {
+        let Some(host) = crate::host::host() else { return };
+        let shared = || host.video_memory().map_or(0, |m| m[3] >> 20);
+        // The card has room, as in the game run: spares as many as allowed.
+        SPARES.store(SPARE_KEPT, Ordering::Relaxed);
+        for short in [false, true] {
+            crate::host::set_ram_short(false);
+            let start = shared();
+            // A world streaming in: 640 MB of staging, a texture keeping a
+            // piece of 1 MiB in every third block's worth.
+            let mut kept = Vec::new();
+            let mut burst = Vec::new();
+            for i in 0..40 {
+                burst.push(staging(host, 16 << 20).unwrap().0);
+                if i % 12 == 0 {
+                    kept.push(staging(host, 1 << 20).unwrap().0);
+                }
+            }
+            let peak = (memory()[1], shared());
+            drop(burst);
+            crate::host::set_ram_short(short);
+            let at = now() + REST + 1;
+            settle(&STAGING, at);
+            let after = (memory()[1], shared());
+            println!(
+                "{}: staging blocks {} MB at the burst ({} MB shared with the card, {start} before), {} MB after it rested ({} MB shared), {} MB held by textures",
+                if short { "short of memory (VICTORY_RAM_TRIM=1)" } else { "as before" },
+                peak.0,
+                peak.1,
+                after.0,
+                after.1,
+                kept.len()
+            );
+            drop(kept);
+            crate::host::set_ram_short(true);
+            settle(&STAGING, now() + REST + 1);
+        }
+        crate::host::set_ram_short(false);
     }
 
     /// A pooled texture's piece comes back when its last reference goes, not

@@ -363,6 +363,88 @@ pub(crate) fn keep_freed() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_FREED").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_RAM_TRIM=1` (off by default): while the PC is short of memory
+/// ([`ram_short`]), the empty spares the layer keeps in the PC's memory go
+/// down to a few: blocks of texture staging (`crate::pool`, 8 kept: 512 MB)
+/// and list scratch chunks (1 GiB kept with [`keep_freed`]). They are kept
+/// so that the next burst of streaming takes memory that is there instead
+/// of making it mid-frame; on a 32 GB PC in gameplay the staging blocks held
+/// 768 MB for 43 MB of staging (measured in game, 768p), while the PC had
+/// 2.8 GB free and Windows was paging. Memory in use is never touched: only
+/// spares that no list, texture or submission holds go, as they go today
+/// past their limits. Off: the limits are those of before, whatever the
+/// PC has free.
+fn ram_trim() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_RAM_TRIM"))
+}
+
+/// Under this much free physical memory or commit left, in bytes, the PC
+/// counts as short of memory for [`ram_trim`]
+/// (`VICTORY_RAM_TRIM_BELOW_MB`, 6144).
+fn ram_trim_below() -> u64 {
+    static BELOW: OnceLock<u64> = OnceLock::new();
+    *BELOW.get_or_init(|| {
+        std::env::var("VICTORY_RAM_TRIM_BELOW_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(6144) << 20
+    })
+}
+
+/// Whether the PC was short of memory at the last sweep ([`ram_trim`]).
+static RAM_SHORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the layer's spares in the PC's memory are to stay few now: only
+/// with [`ram_trim`], and only while the PC was short of memory at the last
+/// look (once a second).
+pub(crate) fn ram_short() -> bool {
+    RAM_SHORT.load(Ordering::Relaxed)
+}
+
+/// For measurements: as if the last look had found the PC short or not.
+#[cfg(test)]
+pub(crate) fn set_ram_short(short: bool) {
+    RAM_SHORT.store(short, Ordering::Relaxed);
+}
+
+/// Whether `[commit_left, ram_free]` (as [`system_memory`] gives them) is
+/// short of memory for a limit of `below` bytes. Zeros mean the system did
+/// not say: not short.
+fn short_of(system: [u64; 2], below: u64) -> bool {
+    let [commit_left, ram_free] = system;
+    (commit_left > 0 || ram_free > 0) && (commit_left < below || ram_free < below)
+}
+
+/// Times the PC turned short of memory since the start, and the spare
+/// bytes let go for it (staging blocks, scratch chunks; the memory line's
+/// `ram_trimmed`).
+pub(crate) static RAM_TRIMS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Once a second ([`sweep`]): with [`ram_trim`], looks at what the PC has
+/// and, while it is short, lets go of the scratch chunks past what is kept
+/// then.
+fn note_ram() {
+    if !ram_trim() {
+        return;
+    }
+    let system = system_memory();
+    let short = short_of(system, ram_trim_below());
+    if RAM_SHORT.swap(short, Ordering::Relaxed) != short {
+        let times = RAM_TRIMS[0].fetch_add(u64::from(short), Ordering::Relaxed) + u64::from(short);
+        tracing::info!(
+            "VICTORY_RAM_TRIM: the PC is {} short of memory ({} MB free, {} MB left to commit; under {} MB is short): spares in the PC's memory kept {} (short {times} times, {} MB of spares let go so far)",
+            if short { "now" } else { "no longer" },
+            system[1] >> 20,
+            system[0] >> 20,
+            ram_trim_below() >> 20,
+            if short { "few" } else { "as before" },
+            RAM_TRIMS[1].load(Ordering::Relaxed) >> 20
+        );
+    }
+    if short {
+        let freed = trim_spare_chunks(SPARE_SHORT);
+        RAM_TRIMS[1].fetch_add(freed, Ordering::Relaxed);
+    }
+}
+
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
 /// when free physical RAM is low. Never returns less than 2,000 ms.
@@ -432,6 +514,8 @@ fn sweep() {
     }
     #[cfg(feature = "diagnostics")]
     crate::book::check();
+    // First: the pools below keep fewer spares while it says so.
+    note_ram();
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
@@ -2089,6 +2173,34 @@ const SCRATCH_FIRST: u64 = 256 << 10;
 const SPARE_MOST: u64 = 128 << 20;
 /// The same with [`keep_freed`].
 const SPARE_KEPT: u64 = 1 << 30;
+/// The same while the PC is short of memory ([`ram_short`]): what is kept
+/// without [`keep_freed`].
+const SPARE_SHORT: u64 = SPARE_MOST;
+
+/// The most bytes of chunks kept while no list holds them, now.
+fn spare_most() -> u64 {
+    if ram_short() {
+        SPARE_SHORT
+    } else if keep_freed() {
+        SPARE_KEPT
+    } else {
+        SPARE_MOST
+    }
+}
+
+/// Lets go of the kept scratch chunks past `most` bytes, those given back
+/// longest ago first; the bytes let go.
+fn trim_spare_chunks(most: u64) -> u64 {
+    let freed: Vec<(Chunk, u64)> = SPARE.lock().unwrap_or_else(|e| e.into_inner()).trim(most);
+    let bytes: u64 = freed.iter().map(|(_, size)| size).sum();
+    ALIVE[1].fetch_sub(freed.len() as u64, Ordering::Relaxed);
+    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
+    ALIVE[3].fetch_sub(freed.len() as u64, Ordering::Relaxed);
+    ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+    // Freed outside the lock. No list holds them: they were kept spare.
+    drop(freed);
+    bytes
+}
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
@@ -2132,6 +2244,19 @@ impl<T> Spare<T> {
         self.kept.push((thing, size));
         None
     }
+
+    /// Takes out the things given longest ago until the kept bytes are at
+    /// most `most`, and hands them back with their sizes.
+    fn trim(&mut self, most: u64) -> Vec<(T, u64)> {
+        let mut n = 0;
+        let mut bytes = self.bytes;
+        while bytes > most && n < self.kept.len() {
+            bytes -= self.kept[n].1;
+            n += 1;
+        }
+        self.bytes = bytes;
+        self.kept.drain(..n).collect()
+    }
 }
 
 /// Scratch chunks no list holds.
@@ -2169,7 +2294,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { SPARE_MOST })
+                spare.give(chunk, size, spare_most())
             } else {
                 Some(chunk)
             };
@@ -11069,7 +11194,7 @@ fn frame_log(presented: [u64; 2]) {
 }
 
 /// The highest value so far of each field of [`memory_line`].
-static MEMORY_PEAKS: [std::sync::atomic::AtomicU64; 20] = [const { std::sync::atomic::AtomicU64::new(0) }; 20];
+static MEMORY_PEAKS: [std::sync::atomic::AtomicU64; 21] = [const { std::sync::atomic::AtomicU64::new(0) }; 21];
 
 /// What holds memory, by who holds it, in one line with the frame-rate
 /// lines every five seconds, for a launcher to read: `memory by subsystem:`
@@ -11084,7 +11209,7 @@ fn memory_line(host: &Host) {
     let kept = crate::pipeline::kept();
     let video = host.video_memory().unwrap_or_default();
     let system = system_memory();
-    let fields: [(&str, u64); 20] = [
+    let fields: [(&str, u64); 21] = [
         ("private", private_bytes()),
         ("list_allocators", HELD_CALLS.load(Ordering::Relaxed) * CALL_BYTES),
         ("list_scratch", alive(2)),
@@ -11112,6 +11237,9 @@ fn memory_line(host: &Host) {
         // there too), and the physical memory free.
         ("commit_left", system[0]),
         ("ram_free", system[1]),
+        // Spares in the PC's memory let go while it was short of memory
+        // (`VICTORY_RAM_TRIM=1`), since the start.
+        ("ram_trimmed", RAM_TRIMS[1].load(Ordering::Relaxed)),
     ];
     tracing::info!("{}", memory_text(&fields, &MEMORY_PEAKS));
 }
@@ -12329,6 +12457,97 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+
+    /// A trim hands back the things given longest ago until the rest fits,
+    /// and what is left comes back as it would have (fixed seeds, against a
+    /// list kept beside it).
+    #[test]
+    fn a_trim_lets_the_oldest_go_and_keeps_the_rest_as_it_was() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut spare: Spare<u32> = Spare::new();
+        let mut model: Vec<(u32, u64)> = Vec::new();
+        for i in 0..20_000u32 {
+            let size = [1u64, 4, 16][(next() % 3) as usize];
+            match next() % 4 {
+                0 | 1 => {
+                    if spare.give(i, size, 200).is_none() {
+                        model.push((i, size));
+                    }
+                }
+                2 => {
+                    let want = model.iter().rposition(|&(_, s)| s == size).map(|at| model.remove(at).0);
+                    assert_eq!(spare.take(size), want);
+                }
+                _ => {
+                    let most = next() % 220;
+                    let gone = spare.trim(most);
+                    let mut bytes: u64 = model.iter().map(|(_, s)| s).sum();
+                    let mut n = 0;
+                    while bytes > most {
+                        bytes -= model[n].1;
+                        n += 1;
+                    }
+                    let want: Vec<(u32, u64)> = model.drain(..n).collect();
+                    assert_eq!(gone, want);
+                    assert!(spare.bytes <= most);
+                }
+            }
+            assert_eq!(spare.bytes, model.iter().map(|(_, s)| s).sum::<u64>());
+            assert_eq!(spare.kept, model);
+        }
+    }
+
+    /// What the spare scratch chunks hold after a frame of many lists, as
+    /// before and trimmed while the PC is short of memory (ignored: a
+    /// measurement; `cargo test --release -p victory-gpu --lib -- --ignored
+    /// --nocapture scratch_spares_trimmed`).
+    #[test]
+    #[ignore = "measures; prints"]
+    fn scratch_spares_trimmed() {
+        use std::sync::atomic::Ordering;
+        let Some(host) = super::host() else { return };
+        let shared = || host.video_memory().map_or(0, |m| m[3] >> 20);
+        let start = shared();
+        // 640 MB of chunks taken by the lists of a busy frame, all given back.
+        let chunks: Vec<(super::Chunk, u64)> =
+            (0..160).map(|_| (super::take_chunk(host, super::SCRATCH_CHUNK).unwrap(), super::SCRATCH_CHUNK)).collect();
+        let busy = shared();
+        super::give_chunks(chunks);
+        let kept = (super::ALIVE[4].load(Ordering::Relaxed) >> 20, shared());
+        let freed = super::trim_spare_chunks(super::SPARE_SHORT);
+        let trimmed = (super::ALIVE[4].load(Ordering::Relaxed) >> 20, shared());
+        println!(
+            "scratch: {start} MB shared with the card before, {busy} MB with 640 MB of chunks taken; given back: {} MB spare ({} MB shared); \
+             trimmed as while short: {} MB let go, {} MB spare ({} MB shared)",
+            kept.0,
+            kept.1,
+            freed >> 20,
+            trimmed.0,
+            trimmed.1
+        );
+        super::trim_spare_chunks(0);
+    }
+
+    /// Short of memory: under the limit in free memory or in commit left;
+    /// a system that says nothing (zeros) is not.
+    #[test]
+    fn short_of_memory_is_either_under_the_limit() {
+        const MB: u64 = 1 << 20;
+        let short = |commit: u64, free: u64| super::short_of([commit * MB, free * MB], 6144 * MB);
+        assert!(!short(20_000, 16_000));
+        assert!(short(20_000, 2_800), "little free memory");
+        assert!(short(869, 16_000), "little left to commit");
+        assert!(short(869, 2_800));
+        assert!(!short(6144, 6144));
+        assert!(short(6143, 6144));
+        assert!(!super::short_of([0, 0], 6144 * MB), "nothing said");
     }
 }
 

@@ -651,6 +651,103 @@ void main(uint3 id : SV_DispatchThreadID) {
         c.PagefileUsage as u64
     }
 
+    /// What of the PC's memory host buffers and list allocators hold
+    /// (cargo test -p victory-gpu --lib -- --ignored --nocapture
+    /// what_buffers_and_allocators_hold). Measured on an RTX 4070 SUPER: a
+    /// shared buffer (a window's kind) is in the working set and the card's
+    /// shared account whole from its making, written or not, so a window's
+    /// pages nothing copied are the PC's memory all the same; an allocator
+    /// keeps the command memory of its largest recording over a reset, and
+    /// the driver keeps it after the allocator is let go, so making allocators
+    /// anew gives nothing back.
+    #[test]
+    #[ignore = "measures; prints"]
+    fn what_buffers_and_allocators_hold() {
+        let Some(host) = crate::host::host() else { return };
+        let ws = || {
+            use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+            // SAFETY: our own process and a sized structure.
+            unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+            c.WorkingSetSize as u64
+        };
+        let say = |what: &str| {
+            let v = host.video_memory().unwrap_or_default();
+            println!(
+                "{what}: private {} MB, working set {} MB, avail phys {} MB, gpu shared used {} MB",
+                private_now() >> 20,
+                ws() >> 20,
+                crate::host::available_physical_ram().unwrap_or(0) >> 20,
+                v[3] >> 20
+            );
+        };
+        say("start");
+        let bufs: Vec<_> = (0..64).map(|_| host.shared_buffer(16 << 20).unwrap()).collect();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        say("64 x 16 MiB shared made");
+        for (_, d) in &bufs {
+            // SAFETY: the buffer's mapping, 16 MiB.
+            unsafe { d.write_volatile(1) };
+        }
+        say("first byte of each written");
+        for (_, d) in &bufs {
+            // SAFETY: as above.
+            unsafe { std::ptr::write_bytes(*d, 1, 8 << 20) };
+        }
+        say("half of each written");
+        let ups: Vec<_> = (0..16).map(|_| host.upload_buffer(64 << 20).unwrap()).collect();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        say("16 x 64 MiB upload made");
+        drop(ups);
+        drop(bufs);
+        say("let go");
+        let device = &host.device;
+        let a = host.upload_buffer(1 << 20).unwrap().0;
+        let b = host.shared_buffer(1 << 20).unwrap().0;
+        // SAFETY (the blocks below): plain creation and recording on a live
+        // device; nothing is executed.
+        let lists: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> = (0..8)
+            .map(|_| unsafe {
+                let al: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let l: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &al, None).unwrap();
+                (al, l)
+            })
+            .collect();
+        say("8 lists made");
+        for (_, l) in &lists {
+            for i in 0..200_000u64 {
+                unsafe { l.CopyBufferRegion(&b, (i * 16) % (1 << 20), &a, 0, 16) };
+            }
+            unsafe { l.Close().unwrap() };
+        }
+        say("200,000 copies recorded in each");
+        for (al, l) in &lists {
+            unsafe {
+                al.Reset().unwrap();
+                l.Reset(al, None).unwrap();
+                l.CopyBufferRegion(&b, 0, &a, 0, 16);
+                l.Close().unwrap();
+            }
+        }
+        say("reset, one copy each");
+        let fresh: Vec<ID3D12CommandAllocator> = lists
+            .iter()
+            .map(|(_, l)| unsafe {
+                let al: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                l.Reset(&al, None).unwrap();
+                l.CopyBufferRegion(&b, 0, &a, 0, 16);
+                l.Close().unwrap();
+                al
+            })
+            .collect();
+        let lists: Vec<_> = lists.into_iter().map(|(_, l)| l).collect();
+        say("old allocators let go, new ones with one copy");
+        drop((fresh, lists));
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        say("all lists and allocators let go");
+    }
+
     /// Which D3D12 objects count in the private bytes (`PagefileUsage`) the
     /// memory line's `private=` reads. `cargo test -p victory-gpu --lib --
     /// --ignored --nocapture what_counts_as_private`.

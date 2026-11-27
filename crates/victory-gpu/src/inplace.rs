@@ -1313,6 +1313,55 @@ pub(crate) fn tick() {
 pub(crate) mod tests {
     use super::*;
 
+    /// Whether a heap opened on a committed section costs the PC's memory
+    /// only for the pages written (they are demand-zero until then), which
+    /// would let a window hold only what it copies at one address for the
+    /// card and the CPU (cargo test -p victory-gpu --lib -- --ignored
+    /// --nocapture a_section_heap_locks_its_pages). Measured on an RTX 4070
+    /// SUPER: no. Placing a buffer in it locks the whole section at once
+    /// (256 MiB: the free memory falls by 261 MB before a page is written),
+    /// as a shared buffer does.
+    #[test]
+    #[ignore = "measures; prints"]
+    fn a_section_heap_locks_its_pages() {
+        let Some(host) = crate::host::host() else { return };
+        let mut rig = Rig::new(&host.device).unwrap();
+        let say = |what: &str| {
+            let v = host.video_memory().unwrap_or_default();
+            println!(
+                "{what}: working set {} MB, avail phys {} MB, gpu shared used {} MB",
+                working_set_mb(),
+                crate::host::available_physical_ram().unwrap_or(0) >> 20,
+                v[3] >> 20
+            );
+        };
+        const BYTES: usize = 256 << 20;
+        // SAFETY (the whole block): a section, view and heap of the test's
+        // own, let go at the end; the card copies only what lies in them.
+        unsafe {
+            say("start");
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, BYTES as u32, std::ptr::null());
+            let view = mem::MapViewOfFile(handle, mem::FILE_MAP_ALL_ACCESS, 0, 0, BYTES);
+            let heap = open(&host.device, From::Section(handle as usize)).unwrap();
+            let buffer = place(&host.device, &heap, 0, BYTES as u64).unwrap();
+            say("256 MiB section opened, buffer placed, view mapped");
+            std::ptr::write_bytes(view.Value.cast::<u8>(), 7, 64 << 20);
+            say("64 MiB written through the view");
+            let ms = rig.copy_ms(&buffer, 64 << 20).unwrap();
+            say(&format!("the card copied the first 64 MiB ({ms:.2} ms)"));
+            let ms = rig.copy_ms(&buffer, BYTES as u64).unwrap();
+            say(&format!("the card copied all 256 MiB ({ms:.2} ms)"));
+            let (shared, _) = host.shared_buffer(BYTES as u64).unwrap();
+            let ms = rig.copy_ms(&shared, BYTES as u64).unwrap();
+            say(&format!("a shared buffer of 256 MiB, copied by the card ({ms:.2} ms)"));
+            drop((buffer, heap, shared));
+            mem::UnmapViewOfFile(view);
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+            say("let go");
+        }
+    }
+
     /// Views as the runtime tells them: a range inside one view, or over
     /// views that continue each other in one section, is one run; over
     /// views from elsewhere it is scattered; over a gap it has holes.

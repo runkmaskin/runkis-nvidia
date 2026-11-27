@@ -52,6 +52,10 @@ $settings = @{
     # local: host copies of placed textures whose memory is gone let go after 2.5 s: peak commit 24.5 -> 24.0-24.1 GB in
     # 5-minute runs, fps the same (27.4 vs 26.9, two runs each); the saving grows with play time
     VICTORY_TEXTURE_UNMAPPED_GO = '1'
+    # local: while the PC has under 6 GB free (or left to commit), empty staging blocks and list scratch chunks go
+    # down to a few: 768p, seconds 150-300, two runs each: staging 662 -> 353 MB, scratch 437 -> 320 MB, card's shared
+    # memory 6.9 -> 6.6 GB, fps 21.7 -> 22.6 (noise)
+    VICTORY_RAM_TRIM = '1'
     # local: programs the shader validator refused (all their draws dropped) now validate: 41 with mixed interpolation
     # in a signature row, 3 alpha-clip materials with a level query on an array; game run: nothing new refused, same fps
     VICTORY_SIG_ROWS = '1'; VICTORY_LOD_ARRAY = '1'
