@@ -87,6 +87,7 @@ public sealed class MainViewModel : Observable, IDisposable
         CopyLog = new Command(() => Clipboard.SetText(string.Join(Environment.NewLine, LogView.Cast<LogLine>().Select(l => l.Text))));
         ClearLog = new Command(() => LogLines.Clear());
         Go = new Command(p => Page = p as string ?? "Play");
+        SavePreset = new Command(DoSavePreset, () => UsingPreset);
 
         fast = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(250) };
         fast.Tick += (_, _) => FastTick();
@@ -135,7 +136,8 @@ public sealed class MainViewModel : Observable, IDisposable
     }
     public string GameName => string.IsNullOrWhiteSpace(profile.GameExe) ? "No game chosen" : Path.GetFileName(profile.GameExe);
     public string GameFolder => string.IsNullOrWhiteSpace(profile.GameExe) ? "Choose your own copy of game_scarlett_master.exe" : Path.GetDirectoryName(profile.GameExe) ?? "";
-    public string ProfileSummary =>
+    public string ProfileSummary => Summary(EffectiveProfile);
+    private string Summary(LaunchProfile profile) =>
         $"Series {(profile.Console == ConsoleModel.SeriesX ? "X" : "S")} · {(profile.Resolution is int r ? $"{r}p" : "half scale")} · "
         + $"{(profile.Quality ? "Quality" : "Speed")} · {RepoLayout.BuildFolder(profile.Build)} build · "
         + (Dxgi.Resolve(adapters, profile.Adapter).Adapter?.Name ?? "no card");
@@ -146,6 +148,46 @@ public sealed class MainViewModel : Observable, IDisposable
     public Array DredModes { get; } = Enum.GetValues<DredMode>();
     public List<Choice> ResolutionChoices { get; }
     public List<Choice> AdapterChoices { get; }
+
+    // ---------------------------------------------------------------- presets
+    /// <summary>"Start as": the selected profile, or a preset over it (game, folders, card and build kept).</summary>
+    public List<Choice> StartChoices { get; } =
+        [new("My profile", null), .. Presets.All.Select(p => new Choice(p.Name, p))];
+    private Choice? selectedStart;
+    public Choice? SelectedStart
+    {
+        get => selectedStart ??= StartChoices[0];
+        set
+        {
+            if (!Set(ref selectedStart, value)) return;
+            Raise(nameof(StartDescription));
+            Raise(nameof(ProfileSummary));
+            Raise(nameof(UsingPreset));
+            _ = RunChecksAsync();
+        }
+    }
+    public bool UsingPreset => SelectedStart?.Value is Preset;
+    public string StartDescription => SelectedStart?.Value is Preset p
+        ? p.Description
+        : $"Your profile '{profile.Name}', as set on the Settings page.";
+    /// <summary>What a run would start with now.</summary>
+    public LaunchProfile EffectiveProfile => SelectedStart?.Value is Preset p ? Presets.Make(p, profile) : profile;
+
+    private void DoSavePreset()
+    {
+        if (SelectedStart?.Value is not Preset preset) return;
+        var p = Presets.Make(preset, profile);
+        p.Name = store.FreeName(preset.Name);
+        try
+        {
+            store.Save(p);
+            ProfileNames.Add(p.Name);
+            SwitchTo(p);
+            SelectedStart = StartChoices[0];
+            Toast($"Saved as the profile '{p.Name}'; change it on the Settings page.");
+        }
+        catch (Exception e) when (e is IOException or ArgumentException or InvalidDataException or UnauthorizedAccessException) { Toast($"Not saved: {e.Message}"); }
+    }
 
     private string previewText = "Press 'Show effective settings' to see exactly what the next run gets.";
     public string PreviewText { get => previewText; private set => Set(ref previewText, value); }
@@ -158,6 +200,7 @@ public sealed class MainViewModel : Observable, IDisposable
         Raise(nameof(GameFolder));
         Raise(nameof(ProfileSummary));
         Raise(nameof(ValidationText));
+        Raise(nameof(StartDescription));
     }
 
     private void LoadProfiles()
@@ -285,7 +328,7 @@ public sealed class MainViewModel : Observable, IDisposable
         SetState("Preparing", "Reading the tuned settings from play-nvidia.ps1", "Accent");
         try
         {
-            var plan = await new PlanBuilder(repo).BuildAsync(profile.Clone(), mode);
+            var plan = await new PlanBuilder(repo).BuildAsync(EffectiveProfile.Clone(), mode);
             if (!File.Exists(plan.Victory.Replace("victory_sm.exe", "victory.exe")))
                 throw new PlanException($"{plan.Victory} is not built. Build it with: {RepoLayout.BuildCommand(profile.Build)}");
             session?.Dispose();
@@ -300,7 +343,7 @@ public sealed class MainViewModel : Observable, IDisposable
             s.ProblemFound += p => Application.Current.Dispatcher.BeginInvoke(() => Problems.Add(p));
             s.StateChanged += st => Application.Current.Dispatcher.BeginInvoke(() => OnSessionState(s, st));
             session = s;
-            RunTitle = mode switch { RunMode.Warm => "Building the pipeline cache", RunMode.Precompile => "Translating shaders", _ => GameName };
+            RunTitle = mode switch { RunMode.Warm => "Building the pipeline cache", RunMode.Precompile => "Translating shaders", _ => $"{GameName} · {SelectedStart?.Label}" };
             s.Start();
             if (mode == RunMode.Play) Page = "Play";
         }
@@ -513,7 +556,7 @@ public sealed class MainViewModel : Observable, IDisposable
         ChecksSummary = "Checking…";
         try
         {
-            var p = profile.Clone();
+            var p = EffectiveProfile.Clone();
             var results = await Task.Run(() => new DiagnosticRunner(repo).RunAsync(p));
             Checks.Clear();
             foreach (var c in results.OrderByDescending(c => c.Status)) Checks.Add(c);
@@ -591,6 +634,7 @@ public sealed class MainViewModel : Observable, IDisposable
     public Command CopyLog { get; }
     public Command ClearLog { get; }
     public Command Go { get; }
+    public Command SavePreset { get; }
 
     /// <summary>True when the window may close; asks what to do with a run still going.</summary>
     public bool ConfirmClose()

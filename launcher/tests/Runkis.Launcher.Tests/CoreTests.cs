@@ -105,6 +105,49 @@ public class ProfileTests
     }
 }
 
+public class PresetTests
+{
+    [Fact]
+    public void Presets_keep_the_users_game_folders_and_card()
+    {
+        var mine = new LaunchProfile { GameExe = @"D:\g\game_scarlett_master.exe", CacheDir = @"D:\c", Adapter = "#1", Build = BuildKind.Release, Quality = true, Air = 1.2 };
+        foreach (var preset in Presets.All)
+        {
+            var p = Presets.Make(preset, mine);
+            Assert.Equal(mine.GameExe, p.GameExe);
+            Assert.Equal(mine.CacheDir, p.CacheDir);
+            Assert.Equal(mine.Adapter, p.Adapter);
+            Assert.Equal(0.3, p.Air);   // the rest starts from the script's set, not the profile's choices
+            Assert.Equal(preset.Name, p.Name);
+        }
+    }
+
+    [Fact]
+    public void Every_preset_is_a_valid_profile()
+    {
+        using var d = new TempDir();
+        var exe = Path.Combine(d.Path, "game_scarlett_master.exe");
+        File.WriteAllText(exe, "");
+        foreach (var preset in Presets.All)
+            Assert.DoesNotContain(ProfileValidator.Validate(Presets.Make(preset, new LaunchProfile { GameExe = exe })), i => i.Blocking);
+        Assert.Equal(Presets.All.Count, Presets.All.Select(p => p.Id).Distinct().Count());
+    }
+
+    [Fact]
+    public void Presets_set_what_they_say()
+    {
+        var basis = new LaunchProfile { GameExe = "x.exe" };
+        var fps = Presets.Make(Presets.ById("fps")!, basis);
+        Assert.Equal(480, fps.Resolution);
+        Assert.True(fps.SkipHairSim && fps.LeaveOut);
+        var x = Presets.Make(Presets.ById("seriesx")!, basis);
+        Assert.Equal(ConsoleModel.SeriesX, x.Console);
+        Assert.Null(x.Resolution);
+        Assert.Equal(["-Exe", "x.exe", "-Build", "diag", "-SeriesX", "-NoSmoothMotion", "-PrintEnv"], PlanBuilder.ScriptArgs(x, RunMode.Play));
+        Assert.Equal(DredMode.Light, Presets.Make(Presets.ById("safe")!, basis).Dred);
+    }
+}
+
 public class PlanTests
 {
     [Fact]

@@ -102,6 +102,10 @@ public sealed class DiagnosticRunner(RepoLayout? repo)
             else
                 r.Add(new("Graphics card", CheckStatus.Pass,
                     $"{chosen.Name}, {vram:0.#} GB, driver {chosen.NvidiaVersion ?? chosen.DriverVersion ?? "unknown"}"));
+            if (p.MipDrop == 0 && vram < 9.5 && chosen.DedicatedVideoMemory > 0)
+                r.Add(new("Full-size textures", CheckStatus.Warning,
+                    $"Full-size textures on a {vram:0.#} GB card: on 8 GB the card ran out of texture room (constant re-uploads, long frames).",
+                    "Use the Standard preset, or a texture mip drop of 1."));
             if (vram < 7.5 && chosen.DedicatedVideoMemory > 0)
                 r.Add(new("Video memory", CheckStatus.Warning, $"{vram:0.#} GB. The settings here were measured on 8 GB; less means more texture churn.",
                     "Use 480p or 540p, and keep the texture mip drop at 1 or higher."));
