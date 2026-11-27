@@ -222,6 +222,9 @@ pub(crate) extern "system" fn wait(
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
         // Tokens count frames (consecutive), not ticks.
         let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
+        // LOCAL: Reflex's frame begins here (`VICTORY_DLSS_REFLEX=1`).
+        #[cfg(windows)]
+        crate::dlss::marker(crate::dlss::Marker::SimulationStart, frame);
         if !token.is_null() {
             // SAFETY: checked non-null; the title passes its token.
             unsafe { token.write(frame) };

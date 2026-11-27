@@ -71,6 +71,36 @@ pub(crate) const RENDER_SCALE_ENV: &str = "VICTORY_RENDER_SCALE";
 /// on every console profile (Series S otherwise picks FSR).
 pub(crate) const OWN_UPSCALER_ENV: &str = "VICTORY_OWN_UPSCALER";
 
+/// Environment variable (with [`OWN_UPSCALER_ENV`] and [`RENDER_SCALE_ENV`])
+/// that makes the own upscaler's maximum scale 1 instead of the minimum: the
+/// title then sizes its scene's target (post-processing included) at the
+/// output size and runs its temporal upscaler, `TAA2U:CS_TAA2_Resolve`, from
+/// the render size to it, instead of TAA at the render size and a spatial
+/// upscale of the finished picture. Off by default (docs/dlss.md).
+pub(crate) const OWN_TAAU_ENV: &str = "VICTORY_OWN_TAAU";
+
+/// The title picks `TAA2U` over `TAA2` each frame when the scene's render size
+/// differs from its target size (`0x13f4023`: fields `+0x44/+0x48` against
+/// `+0x4c/+0x50` of the TAA object; measured 960x540 against 960x540 with the
+/// maximum made the minimum). The target is the output size times the own
+/// upscaler's maximum scale, which the title takes as the larger of its minimum
+/// and `0x1fb4300` (1 on one console profile, 2/3 on the other). This makes
+/// it 1: `vmaxss xmm0, xmm0, [rsi+0x90]` becomes `vmovss xmm0, [rip+disp]`,
+/// a load of this build's read-only 1.0 at `0x5fc6ed8`.
+fn own_taau_patch() -> OwnedPatch {
+    const AT: usize = 0x28f1e87;
+    const ONE: usize = 0x5fc6ed8;
+    let disp = (ONE as i64 - (AT as i64 + 8)) as i32;
+    let mut new = vec![0xC5, 0xFA, 0x10, 0x05];
+    new.extend_from_slice(&disp.to_le_bytes());
+    OwnedPatch {
+        what: "render scale: own upscaler maximum = 1 (temporal upscaler to the output size)",
+        rva: AT,
+        expect: vec![0xC5, 0xFA, 0x5F, 0x86, 0x90, 0, 0, 0],
+        new,
+    }
+}
+
 /// A patch whose bytes are computed at load time.
 struct OwnedPatch {
     what: &'static str,
@@ -268,7 +298,12 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
         match parse_scale(&text) {
             Some(scale) => {
                 // With the own upscaler forced, FSR is left as it is.
-                for p in render_scale_patches(base, scale, !own) {
+                let mut patches = render_scale_patches(base, scale, !own);
+                // VICTORY_OWN_TAAU: the maximum is 1, not the minimum.
+                if own && std::env::var_os(OWN_TAAU_ENV).is_some_and(|v| v != "0") {
+                    patches[1] = own_taau_patch();
+                }
+                for p in patches {
                     let p = Patch {
                         what: p.what,
                         rva: p.rva,
@@ -426,6 +461,18 @@ mod tests {
             other[1] ^= 1;
             assert_eq!(patch_site(p, &other), (false, other));
         }
+    }
+
+    #[test]
+    fn the_temporal_upscaler_patch_loads_one_in_place_of_the_maximum() {
+        let p = own_taau_patch();
+        // The same eight bytes as the `maximum = minimum` patch replaces.
+        assert_eq!(p.expect, render_scale_patches(0, 0.5, false)[1].expect);
+        assert_eq!(p.rva, render_scale_patches(0, 0.5, false)[1].rva);
+        // vmovss xmm0, [rip + disp32]: the next instruction is at 0x28f1e8f.
+        let disp = i32::from_le_bytes(p.new[4..8].try_into().unwrap());
+        assert_eq!(0x28f1e8f_i64 + i64::from(disp), 0x5fc6ed8);
+        assert_eq!(&p.new[..4], &[0xC5, 0xFA, 0x10, 0x05]);
     }
 
     #[test]

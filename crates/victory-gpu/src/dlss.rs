@@ -71,22 +71,41 @@ pub(crate) struct Map {
 /// use its real temporal upscaler.
 /// - colour: the lit scene, RGBA16F, HDR (written by `CS_ApplyCombinedDeferred`)
 /// - depth: D32S8, reversed (the projection's far plane is at 0)
-/// - motion: R16G16F
+/// - motion: R16G16F, in render pixels (captured while the camera moved:
+///   values of -1.8 to 2.2 a frame, which as a fraction of the screen would be
+///   two screens; -10000 marks texels without a vector)
 /// - the jitter: words 24 and 25 of the frame's constant buffer (table place
 ///   168) are the projection's third row, x and y: the jitter in clip space,
 ///   so a pixel's offset is -x times half the width and y times half the
 ///   height (clip y points up, pixels down; the sign is checked in play).
-pub(crate) const PASS: Option<Map> = Some(Map {
-    hash: "df11dcd012cd7382",
-    colour: (1, 56),
-    depth: (1, 32),
-    motion: (1, 80),
-    output: (1, 160),
-    jitter: ((1, 168), 24),
-    jitter_scale: [-0.5, 0.5],
-    motion_per_pixel: false,
-    depth_inverted: true,
-});
+pub(crate) const PASSES: [Map; 2] = [
+    Map {
+        hash: "df11dcd012cd7382",
+        colour: (1, 56),
+        depth: (1, 32),
+        motion: (1, 80),
+        output: (1, 160),
+        jitter: ((1, 168), 24),
+        jitter_scale: [-0.5, 0.5],
+        motion_per_pixel: true,
+        depth_inverted: true,
+    },
+    // The title's temporal upscaler, `TAA2U:CS_TAA2_Resolve`, which it runs
+    // with `VICTORY_OWN_TAAU=1`: the same source compiled to write its result
+    // at the output size, with the same table layout (read from the shader
+    // offline). DLSS then upscales: render size in, output size out.
+    Map {
+        hash: "22f4971293b8fdcc",
+        colour: (1, 56),
+        depth: (1, 32),
+        motion: (1, 80),
+        output: (1, 160),
+        jitter: ((1, 168), 24),
+        jitter_scale: [-0.5, 0.5],
+        motion_per_pixel: true,
+        depth_inverted: true,
+    },
+];
 
 /// The jitter in render pixels from the words the title keeps it in.
 /// `VICTORY_DLSS_JITTER_SCALE=<x>,<y>` replaces the map's scale (to try the
@@ -146,6 +165,139 @@ pub(crate) fn readable(at: usize, len: usize) -> bool {
 const SDK_VERSION: u64 = (2 << 48) | (14 << 32) | (16 << 16) | 0xfedc;
 
 const FEATURE_DLSS: u32 = 0;
+const FEATURE_REFLEX: u32 = 3;
+const FEATURE_PCL: u32 = 4;
+const FEATURE_DLSS_G: u32 = 1000;
+
+/// `VICTORY_DLSS_REFLEX=1` (with `VICTORY_DLSS=1`): NVIDIA Reflex in low
+/// latency mode, and the PC latency markers of each frame ([`marker`]).
+pub(crate) fn reflex_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| on() && crate::switch::on("VICTORY_DLSS_REFLEX"))
+}
+
+/// `VICTORY_DLSS_FG=1` (with `VICTORY_DLSS=1`): DLSS Frame Generation is
+/// loaded and whether it can run is logged. It needs hardware-accelerated GPU
+/// scheduling; its per-frame inputs are the plan in `docs/dlss.md`.
+pub(crate) fn frame_generation_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| on() && crate::switch::on("VICTORY_DLSS_FG"))
+}
+
+/// `sl::ReflexOptions`, version 1.
+#[repr(C)]
+struct ReflexOptions {
+    base: Base,
+    mode: u32,
+    frame_limit_us: u32,
+    use_markers_to_optimize: bool,
+    virtual_key: u16,
+    id_thread: u32,
+}
+
+const REFLEX_OPTIONS: Guid = Guid(0xf03a_f81a, 0x6d0b, 0x4902, [0xa6, 0x51, 0xc4, 0x96, 0x5e, 0x21, 0x54, 0x34]);
+/// `sl::ReflexMode::eLowLatency`.
+const REFLEX_LOW_LATENCY: u32 = 1;
+
+/// The PC latency markers (`sl::PCLMarker`) the layer sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Marker {
+    /// The title begins a frame (its frame-origin wait ends).
+    SimulationStart = 0,
+    /// The title presents the frame's planes.
+    SimulationEnd = 1,
+    RenderSubmitStart = 2,
+    RenderSubmitEnd = 3,
+    /// Around the host's `Present`.
+    PresentStart = 4,
+    PresentEnd = 5,
+}
+
+/// Turns Reflex on and finds the marker function; `None` (logged) if
+/// either is refused.
+fn reflex(function_of: &dyn Fn(u32, &std::ffi::CStr) -> Result<*mut c_void, String>) -> Option<SetMarker> {
+    let set = match function_of(FEATURE_REFLEX, c"slReflexSetOptions") {
+        // SAFETY: the function `sl_reflex.h` declares under this name.
+        Ok(f) => unsafe { std::mem::transmute::<*mut c_void, SetReflex>(f) },
+        Err(why) => {
+            tracing::warn!("Reflex not available: {why}");
+            return None;
+        }
+    };
+    let options = ReflexOptions {
+        base: Base::new(REFLEX_OPTIONS, 1),
+        mode: REFLEX_LOW_LATENCY,
+        frame_limit_us: 0,
+        use_markers_to_optimize: false,
+        virtual_key: 0,
+        id_thread: 0,
+    };
+    // SAFETY: valid options living through the call.
+    let r = unsafe { set(&raw const options) };
+    if r != 0 {
+        tracing::warn!("Reflex not turned on: {}", result_text(r));
+        return None;
+    }
+    match function_of(FEATURE_PCL, c"slPCLSetMarker") {
+        Ok(f) => {
+            tracing::info!("Reflex: low latency mode on, PC latency markers sent each frame");
+            // SAFETY: the function `sl_pcl.h` declares under this name.
+            Some(unsafe { std::mem::transmute::<*mut c_void, SetMarker>(f) })
+        }
+        Err(why) => {
+            tracing::warn!("Reflex markers not available: {why}");
+            None
+        }
+    }
+}
+
+/// The Streamline attached to the host device, if any.
+fn attached() -> Option<&'static Dlss> {
+    ATTACHED.get()?.as_ref().ok()
+}
+
+/// Sends latency marker `m` for the title's frame `frame` (Reflex on only).
+pub(crate) fn marker(m: Marker, frame: u64) {
+    if !reflex_on() {
+        return;
+    }
+    let Some(d) = attached() else { return };
+    let Some(set) = d.markers else { return };
+    let index = frame as u32;
+    let mut token = std::ptr::null_mut();
+    // SAFETY: an out pointer and a frame index of ours; the token is
+    // Streamline's and lives in its ring of frames.
+    unsafe {
+        if (d.new_token)(&raw mut token, &raw const index) == 0 && !token.is_null() {
+            let r = set(m as u32, token);
+            if r != 0 {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(marker = ?m, "Reflex marker refused: {}", result_text(r)));
+            }
+        }
+    }
+}
+
+/// `factory` as Streamline's proxy (`slUpgradeInterface`), when DLSS is on
+/// and attached: a swap chain made with it presents through Streamline, which
+/// runs its per-frame bookkeeping there (without it Streamline logs that
+/// `presentCommon()` was not observed) and which frame generation needs. The
+/// factory as it was otherwise.
+pub(crate) fn proxy_factory(factory: windows::Win32::Graphics::Dxgi::IDXGIFactory2) -> windows::Win32::Graphics::Dxgi::IDXGIFactory2 {
+    let Some(d) = attached() else { return factory };
+    let mut raw = factory.into_raw();
+    // SAFETY: a live factory whose reference we hand over; Streamline puts
+    // its proxy (holding the factory) in its place, or leaves it.
+    unsafe {
+        let r = (d.upgrade)(&raw mut raw);
+        if r == 0 {
+            tracing::info!("DLSS: the swap chain is made through Streamline's factory");
+        } else {
+            tracing::warn!("DLSS: Streamline's factory refused ({}); the swap chain is made as before", result_text(r));
+        }
+        windows::Win32::Graphics::Dxgi::IDXGIFactory2::from_raw(raw)
+    }
+}
 
 /// A structure's type id (a GUID) and version, which Streamline reads
 /// first in every structure it is given.
@@ -420,6 +572,9 @@ type SetConstants = unsafe extern "C" fn(*const Constants, *const c_void, *const
 type Evaluate = unsafe extern "C" fn(u32, *const c_void, *const *const Base, u32, *mut c_void) -> i32;
 type SetOptions = unsafe extern "C" fn(*const Viewport, *const Options) -> i32;
 type GetOptimal = unsafe extern "C" fn(*const Options, *mut Optimal) -> i32;
+type Upgrade = unsafe extern "C" fn(*mut *mut c_void) -> i32;
+type SetMarker = unsafe extern "C" fn(u32, *const c_void) -> i32;
+type SetReflex = unsafe extern "C" fn(*const ReflexOptions) -> i32;
 
 /// Streamline, loaded and attached to one device.
 pub(crate) struct Dlss {
@@ -429,6 +584,9 @@ pub(crate) struct Dlss {
     evaluate: Evaluate,
     set_options: SetOptions,
     get_optimal: GetOptimal,
+    upgrade: Upgrade,
+    /// PC latency markers (`slPCLSetMarker`), with `VICTORY_DLSS_REFLEX=1`.
+    markers: Option<SetMarker>,
     /// The options last set, to set them again only when they change.
     options: Mutex<Option<(u32, u32, u32, u32, u8)>>,
 }
@@ -565,7 +723,7 @@ fn start(device: &ID3D12Device) -> Result<Dlss, String> {
     };
     // SAFETY: each name's function has the type declared for it above
     // (`sl_core_api.h`).
-    let (init, set_device, supported, get_function, new_token, set_constants, evaluate) = unsafe {
+    let (init, set_device, supported, get_function, new_token, set_constants, evaluate, upgrade) = unsafe {
         (
             std::mem::transmute::<Proc, Init>(find(b"slInit\0")?),
             std::mem::transmute::<Proc, SetDevice>(find(b"slSetD3DDevice\0")?),
@@ -574,11 +732,19 @@ fn start(device: &ID3D12Device) -> Result<Dlss, String> {
             std::mem::transmute::<Proc, NewToken>(find(b"slGetNewFrameToken\0")?),
             std::mem::transmute::<Proc, SetConstants>(find(b"slSetConstants\0")?),
             std::mem::transmute::<Proc, Evaluate>(find(b"slEvaluateFeature\0")?),
+            std::mem::transmute::<Proc, Upgrade>(find(b"slUpgradeInterface\0")?),
         )
     };
     let plugins = wide(&dir);
     let paths = [plugins.as_ptr()];
-    let features = [FEATURE_DLSS];
+    // Reflex and its latency markers, and frame generation, only when asked.
+    let mut features = vec![FEATURE_DLSS];
+    if reflex_on() {
+        features.extend([FEATURE_REFLEX, FEATURE_PCL]);
+    }
+    if frame_generation_on() {
+        features.push(FEATURE_DLSS_G);
+    }
     // Logs and NGX's data in the layer's own folder, outside the repository.
     let logs = std::env::var_os("LOCALAPPDATA").map(|l| wide(&std::path::Path::new(&l).join("victory").join("dlss-logs")));
     if let Some(l) = &logs {
@@ -628,15 +794,16 @@ fn start(device: &ID3D12Device) -> Result<Dlss, String> {
     if r != 0 {
         return Err(format!("DLSS on this adapter: {}", result_text(r)));
     }
-    let function = |name: &std::ffi::CStr| -> Result<*mut c_void, String> {
+    let function_of = |feature: u32, name: &std::ffi::CStr| -> Result<*mut c_void, String> {
         let mut f = std::ptr::null_mut();
         // SAFETY: a NUL-terminated name and an out pointer of ours.
-        let r = unsafe { get_function(FEATURE_DLSS, name.as_ptr(), &raw mut f) };
+        let r = unsafe { get_function(feature, name.as_ptr(), &raw mut f) };
         if r != 0 || f.is_null() {
             return Err(format!("{}: {}", name.to_string_lossy(), result_text(r)));
         }
         Ok(f)
     };
+    let function = |name: &std::ffi::CStr| function_of(FEATURE_DLSS, name);
     // SAFETY: the functions `sl_dlss.h` declares under these names.
     let (set_options, get_optimal) = unsafe {
         (
@@ -644,6 +811,16 @@ fn start(device: &ID3D12Device) -> Result<Dlss, String> {
             std::mem::transmute::<*mut c_void, GetOptimal>(function(c"slDLSSGetOptimalSettings")?),
         )
     };
+    let markers = reflex_on().then(|| reflex(&function_of)).flatten();
+    if frame_generation_on() {
+        // SAFETY: valid structures living through the call.
+        let r = unsafe { supported(FEATURE_DLSS_G, &raw const info) };
+        if r == 0 {
+            tracing::info!("DLSS Frame Generation: supported on this card and system (not wired into the present yet; docs/dlss.md)");
+        } else {
+            tracing::warn!("DLSS Frame Generation not available: {} (it needs hardware-accelerated GPU scheduling on, an RTX 40 or 50 card and a recent driver)", result_text(r));
+        }
+    }
     Ok(Dlss {
         device: device.as_raw() as usize,
         new_token,
@@ -651,6 +828,8 @@ fn start(device: &ID3D12Device) -> Result<Dlss, String> {
         evaluate,
         set_options,
         get_optimal,
+        upgrade,
+        markers,
         options: Mutex::new(None),
     })
 }
@@ -880,6 +1059,9 @@ mod tests {
         assert_eq!(offset_of!(Options, dlaa_preset), 60);
         assert_eq!(offset_of!(Options, use_auto_exposure), 84);
         assert_eq!(size_of::<Optimal>(), 64);
+        assert_eq!(size_of::<ReflexOptions>(), 48);
+        assert_eq!(offset_of!(ReflexOptions, use_markers_to_optimize), 40);
+        assert_eq!(offset_of!(ReflexOptions, id_thread), 44);
         assert_eq!(SDK_VERSION, 0x0002_000e_0010_fedc);
     }
 
@@ -1202,5 +1384,11 @@ mod tests {
         }
         eprintln!("largest difference from the flat colours: {worst:.4}");
         assert!(worst < 0.03, "DLSS kept flat areas flat: worst difference {worst}");
+        // Streamline's factory proxy (what the swap chain is made with) still
+        // works as a factory.
+        // SAFETY: plain DXGI calls.
+        let proxy = proxy_factory(unsafe { CreateDXGIFactory2::<IDXGIFactory2>(DXGI_CREATE_FACTORY_FLAGS(0)) }.unwrap());
+        // SAFETY: a plain query.
+        assert!(unsafe { proxy.EnumAdapters(0) }.is_ok(), "the proxy factory lists adapters");
     }
 }

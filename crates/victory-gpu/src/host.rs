@@ -11652,7 +11652,12 @@ impl Host {
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
             let swapping = std::time::Instant::now();
+            // LOCAL: Reflex's markers around the present (`VICTORY_DLSS_REFLEX=1`).
+            let reflex_frame = crate::frame::current();
+            crate::dlss::marker(crate::dlss::Marker::RenderSubmitEnd, reflex_frame);
+            crate::dlss::marker(crate::dlss::Marker::PresentStart, reflex_frame);
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            crate::dlss::marker(crate::dlss::Marker::PresentEnd, reflex_frame);
             let swap_us = latency_us + swapping.elapsed().as_micros() as u64;
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
@@ -11680,6 +11685,9 @@ impl Host {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            // LOCAL: with `VICTORY_DLSS=1` the swap chain is Streamline's proxy
+            // (`crate::dlss::proxy_factory`); else the factory as it is.
+            let factory = if crate::dlss::on() { crate::dlss::proxy_factory(factory) } else { factory };
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,

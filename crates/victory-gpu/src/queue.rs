@@ -1104,6 +1104,10 @@ fn show(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u
         let s = if *s == u32::MAX { t.state.load(Ordering::Relaxed) } else { *s };
         (&t.texture, s)
     });
+    // LOCAL: the title has finished the frame's work (`VICTORY_DLSS_REFLEX=1`).
+    let reflex_frame = crate::frame::current();
+    crate::dlss::marker(crate::dlss::Marker::SimulationEnd, reflex_frame);
+    crate::dlss::marker(crate::dlss::Marker::RenderSubmitStart, reflex_frame);
     let shown = host.present_over(texture, state, over, what.frame);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);

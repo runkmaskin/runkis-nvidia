@@ -3104,7 +3104,8 @@ impl State {
             self.upscaler_report(p, Some([x, y, z]));
         }
         if crate::dlss::on()
-            && let Some(map) = &crate::dlss::PASS
+            && let Some(hash) = p.stages.first().map(|s| s.shader.hash.as_str())
+            && let Some(map) = crate::dlss::PASSES.iter().find(|m| m.hash == hash)
         {
             self.dlss_after(list, p, map);
         }
