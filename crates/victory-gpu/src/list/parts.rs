@@ -146,6 +146,21 @@ pub(crate) fn line(frames: f64) {
         total as f64 / calls / 1e3,
         parts.join(", ")
     );
+    // What the tables did, for the tables part above: made against copied
+    // views, the recordings a thread began its views anew for, and the
+    // mirrored entries read through against those left as read
+    // (`VICTORY_TABLE_CACHE=1` moves counts from the first of each pair).
+    use crate::descriptor::host::{LISTED, LISTED_BEGUN, LISTED_COPIED, LISTED_LEFT, LISTED_MADE, LISTED_READ};
+    let n: Vec<f64> = LISTED.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "tables per frame (VICTORY_TABLE_CACHE={}): views made {:.0}, copied {:.0}, recordings begun anew on a thread {:.0}; mirrored entries read {:.0}, left as read {:.0}",
+        u8::from(crate::descriptor::host::table_cache()),
+        n[LISTED_MADE],
+        n[LISTED_COPIED],
+        n[LISTED_BEGUN],
+        n[LISTED_READ],
+        n[LISTED_LEFT]
+    );
 }
 
 #[cfg(test)]

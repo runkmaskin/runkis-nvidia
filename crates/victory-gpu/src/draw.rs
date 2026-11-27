@@ -358,6 +358,14 @@ pub(crate) struct State {
     root_srv_slots: crate::fx::Map<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: crate::fx::Map<(usize, u64), RootSlot>,
+    /// Shader resource views mirrored table entries hold that this list
+    /// made readable, by record (`VICTORY_TABLE_CACHE=1`,
+    /// [`State::entry_readable`]): the list's epoch then, the tested depth
+    /// target, and whether the read was of that target.
+    entries_read: crate::fx::Map<(u32, u32), (u64, usize, bool)>,
+    /// The views this list's tables copy, made once a recording
+    /// (`VICTORY_TABLE_CACHE=1`, [`crate::descriptor::host::ListViews::of_list`]).
+    list_views: Option<crate::descriptor::host::ListViews>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
@@ -396,6 +404,11 @@ impl State {
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
+        self.entries_read.clear();
+        // (What they hold is let go of once the list has run.)
+        if let Some(views) = &mut self.list_views {
+            views.clear();
+        }
         self.tables_gone = true;
     }
 }
@@ -3289,8 +3302,8 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
-        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
+        let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
         let handle = table + u64::from(u.table_offset_dwords) * 4;
@@ -3301,7 +3314,12 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            if crate::descriptor::host::table_cache() && ready_once() && u.kind == ResourceType::Srv {
+                self.entry_readable(list, handle, &view);
+            } else {
+                crate::descriptor::host::count_listed(crate::descriptor::host::LISTED_READ);
+                readable(list, u.kind, &view);
+            }
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -3309,6 +3327,53 @@ impl State {
                 host.slot_tabled(index);
             }
         }
+    }
+
+    /// [`readable`] of a shader resource view a table entry at `handle`
+    /// holds, unless the list read the same record with the same tested
+    /// depth target at its present epoch (`VICTORY_TABLE_CACHE=1`). The rule
+    /// is the one views a fresh table copies have had (`Listed::ready`):
+    /// until something changes in the list (a texture's state, a twin, a
+    /// title write), reading the view again changes nothing. Tables without a
+    /// constant buffer are mirrored, not made afresh, and the same tables were
+    /// read through for every draw.
+    fn entry_readable(&mut self, list: &HostList, handle: u64, view: &View) {
+        use crate::descriptor::host::{LISTED_LEFT, LISTED_READ, count_listed};
+        let Some(words) = crate::descriptor::record_at(handle) else {
+            count_listed(LISTED_READ);
+            return readable(list, ResourceType::Srv, view);
+        };
+        let tested = TESTED_DEPTH.get();
+        let key = (words[1], words[2]);
+        if let Some(&(epoch, depth_of, depth)) = self.entries_read.get(&key)
+            && epoch == list.epoch()
+            && depth_of == tested.0
+        {
+            count_listed(LISTED_LEFT);
+            if depth {
+                TESTED_DEPTH.set((tested.0, true));
+            }
+            return;
+        }
+        count_listed(LISTED_READ);
+        TESTED_DEPTH.set((tested.0, false));
+        readable(list, ResourceType::Srv, view);
+        let depth = TESTED_DEPTH.get().1;
+        TESTED_DEPTH.set((tested.0, tested.1 || depth));
+        // (Of lists the title records again without submitting them, which
+        // never give their tables back: kept from growing.)
+        if self.entries_read.len() >= 1 << 14 {
+            self.entries_read.clear();
+        }
+        // The epoch as it is now: what this read changed itself it need not
+        // do again.
+        self.entries_read.insert(key, (list.epoch(), tested.0, depth));
+    }
+
+    /// The mirrored entries' records this list read (tests).
+    #[cfg(test)]
+    pub(crate) fn entries_read(&self) -> usize {
+        self.entries_read.len()
     }
 
     /// The descriptors a shader reads through tables. Tables holding a
@@ -3572,6 +3637,9 @@ impl State {
                 self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
             }
             let recording = self.recording;
+            // The list's own views (`VICTORY_TABLE_CACHE=1`), else this thread's.
+            // (Taken out for the table's slots: given back below.)
+            let mut own_views = crate::descriptor::host::table_cache().then(|| self.list_views.take());
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -3580,7 +3648,10 @@ impl State {
                 // and nothing more if nothing changed in the list since.
                 if list_views
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
-                    && let Some(mut listed) = host.make_listed(recording, words, index)
+                    && let Some(mut listed) = match own_views.as_mut() {
+                        Some(views) => host.make_listed_by(views, recording, words, index),
+                        None => host.make_listed(recording, words, index),
+                    }
                 {
                     let kind = entry_at(k)
                         .map(|u| u.kind)
@@ -3592,7 +3663,10 @@ impl State {
                             if listed.ready.2 {
                                 TESTED_DEPTH.set((tested.0, true));
                             }
-                        } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
+                        } else if let Some(view) = match own_views.as_ref() {
+                            Some(views) => views.as_ref().and_then(|v| v.view_of(recording, words)),
+                            None => crate::descriptor::host::listed_view(recording, words),
+                        } {
                             TESTED_DEPTH.set((tested.0, false));
                             readable(list, kind, &view);
                             let depth = TESTED_DEPTH.get().1;
@@ -3613,7 +3687,14 @@ impl State {
                         }
                     }
                     if was != (listed.ready, listed.tabled) {
-                        crate::descriptor::host::note_listed(recording, words, listed);
+                        match own_views.as_mut() {
+                            Some(views) => {
+                                if let Some(v) = views.as_mut() {
+                                    v.note(recording, words, listed);
+                                }
+                            }
+                            None => crate::descriptor::host::note_listed(recording, words, listed),
+                        }
                     }
                     continue;
                 }
@@ -3674,6 +3755,9 @@ impl State {
                         }
                     }
                 }
+            }
+            if let Some(views) = own_views {
+                self.list_views = views;
             }
             made.push((slot, first * 32));
         }

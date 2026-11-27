@@ -2772,47 +2772,73 @@ impl HostHeap {
             }
             let views = views.as_mut()?;
             if views.recording != recording {
+                count_listed(LISTED_BEGUN);
                 views.recording = recording;
-                views.made.clear();
+                views.clear();
             }
-            let twins = self.twins.get(index as usize).is_some();
-            let put = |views: &ListViews, made: &ListView| {
-                self.copy_from(index, views.slot(made.at));
-                if made.twin && twins {
-                    self.copy_from(self.raw + index, views.slot(made.at + 1));
-                    self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
-                } else {
-                    self.clear_twin(index);
-                }
-                self.keep_ref(index, made.kept.as_ref());
-                made.listed
-            };
-            let key = WordKey(words);
-            // Made before in this recording (most records): one lookup.
-            if let Some(made) = views.made.get(&key) {
-                return Some(put(views, made));
-            }
-            {
-                let view = super::view_at(words[1], words[2])?;
-                let at = 2 * views.made.len() as u32;
-                // (A constant buffer's bytes are copied for each draw.)
-                if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
-                    return None;
-                }
-                let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
-                let listed = Listed {
-                    kind: crate::draw::view_kind(&view),
-                    texture: is_texture_view(&view),
-                    ready: (0, 0, false),
-                    tabled: None,
-                };
-                views.made.insert(key, ListView { view, at, twin, kept, listed });
-            }
-            Some(put(views, &views.made[&key]))
+            self.listed_in(views, words, index)
         })
     }
 
+    /// [`HostHeap::make_listed`] from the views the list itself keeps for
+    /// `recording` (`VICTORY_TABLE_CACHE=1`, [`ListViews::of_list`]), made
+    /// when it first asks.
+    pub(crate) fn make_listed_by(&self, views: &mut Option<ListViews>, recording: u64, words: [u32; 3], index: u32) -> Option<Listed> {
+        if self.sampler {
+            return None;
+        }
+        if views.is_none() {
+            *views = Some(ListViews::of_list());
+        }
+        let views = views.as_mut()?;
+        if views.recording != recording {
+            count_listed(LISTED_BEGUN);
+            views.recording = recording;
+            views.clear();
+        }
+        self.listed_in(views, words, index)
+    }
+
+    /// What [`HostHeap::make_listed`] does with the views of the recording.
+    fn listed_in(&self, views: &mut ListViews, words: [u32; 3], index: u32) -> Option<Listed> {
+        let twins = self.twins.get(index as usize).is_some();
+        let put = |views: &ListViews, made: &ListView| {
+            self.copy_from(index, views.slot(made.at));
+            if made.twin && twins {
+                self.copy_from(self.raw + index, views.slot(made.at + 1));
+                self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                self.clear_twin(index);
+            }
+            self.keep_ref(index, made.kept.as_ref());
+            made.listed
+        };
+        let key = WordKey(words);
+        // Made before in this recording (most records): one lookup.
+        if let Some(made) = views.made.get(&key) {
+            count_listed(LISTED_COPIED);
+            return Some(put(views, made));
+        }
+        {
+            let view = super::view_at(words[1], words[2])?;
+            let at = 2 * views.made.len() as u32;
+            // (A constant buffer's bytes are copied for each draw.)
+            if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) || !views.room(at + 1) {
+                return None;
+            }
+            let twin = twinned(&view);
+            let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+            let listed = Listed {
+                kind: crate::draw::view_kind(&view),
+                texture: is_texture_view(&view),
+                ready: (0, 0, false),
+                tabled: None,
+            };
+            views.made.insert(key, ListView { view, at, twin, kept, listed });
+            count_listed(LISTED_MADE);
+        }
+        Some(put(views, &views.made[&key]))
+    }
     /// As [`HostHeap::copy_to`], from the slot `from`, which the card does not
     /// see.
     fn copy_from(&self, to: u32, from: D3D12_CPU_DESCRIPTOR_HANDLE) {
@@ -2906,6 +2932,13 @@ impl HostHeap {
         if let Some(old) = old {
             retire_kept(old);
         }
+    }
+
+    /// The host resource slot `index` holds, by address (tests).
+    #[cfg(test)]
+    pub(crate) fn kept_raw(&self, index: u32) -> Option<usize> {
+        use windows::core::Interface;
+        self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|r| r.as_raw() as usize)
     }
 
     /// Whether slot `index` views a resource of the host's.
@@ -6403,38 +6436,88 @@ struct ListView {
 /// frame waits for last (timeline waits-2: 24 of 65 ms). Here a list makes a
 /// view once, as it makes a table once (`crate::draw::State::tables`), and
 /// copies its descriptor.
-struct ListViews {
+pub(crate) struct ListViews {
     recording: u64,
-    heap: ID3D12DescriptorHeap,
+    /// The heaps, of `chunk` slots each, and where each starts.
+    heaps: Vec<(ID3D12DescriptorHeap, usize)>,
+    chunk: u32,
     step: usize,
-    start: usize,
     made: std::collections::HashMap<WordKey<3>, ListView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
 }
 
 impl ListViews {
     const SLOTS: u32 = 8192;
+    /// The slots a list's own views take a heap at a time
+    /// ([`ListViews::of_list`]): most lists name some hundreds of views, and
+    /// the title has some 630 lists.
+    const LIST_CHUNK: u32 = 1024;
 
+    /// A thread's: one heap of all the slots.
     fn new() -> Option<ListViews> {
-        let host = host()?;
-        // SAFETY: plain object creation.
-        unsafe {
-            let heap: ID3D12DescriptorHeap = host
-                .device
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+        let mut views = ListViews { recording: 0, heaps: Vec::new(), chunk: Self::SLOTS, step: 0, made: Default::default() };
+        views.room(0).then_some(views)
+    }
+
+    /// A list's own (`VICTORY_TABLE_CACHE=1`): the views of a recording made
+    /// once, whichever of the threads that translate lists takes its pieces.
+    /// A thread translates a recording a piece at a time (`crate::list::thin`:
+    /// 1,024 words, some tens of draws), then whichever recording has words
+    /// next; a thread's views were thrown away at every change of recording,
+    /// and the next piece, on whatever thread, made each of them again
+    /// (`make_twinned`, 6.3 % of the list threads in the game profile on
+    /// 8d8db49). Only one thread translates a recording at a time. Its heaps
+    /// are made as views come, [`Self::LIST_CHUNK`] slots at a time.
+    pub(crate) fn of_list() -> ListViews {
+        ListViews { recording: 0, heaps: Vec::new(), chunk: Self::LIST_CHUNK, step: 0, made: Default::default() }
+    }
+
+    /// Whether slot `i` is there, its heap made if it was not.
+    fn room(&mut self, i: u32) -> bool {
+        let wanted = (i / self.chunk) as usize;
+        while self.heaps.len() <= wanted {
+            let Some(host) = host() else { return false };
+            // SAFETY: plain object creation.
+            let made = unsafe {
+                host.device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: Self::SLOTS,
+                    NumDescriptors: self.chunk,
                     ..Default::default()
                 })
-                .ok()?;
-            let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
-            let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
-            Some(ListViews { recording: 0, heap, step, start, made: Default::default() })
+            };
+            let Ok(heap) = made else { return false };
+            // SAFETY: a live device and heap.
+            unsafe {
+                self.step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+                let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+                self.heaps.push((heap, start));
+            }
         }
+        true
     }
 
     fn slot(&self, i: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        debug_assert!(i < Self::SLOTS && !windows::core::Interface::as_raw(&self.heap).is_null());
-        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start + i as usize * self.step }
+        debug_assert!(i < Self::SLOTS && ((i / self.chunk) as usize) < self.heaps.len());
+        let (_, start) = &self.heaps[(i / self.chunk) as usize];
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start + (i % self.chunk) as usize * self.step }
+    }
+
+    /// Another recording: what was made goes (its heaps stay).
+    pub(crate) fn clear(&mut self) {
+        self.made.clear();
+    }
+
+    /// The view the record `words` names, as made for `recording`.
+    pub(crate) fn view_of(&self, recording: u64, words: [u32; 3]) -> Option<View> {
+        (self.recording == recording).then(|| self.made.get(&WordKey(words)).map(|m| m.view.clone())).flatten()
+    }
+
+    /// Notes what is known of the record `words` in `recording`.
+    pub(crate) fn note(&mut self, recording: u64, words: [u32; 3], listed: Listed) {
+        if self.recording == recording
+            && let Some(made) = self.made.get_mut(&WordKey(words))
+        {
+            made.listed = listed;
+        }
     }
 }
 
@@ -6442,26 +6525,75 @@ thread_local! {
     static LIST_VIEWS: std::cell::RefCell<Option<ListViews>> = const { std::cell::RefCell::new(None) };
 }
 
+/// Per-draw descriptor table work kept for reuse (`VICTORY_TABLE_CACHE=1`;
+/// off by default): a list keeps the views its tables copy for its
+/// recording ([`ListViews::of_list`]), and table entries read again at the
+/// same list epoch are left as they are (`crate::draw::State::tables`).
+pub(crate) fn table_cache() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TABLE_CACHE_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_CACHE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`table_cache`] for a test on this thread (none: the switch).
+    pub(crate) static TABLE_CACHE_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`LISTED`]: views made for a recording, views copied from one made
+/// before, recordings whose views were begun anew (on a thread, or by a
+/// list), mirrored table entries read through, and those left as they were
+/// read at the same epoch.
+pub(crate) const LISTED_MADE: usize = 0;
+pub(crate) const LISTED_COPIED: usize = 1;
+pub(crate) const LISTED_BEGUN: usize = 2;
+pub(crate) const LISTED_READ: usize = 3;
+pub(crate) const LISTED_LEFT: usize = 4;
+
+/// Counts of the tables' views since the last line (`VICTORY_DRAW_PARTS=1`
+/// only), by the `LISTED_*` index.
+pub(crate) static LISTED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+thread_local! {
+    /// This thread's [`LISTED`] counts not yet added up, and how many.
+    static LISTED_MINE: std::cell::Cell<([u64; 5], u32)> = const { std::cell::Cell::new(([0; 5], 0)) };
+}
+
+/// One more of the `LISTED_*` count `which`, when the draw parts are timed.
+/// Added up a thousand at a time: no shared counter per descriptor.
+pub(crate) fn count_listed(which: usize) {
+    if !crate::list::parts::on() {
+        return;
+    }
+    let (mut counts, n) = LISTED_MINE.get();
+    counts[which] += 1;
+    if n < 1024 {
+        LISTED_MINE.set((counts, n + 1));
+        return;
+    }
+    for (all, c) in LISTED.iter().zip(counts) {
+        all.fetch_add(c, std::sync::atomic::Ordering::Relaxed);
+    }
+    LISTED_MINE.set(([0; 5], 0));
+}
+
 /// The view the record `words` names, as this thread made it for `recording`.
 pub(crate) fn listed_view(recording: u64, words: [u32; 3]) -> Option<View> {
-    LIST_VIEWS.with(|views| {
-        let views = views.borrow();
-        let views = views.as_ref().filter(|v| v.recording == recording)?;
-        views.made.get(&WordKey(words)).map(|m| m.view.clone())
-    })
+    LIST_VIEWS.with(|views| views.borrow().as_ref()?.view_of(recording, words))
 }
 
 /// Notes what is known of the record `words` in `recording`.
 pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
     LIST_VIEWS.with(|views| {
-        if let Some(views) = views.borrow_mut().as_mut().filter(|v| v.recording == recording)
-            && let Some(made) = views.made.get_mut(&WordKey(words))
-        {
-            made.listed = listed;
+        if let Some(views) = views.borrow_mut().as_mut() {
+            views.note(recording, words, listed);
         }
     });
 }
-
 /// Whether a list makes a view its tables hold once (`VICTORY_LIST_VIEWS=0`:
 /// for every table).
 pub(crate) fn list_views() -> bool {
@@ -6865,5 +6997,291 @@ mod list_cpu {
         };
         let (before, after) = ((0..3).map(|_| threads(false)).fold(f64::MAX, f64::min), (0..3).map(|_| threads(true)).fold(f64::MAX, f64::min));
         eprintln!("keep, new resource each time, 8 threads x {} draws x {SLOTS} slots: one retirement each {before:.3} ms, batched {after:.3} ms", DRAWS / 8);
+    }
+}
+
+/// A list's own views (`VICTORY_TABLE_CACHE=1`, [`ListViews::of_list`]) against
+/// a thread's, on fixed seeds: recordings interleaved on one thread, as the
+/// list threads take their pieces, against each recording translated alone
+/// on a thread of its own (the rule within a recording), with views
+/// released and made anew between the descriptors. `cargo test --release
+/// -p victory-gpu --lib -- --ignored --nocapture table_cache` times them.
+#[cfg(test)]
+mod table_cache_tests {
+    use super::*;
+    use windows::core::Interface;
+
+    /// A fixed-seed stream (xorshift64*).
+    struct Seeded(u64);
+
+    impl Seeded {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Title buffer views: four views of 16 floats each of every buffer,
+    /// recorded in a heap of the test's (`slots`, 32 bytes a view).
+    struct Pool {
+        buffers: Vec<crate::object::This>,
+        slots: Vec<u64>,
+    }
+
+    impl Pool {
+        fn new(buffers: usize) -> Pool {
+            let buffers: Vec<_> = (0..buffers).map(|_| crate::resource::test_buffer(4096)).collect();
+            let mut pool = Pool { slots: vec![0; buffers.len() * 4 * 4], buffers };
+            for b in 0..pool.buffers.len() {
+                pool.record(b);
+            }
+            pool
+        }
+
+        fn handle(&self, view: usize) -> u64 {
+            self.slots.as_ptr() as u64 + 32 * view as u64
+        }
+
+        /// (Again) the four views of buffer `b`.
+        fn record(&mut self, b: usize) {
+            for k in 0..4u32 {
+                let desc: [u32; 10] = [41, 1, 5768, 0, k * 16, 0, 16, 0, 0, 0];
+                super::super::create_srv(std::ptr::null(), self.buffers[b], &desc, self.handle(4 * b + k as usize));
+            }
+        }
+
+        /// Buffer `b` is released (its views go stale) and its views made
+        /// anew, as views of a resource made at the same place.
+        fn renew(&mut self, b: usize) {
+            super::super::forget(self.buffers[b] as usize);
+            self.record(b);
+        }
+
+        fn words(&self, view: usize) -> [u32; 3] {
+            super::super::record_at(self.handle(view)).expect("a view's record")
+        }
+
+        fn views(&self) -> usize {
+            self.buffers.len() * 4
+        }
+    }
+
+    /// What one descriptor left: what is known of its record, the resource
+    /// the slot holds, and the slot's bytes where they can be read.
+    type Seen = Option<(Option<victory_shader::native::ResourceType>, bool, usize, Option<Vec<u8>>)>;
+
+    fn seen(heap: &HostHeap, index: u32, listed: Option<Listed>) -> Seen {
+        let listed = listed?;
+        let held = heap.kept[index as usize].lock().unwrap().as_ref().map_or(0, |r| r.as_raw() as usize);
+        let mut bytes = vec![0u8; heap.step as usize];
+        let read = crate::host::read_into(heap.cpu(index).ptr as *const u8, &mut bytes);
+        Some((listed.kind, listed.texture, held, read.then_some(bytes)))
+    }
+
+    /// One descriptor: recording, record, slot.
+    type Op = (u64, [u32; 3], u32);
+
+    /// A thread of its own that makes the descriptors it is sent into
+    /// `heap`: from the thread's views, or (`own`) from each recording's own.
+    fn worker<'s>(
+        s: &'s std::thread::Scope<'s, '_>,
+        heap: &'s HostHeap,
+        own: bool,
+    ) -> (std::sync::mpsc::Sender<Op>, std::sync::mpsc::Receiver<Seen>) {
+        let (ops, take) = std::sync::mpsc::channel::<Op>();
+        let (give, seen_back) = std::sync::mpsc::channel::<Seen>();
+        s.spawn(move || {
+            let mut lists: crate::fx::Map<u64, Option<ListViews>> = Default::default();
+            for (recording, words, index) in take {
+                let _r = retiring();
+                let listed = if own {
+                    heap.make_listed_by(lists.entry(recording).or_default(), recording, words, index)
+                } else {
+                    heap.make_listed(recording, words, index)
+                };
+                if give.send(seen(heap, index, listed)).is_err() {
+                    return;
+                }
+            }
+        });
+        (ops, seen_back)
+    }
+
+    /// `ops` descriptors of `recordings` recordings, interleaved as the list
+    /// threads take pieces (a recording goes on for a while, then another
+    /// comes), through a thread's views (as before), each recording's own,
+    /// and each recording alone on a thread. `renew`: views are released
+    /// and made anew between them. Returns the descriptors where the
+    /// thread's views and the recording alone differed.
+    fn run(seed: u64, recordings: u64, ops: usize, renew: bool) -> usize {
+        let (Some(thread_heap), Some(own_heap), Some(alone_heap)) =
+            (HostHeap::new(false, 64), HostHeap::new(false, 64), HostHeap::new(false, 64))
+        else {
+            return 0; // no host GPU
+        };
+        let mut pool = Pool::new(24);
+        let mut rng = Seeded(seed);
+        let (mut differed, mut made, mut read) = (0, 0, 0);
+        std::thread::scope(|s| {
+            let thread = worker(s, &thread_heap, false);
+            let own = worker(s, &own_heap, true);
+            // (Recordings are numbered from 1, as `State` numbers them.)
+            let alone: Vec<_> = (0..recordings).map(|_| worker(s, &alone_heap, false)).collect();
+            let mut recording = 1;
+            for step in 0..ops {
+                if rng.below(8) == 0 {
+                    recording = 1 + rng.below(recordings);
+                }
+                if renew && rng.below(64) == 0 {
+                    let b = rng.below(pool.buffers.len() as u64) as usize;
+                    pool.renew(b);
+                }
+                // Each recording reads mostly views of its own.
+                let view = if rng.below(4) == 0 {
+                    rng.below(pool.views() as u64) as usize
+                } else {
+                    ((recording * 7 + rng.below(12)) % pool.views() as u64) as usize
+                };
+                let op = (recording, pool.words(view), rng.below(64) as u32);
+                thread.0.send(op).unwrap();
+                own.0.send(op).unwrap();
+                let one = &alone[(recording - 1) as usize];
+                one.0.send(op).unwrap();
+                let (t, o, a) = (thread.1.recv().unwrap(), own.1.recv().unwrap(), one.1.recv().unwrap());
+                assert_eq!(o, a, "seed {seed}, step {step}: the list's own views against the recording alone");
+                if !renew {
+                    assert_eq!(t, o, "seed {seed}, step {step}: nothing released, a thread's views make the same");
+                }
+                differed += usize::from(t != a);
+                made += usize::from(o.is_some());
+                read += usize::from(o.as_ref().is_some_and(|o| o.3.is_some()));
+            }
+        });
+        // Most were made (a released view's record is stale until it is
+        // made anew), and read back.
+        assert!(made > ops / 2, "seed {seed}: {made} of {ops} made");
+        eprintln!("seed {seed}, {recordings} recordings, renew {renew}: {made} made, {read} read back, {differed} where a thread's views differed");
+        differed
+    }
+
+    #[test]
+    fn a_lists_own_views_are_those_of_its_recording_alone() {
+        for seed in [1, 2, 3] {
+            assert_eq!(run(seed, 6, 3_000, false), 0);
+            run(seed, 13, 3_000, true);
+        }
+    }
+
+    /// More views than one heap of a list's holds: the next heap is made,
+    /// and a view past all of them is not kept (the caller makes it).
+    #[test]
+    fn a_lists_own_views_grow_by_heaps() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let pool = Pool::new(ListViews::SLOTS as usize / 8 + 4);
+        let mut views = None;
+        let _r = retiring();
+        for v in 0..ListViews::SLOTS as usize / 2 {
+            assert!(heap.make_listed_by(&mut views, 1, pool.words(v), 0).is_some(), "view {v}");
+        }
+        let views_now = views.as_ref().expect("made");
+        assert_eq!(views_now.heaps.len(), (ListViews::SLOTS / ListViews::LIST_CHUNK) as usize);
+        assert!(heap.make_listed_by(&mut views, 1, pool.words(ListViews::SLOTS as usize / 2), 0).is_none());
+        // Made before: still copied.
+        assert!(heap.make_listed_by(&mut views, 1, pool.words(3), 0).is_some());
+        // Another recording begins with none made, in the same heaps.
+        assert!(heap.make_listed_by(&mut views, 2, pool.words(3), 0).is_some());
+        assert_eq!(views.as_ref().map(|v| (v.made.len(), v.heaps.len())), Some((1, (ListViews::SLOTS / ListViews::LIST_CHUNK) as usize)));
+    }
+
+    /// A frame modelled on the game's (measured on 8d8db49: 8,314 draws
+    /// and dispatches a frame, tables 16 of 25.5 us a call): 60 lists of
+    /// some 140 draws, translated in pieces of 20 draws by 8 threads, each
+    /// piece by whichever thread is free; each draw copies a table of 30
+    /// views of its list's 120. Per draw, with a thread's views (as before)
+    /// and with each list's own.
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn table_cache_list_views() {
+        const LISTS: u64 = 60;
+        const DRAWS: usize = 8_314;
+        const PIECE: usize = 20;
+        const TABLE: u32 = 30;
+        const THREADS: usize = 8;
+        let Some(heaps) = (0..THREADS).map(|_| HostHeap::new(false, 4 * TABLE)).collect::<Option<Vec<_>>>() else {
+            return; // no host GPU
+        };
+        let pool = Pool::new(256);
+        // The pieces in the order they become ready, each with its draws'
+        // tables (the records), dealt round the threads.
+        let mut rng = Seeded(0x7ab1e);
+        let pieces: Vec<(u64, Vec<[[u32; 3]; TABLE as usize]>)> = (0..DRAWS / PIECE)
+            .map(|_| {
+                let list = rng.below(LISTS);
+                let draws = (0..PIECE)
+                    .map(|_| {
+                        std::array::from_fn(|_| {
+                            let view = (list * 61 + rng.below(120)) % pool.views() as u64;
+                            pool.words(view as usize)
+                        })
+                    })
+                    .collect();
+                (list, draws)
+            })
+            .collect();
+        // A frame: the threads' microseconds per draw, and views made per draw.
+        let frame = |own: bool, recordings: u64| -> (f64, f64) {
+            let lists: Vec<std::sync::Mutex<Option<ListViews>>> = (0..LISTS).map(|_| Default::default()).collect();
+            let per_thread: Vec<(f64, usize)> = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..THREADS)
+                    .map(|t| {
+                        let (heap, pieces, lists) = (&heaps[t], &pieces, &lists);
+                        s.spawn(move || {
+                            let began = std::time::Instant::now();
+                            let mut made = 0;
+                            for (list, draws) in pieces.iter().skip(t).step_by(THREADS) {
+                                let recording = recordings + list;
+                                // (One thread translates a recording at a time.)
+                                let mut views = lists[*list as usize].lock().unwrap();
+                                for (d, table) in draws.iter().enumerate() {
+                                    let _r = retiring();
+                                    let first = (d as u32 % 4) * TABLE;
+                                    for (k, words) in table.iter().enumerate() {
+                                        let before = views.as_ref().map_or(0, |v| v.made.len());
+                                        if own {
+                                            heap.make_listed_by(&mut views, recording, *words, first + k as u32);
+                                            made += views.as_ref().map_or(0, |v| v.made.len()) - before;
+                                        } else {
+                                            let thread_before = LIST_VIEWS.with(|v| v.borrow().as_ref().filter(|v| v.recording == recording).map_or(0, |v| v.made.len()));
+                                            heap.make_listed(recording, *words, first + k as u32);
+                                            let thread_after = LIST_VIEWS.with(|v| v.borrow().as_ref().map_or(0, |v| v.made.len()));
+                                            made += thread_after.saturating_sub(thread_before);
+                                        }
+                                    }
+                                }
+                            }
+                            (began.elapsed().as_secs_f64(), made)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let seconds: f64 = per_thread.iter().map(|p| p.0).sum();
+            let made: usize = per_thread.iter().map(|p| p.1).sum();
+            (seconds * 1e6 / DRAWS as f64, made as f64 / DRAWS as f64)
+        };
+        let best = |own: bool| {
+            (1..=5u64).map(|n| frame(own, n * 1000 + u64::from(own) * 100_000)).fold((f64::MAX, 0.0), |a, b| if b.0 < a.0 { b } else { a })
+        };
+        let ((before, made_before), (after, made_after)) = (best(false), best(true));
+        eprintln!(
+            "list views, {DRAWS} draws of a {TABLE}-view table, {LISTS} lists in pieces of {PIECE} on {THREADS} threads: a thread's views {before:.2} us a draw ({made_before:.2} views made a draw), the list's own {after:.2} us a draw ({made_after:.2} made)"
+        );
     }
 }

@@ -66,7 +66,6 @@
 //! shortcut: pages a list does not name are looked at again in turn, over
 //! [`SWEEP`] frames.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY};
@@ -143,6 +142,9 @@ struct Packed {
     header: u64,
 }
 
+/// (Its tables are FxHash, not SipHash: keyed by addresses and numbers of our
+/// own, asked for every draw that reads title memory by address, and walked
+/// only for the diagnostics dump.)
 struct Memory {
     /// The CPU's entries (number, offset), and the copy shaders read.
     directory: (*mut u32, Arc<Shadow>),
@@ -150,35 +152,35 @@ struct Memory {
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
     /// Places of title buffers' copies among `copies`.
-    numbers: HashMap<usize, usize>,
+    numbers: crate::fx::Map<usize, usize>,
     /// Arenas: place in `copies`, address.
     arenas: Vec<(usize, usize)>,
     /// By title page.
-    pages: HashMap<u64, Held>,
+    pages: crate::fx::Map<u64, Held>,
     /// Their numbers in the order they came, and where the sweep is.
     order: Vec<u64>,
     sweep: usize,
     /// Windows of title memory itself ([`Memory::map`]).
     windows: usize,
     /// Packed structures the builder came to: the frame it last did.
-    packed: HashMap<u64, Packed>,
+    packed: crate::fx::Map<u64, Packed>,
     /// Their addresses in the order they came, and where the sweep is.
     packed_order: Vec<u64>,
     packed_sweep: usize,
     /// Places of pages that are free: the copy, the address in the arena.
     free: Vec<(usize, usize)>,
     /// Copies of title buffers the builder may store in.
-    open: std::collections::HashSet<usize>,
+    open: crate::fx::Set<usize>,
     /// Pages taken from faults.
     faulted: usize,
     /// Per host view heap (by its number, `HostHeap::serial`: a heap made
     /// where a released one was has not made the run): the first slot of
     /// its run, and how many copies have their view there.
-    heaps: HashMap<usize, (u32, u32)>,
+    heaps: crate::fx::Map<usize, (u32, u32)>,
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
-    refused: std::collections::HashSet<u64>,
+    refused: crate::fx::Set<u64>,
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
@@ -239,19 +241,19 @@ impl Memory {
             directory: (entries as *mut u32, directory),
             faults: (faults, data.cast::<u32>(), gpu),
             copies: Vec::new(),
-            numbers: HashMap::new(),
+            numbers: Default::default(),
             arenas: Vec::new(),
-            pages: HashMap::new(),
+            pages: Default::default(),
             order: Vec::new(),
             sweep: 0,
             windows: 0,
-            packed: HashMap::new(),
+            packed: Default::default(),
             packed_order: Vec::new(),
             packed_sweep: 0,
             free: Vec::new(),
             open: Default::default(),
             faulted: 0,
-            heaps: HashMap::new(),
+            heaps: Default::default(),
             frame: u64::MAX,
             refused: Default::default(),
             stats: Stats::default(),
@@ -1083,7 +1085,7 @@ mod trace {
         /// Frame, where the size goes, the structure, what title memory had.
         asked: Vec<(u64, u64, u64, u64)>,
         /// By structure, what its size was when last seen to change.
-        sizes: HashMap<u64, (u64, u64)>,
+        sizes: std::collections::HashMap<u64, (u64, u64)>,
         said: u32,
     }
 

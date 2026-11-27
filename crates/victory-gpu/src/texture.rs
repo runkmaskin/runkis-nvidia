@@ -609,12 +609,17 @@ pub(crate) fn let_go_idle() {
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+///
+/// Asked for every texture a draw reads through a table, on all the
+/// recording threads at once ([`upload_from`]): readers share it, and the
+/// key (an object's address) goes through FxHash, not SipHash. It is only
+/// looked up, never walked.
+static HOST_WRITTEN: std::sync::RwLock<Option<crate::fx::Set<usize>>> = std::sync::RwLock::new(None);
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
     let new = {
-        let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        let mut set = HOST_WRITTEN.write().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default).insert(resource as usize)
     };
     // Diagnostics (run 177): where its title memory is, for placed views
@@ -679,7 +684,7 @@ pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
 /// memory.
 pub(crate) fn host_wrote(resource: usize) -> bool {
     HOST_WRITTEN
-        .lock()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .is_some_and(|set| set.contains(&resource))
@@ -691,7 +696,7 @@ pub(crate) fn forget(resource: usize) {
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut set = HOST_WRITTEN.write().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
     }
@@ -796,11 +801,7 @@ pub(crate) struct Digest(u128);
 /// what lies there is another texture's. (After victory-amd 4436f8f1.)
 pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let first = if crate::resource::held_only() { first } else { 0 };
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
+    let host_written = host_wrote(resource as usize);
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
     if host_written {
@@ -2344,5 +2345,81 @@ mod allocation_costs {
             timed("texture placed in 64 MB heaps", N, 1, &place);
             timed("texture placed in 64 MB heaps", N, 8, &place);
         }
+    }
+}
+
+/// [`HOST_WRITTEN`] as a shared lock over FxHash against the lock over
+/// SipHash it was (fixed seeds): the same answers; timed on eight threads
+/// (`cargo test --release -p victory-gpu --lib -- --ignored --nocapture
+/// table_cache_host_written`).
+#[cfg(test)]
+mod host_written_tests {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, RwLock};
+
+    fn stream(seed: u64) -> impl FnMut(u64) -> u64 {
+        let mut s = seed;
+        move |n| {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            s.wrapping_mul(0x2545_f491_4f6c_dd1d) % n
+        }
+    }
+
+    #[test]
+    fn host_written_answers_as_before() {
+        let old: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+        let new: RwLock<Option<crate::fx::Set<usize>>> = RwLock::new(None);
+        let mut below = stream(17);
+        for _ in 0..200_000 {
+            // Object addresses: 16-byte steps.
+            let key = 0x2_0000_0000 + below(4096) as usize * 16;
+            match below(8) {
+                0 => assert_eq!(
+                    old.lock().unwrap().get_or_insert_with(Default::default).insert(key),
+                    new.write().unwrap().get_or_insert_with(Default::default).insert(key)
+                ),
+                1 => assert_eq!(
+                    old.lock().unwrap().as_mut().is_some_and(|s| s.remove(&key)),
+                    new.write().unwrap().as_mut().is_some_and(|s| s.remove(&key))
+                ),
+                _ => assert_eq!(
+                    old.lock().unwrap().as_ref().is_some_and(|s| s.contains(&key)),
+                    new.read().unwrap().as_ref().is_some_and(|s| s.contains(&key))
+                ),
+            }
+        }
+    }
+
+    /// A frame's asks (some 100,000 texture reads through tables, 8 threads)
+    /// of a set of 2,000 textures.
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn table_cache_host_written() {
+        const ASKS: usize = 100_000;
+        let keys: Vec<usize> = (0..2_000).map(|k| 0x2_0000_0000 + k * 0x340).collect();
+        let old: Mutex<Option<HashSet<usize>>> = Mutex::new(Some(keys.iter().copied().step_by(3).collect()));
+        let new: RwLock<Option<crate::fx::Set<usize>>> = RwLock::new(Some(keys.iter().copied().step_by(3).collect()));
+        let time = |ask: &(dyn Fn(usize) -> bool + Sync)| {
+            let began = std::time::Instant::now();
+            std::thread::scope(|s| {
+                for t in 0..8 {
+                    let keys = &keys;
+                    s.spawn(move || {
+                        let mut hits = 0;
+                        for i in 0..ASKS / 8 {
+                            hits += usize::from(ask(keys[(i * 7 + t * 131) % keys.len()]));
+                        }
+                        std::hint::black_box(hits);
+                    });
+                }
+            });
+            began.elapsed().as_secs_f64() * 1e3
+        };
+        let best = |ask: &(dyn Fn(usize) -> bool + Sync)| (0..5).map(|_| time(ask)).fold(f64::MAX, f64::min);
+        let before = best(&|k| old.lock().unwrap().as_ref().is_some_and(|s| s.contains(&k)));
+        let after = best(&|k| new.read().unwrap().as_ref().is_some_and(|s| s.contains(&k)));
+        eprintln!("textures the host wrote, {ASKS} asks on 8 threads: a lock and SipHash {before:.3} ms, a shared lock and FxHash {after:.3} ms");
     }
 }

@@ -1365,8 +1365,9 @@ pub(crate) struct HostList {
     /// resource first.
     states: Mutex<States>,
     /// What the list does with depth textures that have a colour twin, by
-    /// twin ([`TwinUse`]).
-    twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    /// twin ([`TwinUse`]). (FxHash, as `States`: the prelude's copies are of
+    /// different textures, in any order.)
+    twins: Mutex<crate::fx::Map<usize, TwinUse>>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -1464,10 +1465,10 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
-type States = std::collections::HashMap<
-    usize,
-    (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
->;
+/// (FxHash, not SipHash: every texture a draw reads asks it, keyed by an
+/// object's address. Its order reaches only the prelude's barriers, which
+/// may come in any order, and SipHash's was a new one each run.)
+type States = crate::fx::Map<usize, (u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
 
 /// What a list does with a depth texture that has a colour twin
 /// ([`crate::resource::Twin`]). Lists are recorded on many threads and run
@@ -2476,8 +2477,9 @@ struct Deferred {
     /// Scratch memory [`HostList::fill_scratch`] fills since the list last
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
-    /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    /// Textures whose contents the list brings up to date. (FxHash: asked for
+    /// every texture a draw reads, and only looked up.)
+    textures: crate::fx::Set<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -8242,6 +8244,16 @@ impl HostList {
     /// reset.
     pub(crate) fn used(&self, key: usize) -> bool {
         self.deferred().textures.contains(&key)
+    }
+
+    /// What the list's draws left of their reads (tests): its steps, the
+    /// ranges refreshed, the textures brought up to date.
+    #[cfg(test)]
+    pub(crate) fn read_census(&self) -> (usize, Vec<(usize, usize, usize)>, usize) {
+        let deferred = self.deferred();
+        let mut refreshed: Vec<_> = deferred.refreshed.iter().copied().collect();
+        refreshed.sort_unstable();
+        (deferred.copies.len(), refreshed, deferred.textures.len())
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
