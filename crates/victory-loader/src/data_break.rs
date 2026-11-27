@@ -6,7 +6,7 @@
 //! stops after that many seconds (10 by default). Diagnostics builds only; it finds where the
 //! title's own data goes, e.g. a pad's stick on its way to the camera.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::CloseHandle;
@@ -25,6 +25,9 @@ use crate::stacks::other_threads;
 const SLOTS: usize = 1024;
 static AT: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
 static HITS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+/// The largest xmm0 (its low float, without its sign) at each instruction's stops: what a function
+/// that returns a float returned, at the instruction after its call.
+static XMM0: [AtomicU32; SLOTS] = [const { AtomicU32::new(0) }; SLOTS];
 /// The registers at each instruction's first stop, in [`REGISTERS`]' order, then the eight bytes
 /// at the stack pointer (the return address, after a leaf function's read).
 static FIRST: [[AtomicU64; 17]; SLOTS] = [const { [const { AtomicU64::new(0) }; 17] }; SLOTS];
@@ -69,6 +72,41 @@ fn control(places: &[(usize, usize)]) -> u64 {
     })
 }
 
+/// `VICTORY_DATA_BREAK_FOLLOW=<register>[+<register>...][+0x<offset>]:<bytes>`, with one place (an
+/// instruction): the addresses those registers and the offset name at its stops are watched too,
+/// the first three different ones (`VICTORY_DATA_BREAK_FOLLOW_NTH=<n>`: from the n-th) in the free
+/// slots: the data a stopped instruction is about to write, on to who reads it.
+fn follow(text: &str) -> Option<(Vec<usize>, usize, usize)> {
+    let (sum, len) = text.split_once(':')?;
+    let len: usize = len.trim().parse().ok().filter(|l| matches!(l, 1 | 2 | 4 | 8))?;
+    let (mut registers, mut offset) = (Vec::new(), 0);
+    for term in sum.split('+').map(str::trim) {
+        match REGISTERS[..16].iter().position(|r| r.eq_ignore_ascii_case(term)) {
+            Some(r) => registers.push(r),
+            None => offset += usize::from_str_radix(term.trim_start_matches("0x"), 16).ok()?,
+        }
+    }
+    Some((registers, offset, len))
+}
+static FOLLOW: std::sync::OnceLock<Option<(Vec<usize>, usize, usize)>> = std::sync::OnceLock::new();
+/// `VICTORY_DATA_BREAK_WHEN=<register>=<hex>`: the first place (an instruction) counts, and the
+/// follow starts, only at a stop where that register's low 32 bits are that value (one source of
+/// many a function reads, say).
+fn when(text: &str) -> Option<(usize, u32)> {
+    let (register, value) = text.split_once('=')?;
+    let register = REGISTERS[..16].iter().position(|r| r.eq_ignore_ascii_case(register.trim()))?;
+    Some((register, u32::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok()?))
+}
+static WHEN: std::sync::OnceLock<Option<(usize, u32)>> = std::sync::OnceLock::new();
+/// The address [`follow`] found, 0 before.
+static NEXT: AtomicUsize = AtomicUsize::new(0);
+/// The different addresses the follow saw, in order, and which of them it takes.
+static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+static NTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+fn nth() -> usize {
+    std::env::var("VICTORY_DATA_BREAK_FOLLOW_NTH").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+}
+
 /// `VICTORY_DATA_BREAK_SPLIT=<register>`: stops at one instruction count apart by that register's
 /// low 16 bits too (which value of a loop's, say), with the registers of each.
 fn split() -> Option<usize> {
@@ -97,22 +135,46 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return CONTINUE_EXECUTION;
     }
     let c = &*context;
+    // SAFETY: the stopped thread's own stack pointer, which points at its stack.
+    let top = unsafe { (c.Rsp as *const u64).read_unaligned() };
+    // The registers, then the qword at the stack pointer (at a function's first instruction, who
+    // called it: `VICTORY_DATA_BREAK_SPLIT=[rsp]` tells callers apart).
     let all = [
-        c.Rax, c.Rbx, c.Rcx, c.Rdx, c.Rsi, c.Rdi, c.Rbp, c.Rsp, c.R8, c.R9, c.R10, c.R11, c.R12, c.R13, c.R14, c.R15,
+        c.Rax, c.Rbx, c.Rcx, c.Rdx, c.Rsi, c.Rdi, c.Rbp, c.Rsp, c.R8, c.R9, c.R10, c.R11, c.R12, c.R13, c.R14, c.R15, top,
     ];
 
     let pc = c.Rip as usize;
     // Only instruction stops are told apart: a data stop's registers are anything.
     let exec = fired & EXEC.load(Relaxed) != 0;
+    let wanted = WHEN.get().copied().flatten().is_none_or(|(r, v)| all[r] as u32 == v);
+    if exec && fired & 1 != 0 && !wanted {
+        // Not the stop asked for: not counted either.
+        return CONTINUE_EXECUTION;
+    }
+    if exec
+        && fired & 1 != 0
+        && NEXT.load(Relaxed) == 0
+        && let Some(Some((registers, offset, _))) = FOLLOW.get()
+    {
+        let at = registers.iter().fold(*offset, |sum, &r| sum.wrapping_add(all[r] as usize));
+        // `VICTORY_DATA_BREAK_FOLLOW_NTH=<n>`: the n-th different address (from 0), not the first.
+        let mut seen = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !seen.contains(&at) && seen.len() < 64 {
+            seen.push(at);
+        }
+        if seen.len() > *NTH.get_or_init(nth) {
+            NEXT.store(at, Relaxed);
+        }
+    }
     let tag = split().filter(|_| exec).and_then(|r| all.get(r)).map_or(0, |&v| (v as u16 as usize) << 48);
     let key = pc ^ tag;
+    // Of a float, without its sign: as an integer, larger is larger.
+    // SAFETY: the context's vector registers, which the system fills for every exception.
+    let xmm0 = unsafe { c.Anonymous.Anonymous.Xmm0.Low } as u32 & 0x7fff_ffff;
     let mut slot = (key >> 2).wrapping_mul(0x9e37_79b9) % SLOTS;
     for _ in 0..SLOTS {
         match AT[slot].compare_exchange(0, key, Relaxed, Relaxed) {
             Ok(_) => {
-                let top = c.Rsp as *const u64;
-                // SAFETY: the stopped thread's own stack pointer, which points at its stack.
-                let top = unsafe { top.read_unaligned() };
                 let values = [
                     c.Rax, c.Rbx, c.Rcx, c.Rdx, c.Rsi, c.Rdi, c.Rbp, c.Rsp, c.R8, c.R9, c.R10, c.R11, c.R12, c.R13,
                     c.R14, c.R15, top,
@@ -121,10 +183,12 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
                     into.store(value, Relaxed);
                 }
                 HITS[slot].fetch_add(1, Relaxed);
+                XMM0[slot].fetch_max(xmm0, Relaxed);
                 break;
             }
             Err(have) if have == key => {
                 HITS[slot].fetch_add(1, Relaxed);
+                XMM0[slot].fetch_max(xmm0, Relaxed);
                 break;
             }
             Err(_) => slot = (slot + 1) % SLOTS,
@@ -176,8 +240,11 @@ pub fn data_breaks_on_schedule(base: usize, size: usize) {
         tracing::warn!(list, "VICTORY_DATA_BREAK: no place understood");
         return;
     }
-    let addresses: Vec<usize> = places.iter().map(|&(rva, _)| base + rva).collect();
-    let dr7 = control(&places);
+    let mut addresses: Vec<usize> = places.iter().map(|&(rva, _)| base + rva).collect();
+    let mut dr7 = control(&places);
+    WHEN.get_or_init(|| std::env::var("VICTORY_DATA_BREAK_WHEN").ok().as_deref().and_then(when));
+    let followed = FOLLOW.get_or_init(|| std::env::var("VICTORY_DATA_BREAK_FOLLOW").ok().as_deref().and_then(follow));
+    let follow_len = followed.as_ref().filter(|_| places.len() == 1 && places[0].1 == 0).map(|f| f.2);
     EXEC.store(places.iter().enumerate().filter(|(_, p)| p.1 == 0).fold(0, |m, (k, _)| m | 1 << k), Relaxed);
     std::thread::spawn(move || {
         std::thread::sleep(from);
@@ -186,7 +253,26 @@ pub fn data_breaks_on_schedule(base: usize, size: usize) {
         ON.store(1, Relaxed);
         eprintln!("VIctory: data breaks armed at {:x?}", places);
         let start = Instant::now();
+        // A round after the first address is seen, so that the others are seen too.
+        let mut ripe = false;
         while start.elapsed() < length {
+            if let Some(len) = follow_len
+                && NEXT.load(Relaxed) != 0
+                && addresses.len() == 1
+                && std::mem::replace(&mut ripe, true)
+            {
+                // The n-th, n+1-th and n+2-th different addresses, in the three free slots,
+                // aligned down to their length as the processor wants.
+                let seen = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                let from = *NTH.get_or_init(nth);
+                for (k, &at) in seen.iter().skip(from).take(3).enumerate() {
+                    addresses.push(at & !(len - 1));
+                    let mut slots = [(0, 0); 4];
+                    slots[k + 1] = (0, len);
+                    dr7 |= control(&slots) & !(0b11 | 0xf_0000);
+                }
+                eprintln!("VIctory: data breaks follow {:x?} ({len} bytes) of {:x?}", &addresses[1..], seen);
+            }
             // New threads get them too.
             arm(&addresses, dr7);
             std::thread::sleep(Duration::from_millis(500));
@@ -206,7 +292,12 @@ pub fn data_breaks_on_schedule(base: usize, size: usize) {
                 .collect();
             let back = locate(FIRST[k][16].load(Relaxed) as usize);
             let pc = pc & ((1 << 48) - 1);
-            eprintln!("VIctory: data break after {} x{hits} (returns to {back}?) {}", locate(pc), registers.join(" "));
+            let xmm0 = f32::from_bits(XMM0[k].load(Relaxed));
+            eprintln!(
+                "VIctory: data break after {} x{hits} (returns to {back}?) |xmm0|<={xmm0} {}",
+                locate(pc),
+                registers.join(" ")
+            );
         }
     });
 }
@@ -227,6 +318,11 @@ mod tests {
         // instruction (00, 00).
         assert_eq!(control(&[(0, 4), (8, 8), (16, 0)]), 0b10101 | 0xf << 16 | 0xb << 20);
         assert_eq!(places("x1234, 8:8"), [(0x1234, 0), (8, 8)]);
+        assert_eq!(follow("rcx+rax+0xc:4"), Some((vec![2, 0], 0xc, 4)));
+        assert_eq!(follow("rcx:3"), None);
+        assert_eq!(when("r9=0x3012"), Some((9, 0x3012)));
+        // Slot 3 alone, as the follow adds it: enabled, four bytes, reads and writes.
+        assert_eq!(control(&[(0, 0), (0, 0), (0, 0), (0, 4)]) & !0b111111 & !0xfff_0000, 1 << 6 | 0xf << 28);
     }
 
     /// A thread's read of a watched variable is seen, counted, at the instruction after it.
