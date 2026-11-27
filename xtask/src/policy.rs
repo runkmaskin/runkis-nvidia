@@ -16,6 +16,9 @@ const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    // PLAY.bat, and the launcher's C# / WPF sources (launcher/): text we write, held to the same
+    // size, magic and encoded-run checks as everything else.
+    "bat", "cs", "csproj", "xaml", "sln", "slnx", "props", "manifest",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",

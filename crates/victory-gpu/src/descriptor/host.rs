@@ -215,6 +215,8 @@ pub(crate) struct HostHeap {
     /// another's view made stale stays, which says only "may"): a write of
     /// any other view needs nothing of `placed` ([`spans_quick`]).
     spanned: Slots,
+    /// This heap's own number, never used again ([`HostHeap::serial`]).
+    serial: u64,
 }
 
 /// Whether a slot's write of no placed texture view leaves `placed` alone
@@ -1639,6 +1641,10 @@ impl HostHeap {
                 spans
             },
             spanned: Slots::new((count + extra) as usize),
+            serial: {
+                static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1786,6 +1792,13 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// This heap's own number: a heap made where a released one was has
+    /// the same address but another number, so what is kept by heap (the
+    /// heap pass's ranges, a list's dynamic slots) is kept by this.
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial
     }
 
     /// The GPU address of the table of element strides by title slot (view
@@ -3119,8 +3132,24 @@ impl HostHeap {
             }
             return None;
         }
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        // The title unmaps heap pages too, and this is asked of slots no
+        // draw names (the heap pass over every buffer slot, the sync's
+        // records after their page was read): read by a copy that fails
+        // where the page is not there, and then nothing is made. (Without
+        // `VICTORY_SAFE_COPY` read in place as before: a kernel read for
+        // each would cost too much here.)
+        let mut words = [0u32; 3];
+        if crate::safecopy::on() {
+            // SAFETY: `words` is ours, 12 bytes; title memory is read by a
+            // copy that fails where a page is not there.
+            if !unsafe { crate::safecopy::copy(words.as_mut_ptr().cast(), handle as *const u8, 12) } {
+                return None;
+            }
+        } else {
+            // SAFETY: the handle is a descriptor slot in title memory.
+            words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        }
+        let [tag, i, generation] = words;
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         // Made from this record, and nothing has changed it: most of the

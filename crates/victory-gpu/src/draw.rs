@@ -341,9 +341,10 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
-    /// The dynamic slots the list holds: title heap, first, count; given
+    /// The dynamic slots the list holds: title heap, its host heap's number
+    /// ([`crate::descriptor::host::HostHeap::serial`]), first, count; given
     /// back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -360,8 +361,8 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for &(heap, serial, first, n) in &self.dynamic {
+            crate::descriptor::release_dynamic(heap, serial, first, n);
         }
     }
 }
@@ -382,8 +383,8 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for (heap, serial, first, n) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, serial, first, n);
         }
         self.fresh_tables.clear();
         self.recording = 0;
@@ -743,24 +744,49 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+/// Per host heap, by its number ([`crate::descriptor::host::HostHeap::serial`]):
+/// the passes made and the host copy and range each slot's buffer view
+/// reads, kept from pass to pass. Only the slots written since the last
+/// pass are looked at again (83,000 slots a pass otherwise, 0.1 s at best);
+/// all of them every 16 passes, because a view of a released resource goes
+/// stale without a write, and a slot written before its memory had a host
+/// copy is only made then. By number, not address: a heap made where a
+/// released one was starts afresh; and the entry goes with its heap
+/// ([`forget_heap`]), else the host copies it holds were never let go.
+type Ranges = HeapRanges<std::sync::Arc<crate::shadow::Shadow>>;
+static RANGES: std::sync::Mutex<Option<std::collections::HashMap<u64, (u64, Ranges)>>> = std::sync::Mutex::new(None);
+
+/// The title heap whose host heap is numbered `serial` is gone: what the
+/// heap pass kept of it goes too.
+pub(crate) fn forget_heap(serial: u64) {
+    let gone = RANGES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|kept| kept.remove(&serial));
+    // (The host copies are let go of outside the lock.)
+    drop(gone);
+}
+
+/// For tests: runs the heap pass over `heap`; its host heap's number.
+#[cfg(test)]
+pub(crate) fn heap_pass_kept(heap: &crate::descriptor::Heap, frame: u64) -> Option<u64> {
+    let host = heap.host()?;
+    let _ = heap_buffer_pass(heap, host, frame);
+    Some(host.serial())
+}
+/// For tests: whether the heap pass keeps anything of the host heap
+/// numbered `serial`.
+#[cfg(test)]
+pub(crate) fn heap_ranges_kept(serial: u64) -> bool {
+    RANGES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|kept| kept.contains_key(&serial))
+}
+
 /// The pass over the buffer views of `heap` that shaders pick by index
 /// ([`State::heap_buffers`]): their host slots are made, and the host copies
 /// they show are to be refreshed.
 fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) -> Vec<crate::host::aside::Refresh> {
     let started = std::time::Instant::now();
-    // Per host heap: the host copy and range each slot's buffer view
-    // reads, kept from pass to pass. Only the slots written since the
-    // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-    // at best); all of them every 16 passes, because a view of a
-    // released resource goes stale without a write, and a slot written
-    // before its memory had a host copy is only made then.
-    type Ranges = HeapRanges<std::sync::Arc<crate::shadow::Shadow>>;
-    static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
-        std::sync::Mutex::new(None);
     let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
     let (passes, ranges) = kept
         .get_or_insert_with(Default::default)
-        .entry(std::ptr::from_ref(host) as usize)
+        .entry(host.serial())
         .or_insert_with(|| (0, HeapRanges(Vec::new())));
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
@@ -869,20 +895,25 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
     let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
     let whole = whole.get_or_insert_with(Default::default);
+    // `VICTORY_UNWATCHED_FRAMES` sets the interval (1: every frame).
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let every = *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_UNWATCHED_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+    });
+    // A copy refreshed `every` frames ago or more is refreshed when next
+    // seen whether it is here or not, so its entry goes: copies' numbers
+    // are never used again, and the entries of copies let go stayed for
+    // good.
+    whole.retain(|_, last| frame < *last + every);
     let mut found = Vec::with_capacity(spans.len());
     for (shadow, from, to) in spans.values() {
         if shadow.unwatched() {
             // By the copy's number: a copy made where one let go was
             // (`shadow::let_go_idle`) has never been refreshed.
             let key = shadow.id() as usize;
-            // `VICTORY_UNWATCHED_FRAMES` sets the interval (1: every frame).
-            static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-            let every = *EVERY.get_or_init(|| {
-                std::env::var("VICTORY_UNWATCHED_FRAMES")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(1)
-            });
             match whole.get(&key) {
                 Some(&last) if frame < last + every => continue,
                 _ => {
@@ -1777,7 +1808,7 @@ impl State {
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.serial(), index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -1848,7 +1879,7 @@ impl State {
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.serial(), index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -3398,7 +3429,7 @@ impl State {
             };
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+                .push((std::ptr::from_ref(heap) as usize, host.serial(), first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());

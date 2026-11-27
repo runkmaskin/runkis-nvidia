@@ -22,11 +22,37 @@ static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
-/// Keeps translated shaders in `dir` from now on.
+/// The generation of the cache's entries ([`Cache::open_generation`]): the
+/// translator's sources. Every entry's key holds it, so a changed translator
+/// left every entry behind, unreadable, and nothing removed them. The
+/// settings in the key ([`build`]) stay in the key: entries of runs with
+/// other settings are read again when those settings come back.
+pub(crate) fn generation() -> &'static str {
+    &env!("VICTORY_TRANSLATOR")[..16]
+}
+
+/// Keeps translated shaders in `dir` from now on, in the translator's own
+/// generation; the generations of other translators are removed on a thread
+/// of ours.
 pub fn use_shader_cache(dir: PathBuf) {
-    match Cache::open(dir) {
+    match Cache::open_generation(dir, generation()) {
         Ok(cache) => {
+            let sweeping = cache.clone();
             let _ = CACHE.set(cache);
+            let swept = std::thread::Builder::new().name("victory-cache-sweep".into()).spawn(move || {
+                let swept = sweeping.sweep();
+                if swept.files > 0 {
+                    tracing::info!(
+                        generations = swept.generations,
+                        files = swept.files,
+                        mb = swept.bytes >> 20,
+                        "shader cache: entries of other translators and staging files of ended runs removed"
+                    );
+                }
+            });
+            if let Err(e) = swept {
+                tracing::debug!(error = %e, "shader cache not swept");
+            }
         }
         Err(e) => tracing::warn!(error = %e, "no shader cache"),
     }
@@ -129,8 +155,23 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
-        None => translate(container),
+        None => unpanicked(|| translate(container)),
     }
+}
+
+/// `work`'s result, or a panic in it as an error. A translator panic used to
+/// unwind through the pipeline worker making the shader: the worker died,
+/// its counts were never taken back and the pipeline stayed "being made";
+/// now it fails as any shader that does not translate does.
+pub(crate) fn unpanicked<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|panic| {
+        let message = panic
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "no message".to_owned());
+        Err(format!("the translator panicked: {message}"))
+    })
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -138,6 +179,8 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
+    /// The translation failed (not the cache).
+    failed: AtomicBool,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
@@ -150,7 +193,10 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
+        let shader = (self.translate)(&input[32..]).map_err(|e| {
+            self.failed.store(true, Ordering::Relaxed);
+            anyhow::Error::msg(e)
+        })?;
         Ok(encode(&shader))
     }
 }
@@ -161,15 +207,27 @@ fn cached(
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
+    // A panic is a failed translation: nothing is stored ([`unpanicked`]).
+    let translate = move |c: &[u8]| unpanicked(|| translate(c));
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
+        failed: AtomicBool::new(false),
     };
     for _ in 0..2 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
+        let path = match cache.get_or_convert(&converter, &input) {
+            Ok(path) => path,
+            // The translation failed: failures are not kept.
+            Err(e) if converter.failed.load(Ordering::Relaxed) => return Err(format!("{e:#}")),
+            // The cache could not be read or written (a run of another
+            // translator may sweep this generation's folder away meanwhile:
+            // `Cache::sweep`): translated without it.
+            Err(e) => {
+                tracing::debug!(error = %format!("{e:#}"), "shader cache not usable; translating without it");
+                break;
+            }
+        };
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
@@ -436,6 +494,41 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
+    }
+
+    #[test]
+    fn a_translator_panic_is_a_failure_and_stores_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let panics = |_: &[u8]| -> Result<HostShader, String> { panic!("a translator bug") };
+        let got = cached(&cache, &[7; 32], b"a container", panics);
+        assert!(got.as_ref().is_err_and(|e| e.contains("a translator bug")), "{got:?}");
+        let entries: Vec<_> = walk(dir.path())
+            .into_iter()
+            .filter(|p| std::fs::read(p).is_ok_and(|b| b.starts_with(MAGIC)))
+            .collect();
+        assert!(entries.is_empty(), "stored {entries:?}");
+        // The same shader translates later, once the translator does.
+        let fine = |_: &[u8]| Ok(shader());
+        assert_eq!(cached(&cache, &[7; 32], b"a container", fine), Ok(shader()));
+    }
+
+    /// A cache that cannot be written (its folder swept away by a run of
+    /// another translator, say) still gives the translation.
+    #[test]
+    fn a_translation_does_not_need_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open_generation(dir.path(), generation()).unwrap();
+        let build = [9u8; 32];
+        let container = b"a container".as_slice();
+        let probe = Translate { translate: |_: &[u8]| Ok(shader()), ran: AtomicBool::new(false), failed: AtomicBool::new(false) };
+        let key = victory_pipeline::CacheKey::new(&probe, &[&build[..], container].concat());
+        let blocked = cache.path_for(&key);
+        // A file where the entry's folder goes.
+        std::fs::write(blocked.parent().unwrap(), b"in the way").unwrap();
+        assert_eq!(cached(&cache, &build, container, |_| Ok(shader())), Ok(shader()));
+        let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
+        assert!(cached(&cache, &build, container, fail).is_err());
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

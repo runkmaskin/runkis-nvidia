@@ -11,7 +11,7 @@
 
 mod cache;
 
-pub use cache::{Cache, CacheKey};
+pub use cache::{Cache, CacheKey, Swept};
 
 /// A deterministic transformation of one input into one output.
 pub trait Converter: Send + Sync {

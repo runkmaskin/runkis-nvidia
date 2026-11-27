@@ -493,6 +493,21 @@ fn window_mapped_most() -> u64 {
 /// Bytes alive of windows in card memory the CPU maps.
 static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Bytes alive of windows (copies of title memory outside buffers) in the
+/// PC's memory: those not in card memory the CPU maps, nor in place.
+static WINDOW_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// For the line of memory by subsystem, from counters only: the bytes of
+/// windows and of copies of title buffers in the PC's memory, and of the
+/// copies in the card's memory (and the CPU-mapped windows there).
+pub(crate) fn memory_counts() -> [u64; 3] {
+    let windows = WINDOW_BYTES.load(Ordering::Relaxed);
+    let mapped = WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
+    let buffers = LIVE[1].load(Ordering::Relaxed).saturating_sub(windows + mapped);
+    let card = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed) + mapped;
+    [windows, buffers, card]
+}
+
 /// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
 /// to be there ([`window_mapped_most`]).
 fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
@@ -2641,6 +2656,9 @@ impl Drop for Shadow {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
         let window = self.window;
+        if window && !self.mapped {
+            WINDOW_BYTES.fetch_sub(self.len, Ordering::Relaxed);
+        }
         if self.mapped {
             WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -2993,6 +3011,191 @@ pub(crate) fn let_go_idle() {
     }
 }
 
+/// For [`Shadow::writing`]: into `parts`, the parts of `range` that none of
+/// the ranges declared before (`pending`) holds, each range put in the
+/// copy's terms by `inside`, in order (as the pieces are cut, empty ones
+/// among them). False, and `parts` left alone, if `range` is declared
+/// already (dispatches declare the same ranges thousands of times).
+///
+/// One look at each declared range: the check for the same range and the
+/// cutting are one pass, and a declared range that lies past both ends of
+/// what is left cuts nothing and is passed over. Some 7,000 ranges are
+/// declared a frame; each declare once made two passes over all those
+/// before it, and a new vector for each.
+fn untaken(
+    range: (usize, usize),
+    pending: &[(usize, usize)],
+    inside: impl Fn(usize, usize) -> (usize, usize),
+    parts: &mut Vec<(usize, usize)>,
+) -> bool {
+    let mut left = vec![inside(range.0, range.1)];
+    let mut rest = Vec::new();
+    for &(a, e) in pending {
+        if (a, e) == range {
+            return false;
+        }
+        // The pieces are apart and in order: the first's start and the
+        // last's end bound them all.
+        let (Some(&(lo, _)), Some(&(_, hi))) = (left.first(), left.last()) else {
+            continue;
+        };
+        let (a, e) = inside(a, e);
+        if e <= lo || a >= hi {
+            continue;
+        }
+        rest.clear();
+        for &(from, to) in &left {
+            if e <= from || a >= to {
+                rest.push((from, to));
+                continue;
+            }
+            if from < a {
+                rest.push((from, a));
+            }
+            if e < to {
+                rest.push((e, to));
+            }
+        }
+        std::mem::swap(&mut left, &mut rest);
+    }
+    *parts = left;
+    true
+}
+
+#[cfg(test)]
+mod untaken_tests {
+    use super::untaken;
+
+    /// What `Shadow::writing` did before [`untaken`]: the check for the
+    /// same range, then every declared range cut from what is left, a new
+    /// vector each.
+    fn as_before(
+        range: (usize, usize),
+        pending: &[(usize, usize)],
+        inside: impl Fn(usize, usize) -> (usize, usize),
+    ) -> Option<Vec<(usize, usize)>> {
+        if pending.contains(&range) {
+            return None;
+        }
+        let mut parts = vec![inside(range.0, range.1)];
+        for &(a, e) in pending {
+            let (a, e) = inside(a, e);
+            let mut rest = Vec::with_capacity(parts.len() + 1);
+            for (from, to) in parts {
+                if e <= from || a >= to {
+                    rest.push((from, to));
+                    continue;
+                }
+                if from < a {
+                    rest.push((from, a));
+                }
+                if e < to {
+                    rest.push((e, to));
+                }
+            }
+            parts = rest;
+        }
+        Some(parts)
+    }
+
+    /// A fixed-seed xorshift, for ranges that are the same on every run.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> usize {
+            (self.next() % n) as usize
+        }
+    }
+
+    /// A copy of title memory `[start, start + len)`, as `Shadow::inside`
+    /// puts a range in its terms.
+    fn inside_of(start: usize, len: usize) -> impl Fn(usize, usize) -> (usize, usize) {
+        move |a, e| {
+            let end = start + len;
+            let from = a.clamp(start, end);
+            (from - start, e.clamp(from, end) - start)
+        }
+    }
+
+    /// A declared range: mostly short ones here and there, some long ones,
+    /// some reaching outside the copy, some empty, some again.
+    fn range(rng: &mut Rng, start: usize, len: usize, earlier: &[(usize, usize)]) -> (usize, usize) {
+        if !earlier.is_empty() && rng.below(4) == 0 {
+            return earlier[rng.below(earlier.len() as u64)];
+        }
+        let a = start - 256 + rng.below(len as u64 + 512);
+        let n = match rng.below(8) {
+            0 => 0,
+            1 => rng.below(len as u64),
+            _ => rng.below(4096),
+        };
+        (a, a + n)
+    }
+
+    /// The same parts as before, and the same ranges found declared
+    /// already, over random declares of copies small and large.
+    #[test]
+    fn the_parts_are_what_they_were() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut parts = Vec::new();
+        for (round, len) in [64usize, 4096, 1 << 16, 1 << 20, 174 << 20].into_iter().cycle().take(60).enumerate() {
+            let start = 0x1_0000_0000 + round * 0x1000;
+            let inside = inside_of(start, len);
+            let mut pending: Vec<(usize, usize)> = Vec::new();
+            for _ in 0..400 {
+                let r = range(&mut rng, start, len, &pending);
+                let before = as_before(r, &pending, &inside);
+                parts.clear();
+                parts.push((7, 7));
+                let now = untaken(r, &pending, &inside, &mut parts).then(|| parts.clone());
+                assert_eq!(now, before, "round {round}, {r:?} after {} declared", pending.len());
+                if before.is_some() {
+                    pending.push(r);
+                }
+            }
+        }
+    }
+
+    /// 7,000 declares into one copy, as a frame's (short views here and
+    /// there, a quarter of them again): timed as before and now.
+    #[test]
+    fn seven_thousand_declares_timed() {
+        let (start, len) = (0x2_0000_0000usize, 174usize << 20);
+        let inside = inside_of(start, len);
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut declares: Vec<(usize, usize)> = Vec::new();
+        for _ in 0..7000 {
+            let r = range(&mut rng, start, len, &declares);
+            declares.push(r);
+        }
+        let time = |new: bool| {
+            let began = std::time::Instant::now();
+            let (mut pending, mut parts, mut bytes) = (Vec::new(), Vec::new(), 0usize);
+            for &r in &declares {
+                let found = if new {
+                    untaken(r, &pending, &inside, &mut parts).then(|| std::mem::take(&mut parts))
+                } else {
+                    as_before(r, &pending, &inside)
+                };
+                if let Some(found) = found {
+                    bytes += found.iter().map(|&(a, e)| e.saturating_sub(a)).sum::<usize>();
+                    pending.push(r);
+                }
+            }
+            (began.elapsed(), bytes, pending.len())
+        };
+        let (before, bytes_before, declared) = time(false);
+        let (now, bytes_now, _) = time(true);
+        println!("7,000 declares ({declared} distinct) into one copy: {before:?} before, {now:?} now");
+        assert_eq!(bytes_now, bytes_before);
+    }
+}
+
 /// For the memory line: host copies alive and their bytes, of them the
 /// windows of memory outside buffers and their bytes, and the snapshot
 /// buffers kept for reuse and the bytes they reserve.
@@ -3195,37 +3398,22 @@ impl Shadow {
         if relay() {
             self.flights.lock().unwrap_or_else(|e| e.into_inner()).declare(range, PREPARED.load(Ordering::Relaxed));
         }
-        // Dispatches declare the same ranges thousands of times.
-        if pending.contains(&range) {
-            return;
-        }
         // In the card's memory: no snapshot. What shaders wrote is found on
         // the card (`Host::card_before` reads the declared ranges from the
         // lists).
         if self.card.is_some() {
-            pending.push(range);
+            // Dispatches declare the same ranges thousands of times.
+            if !pending.contains(&range) {
+                pending.push(range);
+            }
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
-        let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
-            let (a, e) = self.inside(a, e - a);
-            let mut rest = Vec::with_capacity(parts.len() + 1);
-            for (from, to) in parts {
-                if e <= from || a >= to {
-                    rest.push((from, to));
-                    continue;
-                }
-                if from < a {
-                    rest.push((from, a));
-                }
-                if e < to {
-                    rest.push((e, to));
-                }
-            }
-            parts = rest;
+        let mut parts = Vec::new();
+        if !untaken(range, &pending, |a, e| self.inside(a, e - a), &mut parts) {
+            return;
         }
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
@@ -5431,6 +5619,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
+    WINDOW_BYTES.fetch_add(len, Ordering::Relaxed);
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
         staging,
@@ -5542,6 +5731,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     );
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
+    WINDOW_BYTES.fetch_add(len, Ordering::Relaxed);
     shadow.card = card;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {

@@ -842,6 +842,13 @@ impl Tracked {
         }
         ranges
     }
+
+    /// The page holding `address` was taken but could not be read (the
+    /// title unmapped it meanwhile): the next take gives it again, whole,
+    /// instead of leaving it until the title writes it once more.
+    pub(crate) fn again(&self, address: usize) {
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).remove(&(address / PAGE));
+    }
 }
 
 /// Guarded blocks of view memory.
@@ -4302,6 +4309,27 @@ mod tests {
         assert!(writes(p, p + 4 * PAGE, false).is_some());
         write(2 * PAGE + 9000);
         assert_eq!(tracked.take(p, p + 4 * PAGE), [(p + 2 * PAGE, p + 2 * PAGE + 4096), (p + 2 * PAGE + 8192, p + 2 * PAGE + 12288)]);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A page taken that its taker could not read is taken again, whole, at
+    /// the next take, without another write; the others are not.
+    #[test]
+    fn a_page_not_read_is_taken_again() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let tracked = track(p, 4 * PAGE, false).expect("watched");
+        // SAFETY: committed pages of ours.
+        (0..4).for_each(|page| unsafe { ((p + page * PAGE + 5) as *mut u8).write_volatile(1) });
+        assert_eq!(tracked.take(p, p + 4 * PAGE), [(p, p + 4 * PAGE)]);
+        assert!(tracked.take(p, p + 4 * PAGE).is_empty());
+        tracked.again(p + 2 * PAGE + 100);
+        assert_eq!(tracked.take(p, p + 4 * PAGE), [(p + 2 * PAGE, p + 3 * PAGE)], "the page not read");
+        assert!(tracked.take(p, p + 4 * PAGE).is_empty(), "once");
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }

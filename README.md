@@ -82,7 +82,16 @@ differences are noise.
 2. **Drag `game_scarlett_master.exe` onto `PLAY.bat`**, or copy your game folder next to it and name it `game`.
 3. The first start is slow while shaders are translated and pipelines are built. Later starts are faster.
 
-Options for `scripts\play-nvidia.ps1`:
+Or use the **launcher** (`LAUNCHER.bat`, see [launcher/README.md](launcher/README.md)): the same tuned settings,
+saved profiles, a pre-flight check of the build, folders, card, RAM and drivers, live FPS / frame times / 1 % lows /
+CPU / RAM / GPU / VRAM, the log with known problems explained, and the pipeline warm-up and shader translation as
+buttons.
+
+In a source checkout PLAY.bat now keeps caches and saves under `%LOCALAPPDATA%\victory`: the layer refuses folders
+inside the source tree, so before this a checkout's PLAY.bat stopped at start.
+
+Options for `scripts\play-nvidia.ps1` (`-PrintEnv` prints the resulting settings as JSON without starting anything;
+the launcher uses it):
 - `-Warm` builds every recorded pipeline into the driver cache before play. This needs about 23 GB free on C: for
   all of them; `-WarmLimit n` builds fewer.
 - `-Precompile` translates every shader ahead of time.
@@ -106,5 +115,8 @@ RTX 20, an external tool such as Lossless Scaling can add generated frames.
 - Ray-traced lighting is not computed (a stand-in light is used), so some rooms look too bright or too dark.
 - Textures can still appear late or briefly wrong while the title streams.
 - The first frame of the world freezes for about 4 s while it loads.
+
+What changed on 2026-11-27 (audit fixes, memory work, the launcher) and what still needs a game run:
+[docs/changes-2026-11-27.md](docs/changes-2026-11-27.md).
 
 The upstream README with full background and credits is in [UPSTREAM-README.md](UPSTREAM-README.md).

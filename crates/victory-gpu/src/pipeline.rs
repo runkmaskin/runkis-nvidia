@@ -147,7 +147,10 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                // A panic (in the parse as well as the translation) is a
+                // failure, logged below with the hash, not an unwind that
+                // leaves this unset and kills the pipeline worker.
+                let done = crate::shader_cache::unpanicked(|| translate(&self.container));
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {

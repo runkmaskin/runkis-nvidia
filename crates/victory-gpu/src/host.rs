@@ -753,8 +753,8 @@ pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync:
 /// makes at its start).
 pub(crate) static LISTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// The process's private bytes (diagnostics: around the making of lists).
-#[cfg(feature = "diagnostics")]
+/// The process's private bytes (around the making of lists, diagnostics;
+/// for the line of memory by subsystem).
 fn private_bytes() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -1152,6 +1152,139 @@ mod tests {
 
     use super::*;
 
+    /// The process's private bytes.
+    fn private_now() -> i64 {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+        // SAFETY: our own process and a sized structure.
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+        c.PagefileUsage as i64
+    }
+
+    /// Records `n` small copies from `a` into `b` on `list`.
+    fn copies(list: &HostList, a: &ID3D12Resource, b: &ID3D12Resource, n: u64) {
+        for i in 0..n {
+            // SAFETY: an open list; buffers of 64 KiB.
+            unsafe { list.list.CopyBufferRegion(b, (i % 1000) * 4, a, (i % 999) * 4, 4) };
+        }
+    }
+
+    /// A list counts its recording's calls, and keeps the largest over its
+    /// resets: what its allocator holds.
+    #[test]
+    fn a_list_keeps_the_count_of_its_largest_recording() {
+        let Some(host) = host() else { return };
+        let (a, _) = host.shared_buffer(1 << 16).unwrap();
+        let (b, _) = host.shared_buffer(1 << 16).unwrap();
+        let list = host.new_list().unwrap();
+        copies(&list, &a, &b, 3_000);
+        assert!(list.calls() >= 3_000);
+        list.close();
+        list.reset();
+        assert!(list.calls() < 10, "counted anew after the reset");
+        copies(&list, &a, &b, 10);
+        assert!(list.calls() >= 10 && list.calls() < 20);
+        assert!(list.peak() >= 3_000, "the largest recording is kept");
+        list.close();
+    }
+
+    /// The line of memory by subsystem: its prefix, then `name=MB` and
+    /// `name_peak=MB` for each field, the peak the highest seen.
+    #[test]
+    fn the_memory_line_is_names_and_megabytes() {
+        let peaks = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+        let first = memory_text(&[("windows", 300 << 20), ("gpu_used", 5 << 20)], &peaks);
+        assert_eq!(first, "memory by subsystem: windows=300 windows_peak=300 gpu_used=5 gpu_used_peak=5");
+        let second = memory_text(&[("windows", 100 << 20), ("gpu_used", 9 << 20)], &peaks);
+        let fields: Vec<(&str, u64)> = second
+            .strip_prefix("memory by subsystem: ")
+            .unwrap()
+            .split(' ')
+            .map(|f| f.split_once('=').map(|(n, v)| (n, v.parse().unwrap())).unwrap())
+            .collect();
+        assert_eq!(fields, [("windows", 100), ("windows_peak", 300), ("gpu_used", 9), ("gpu_used_peak", 9)]);
+    }
+
+    /// The calls a list holds count in [`HELD_CALLS`] while it lives, and
+    /// not after. (Other tests' lists come and go meanwhile; each counts
+    /// itself only, and none of them holds a million calls.)
+    #[test]
+    fn held_calls_go_with_their_list() {
+        for _ in 0..3 {
+            let peak = Peak::default();
+            peak.raise(1_000_000);
+            peak.raise(10);
+            assert_eq!(peak.0.load(Ordering::Relaxed), 1_000_000);
+            assert!(HELD_CALLS.load(Ordering::Relaxed) >= 1_000_000);
+            drop(peak);
+            assert!(HELD_CALLS.load(Ordering::Relaxed) < 1_000_000);
+        }
+    }
+
+    /// What allocators hold when host lists rotate between recordings of
+    /// different sizes (`crate::list::tests::rotate` with real lists): run
+    /// alone, `cargo test -p victory-gpu --lib allocators_by_class --
+    /// --ignored --nocapture --test-threads=1`. By class first: memory the
+    /// driver kept from it serves the other way, which can only make that
+    /// one look smaller.
+    #[test]
+    #[ignore]
+    fn allocators_by_class_hold_less() {
+        let Some(host) = host() else { return };
+        let (a, _) = host.shared_buffer(1 << 16).unwrap();
+        let (b, _) = host.shared_buffer(1 << 16).unwrap();
+        let mut sizes = vec![40_000u64; 4];
+        sizes.extend([4_000; 4]);
+        sizes.extend([20; 40]);
+        for classed in [true, false] {
+            let before = private_now();
+            let mut pool = crate::list::Classed::new();
+            let mut lifo: Vec<HostList> = Vec::new();
+            let mut hosts: Vec<HostList> = sizes.iter().map(|_| host.new_list().unwrap()).collect();
+            let mut made = hosts.len();
+            let mut peaks = Vec::new();
+            for frame in 0..20 {
+                let mut flying = Vec::new();
+                for i in 0..sizes.len() {
+                    // Each frame in another order.
+                    let t = (i * 7 + frame * 13) % sizes.len();
+                    copies(&hosts[t], &a, &b, sizes[t]);
+                    hosts[t].close();
+                    let fresh = if classed { pool.take(crate::list::class(sizes[t] as u32)) } else { lifo.pop() };
+                    let fresh = fresh.unwrap_or_else(|| {
+                        made += 1;
+                        host.new_list().unwrap()
+                    });
+                    flying.push(std::mem::replace(&mut hosts[t], fresh));
+                }
+                // They land in another order than they were sent.
+                flying.reverse();
+                for list in flying {
+                    list.reset();
+                    if classed {
+                        let held = crate::list::class(list.peak());
+                        pool.give(list, held, 0);
+                    } else {
+                        lifo.push(list);
+                    }
+                }
+            }
+            peaks.extend(hosts.iter().map(HostList::peak));
+            peaks.extend(lifo.iter().map(HostList::peak));
+            while let Some(list) = pool.take(0) {
+                peaks.push(list.peak());
+            }
+            let held: u64 = peaks.iter().map(|&p| u64::from(p)).sum();
+            let grew = (private_now() - before) >> 20;
+            eprintln!(
+                "{}: {made} lists, private bytes grew {grew} MB, calls held by allocators {held}",
+                if classed { "by class" } else { "last in, first out" },
+            );
+            drop((hosts, lifo));
+        }
+    }
+
     #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
@@ -1231,6 +1364,12 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// The most calls one recording of the list made ([`rec::Rec::calls`]).
+    /// Its allocator keeps the command memory of its largest recording over
+    /// every reset (measured on an RTX 4070 SUPER: eight lists of 200,000
+    /// copies took 173 MB, and still held it after a reset and one copy
+    /// each), so this is how much the list holds, whatever it records now.
+    peak: Peak,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -1242,6 +1381,34 @@ pub(crate) struct HostList {
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
 }
+
+/// [`HostList::peak`], counted in [`HELD_CALLS`] while the list lives.
+#[derive(Default)]
+struct Peak(AtomicU32);
+
+impl Peak {
+    fn raise(&self, calls: u32) {
+        let was = self.0.fetch_max(calls, Ordering::Relaxed);
+        if calls > was {
+            HELD_CALLS.fetch_add(u64::from(calls - was), Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for Peak {
+    fn drop(&mut self) {
+        HELD_CALLS.fetch_sub(u64::from(*self.0.get_mut()), Ordering::Relaxed);
+    }
+}
+
+/// The largest recordings' calls of the host lists alive ([`HostList::peak`]):
+/// what their allocators hold, by [`CALL_BYTES`].
+pub(crate) static HELD_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The command memory an allocator took for a call, about: 108 bytes for a
+/// buffer copy on an RTX 4070 SUPER (eight lists of 200,000 copies, 173 MB).
+/// Other calls differ; it is an estimate for the line of memory by subsystem.
+const CALL_BYTES: u64 = 108;
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
@@ -4135,6 +4302,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                peak: Peak::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -6319,6 +6487,7 @@ impl HostList {
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
+        self.peak.raise(self.list.take_calls());
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6348,6 +6517,17 @@ impl HostList {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// Calls of the recording since the last reset ([`rec::Rec::calls`]).
+    pub(crate) fn calls(&self) -> u32 {
+        self.list.calls()
+    }
+
+    /// The most calls a recording of the list made, this one included
+    /// ([`HostList::peak`]): what its allocator holds.
+    pub(crate) fn peak(&self) -> u32 {
+        self.peak.0.load(Ordering::Relaxed).max(self.list.calls())
     }
 
     /// Something changed in this list that bringing a draw's textures and
@@ -8864,24 +9044,77 @@ fn frame_log() {
         last: std::time::Instant,
         drawn: u64,
         out: std::io::BufWriter<std::fs::File>,
-        n: u32,
+        flushed: std::time::Instant,
     }
     static LOG: Mutex<Option<Option<Log>>> = Mutex::new(None);
     let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
     let log = log.get_or_insert_with(|| {
         let path = std::env::var_os("VICTORY_FRAME_LOG")?;
         let file = std::fs::File::create(path).ok()?;
-        Some(Log { start: std::time::Instant::now(), last: std::time::Instant::now(), drawn: crate::draw::drawn(), out: std::io::BufWriter::new(file), n: 0 })
+        let now = std::time::Instant::now();
+        Some(Log { start: now, last: now, drawn: crate::draw::drawn(), out: std::io::BufWriter::new(file), flushed: now })
     });
     let Some(log) = log else { return };
     let now = std::time::Instant::now();
     let drawn = crate::draw::drawn();
     let _ = writeln!(log.out, "{:.3} {:.2} {}", (now - log.start).as_secs_f64(), (now - log.last).as_secs_f64() * 1000.0, drawn - log.drawn);
     (log.last, log.drawn) = (now, drawn);
-    log.n += 1;
-    if log.n % 64 == 0 {
+    // By time, not by count: at 18 fps every 64th frame was 3.5 s behind, too
+    // late for anyone reading the file live (the launcher's frame-time graph).
+    // Four small writes a second cost nothing next to a frame.
+    if now - log.flushed >= std::time::Duration::from_millis(250) {
         let _ = log.out.flush();
+        log.flushed = now;
     }
+}
+
+/// The highest value so far of each field of [`memory_line`].
+static MEMORY_PEAKS: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+
+/// What holds memory, by who holds it, in one line with the frame-rate
+/// lines every five seconds, for a launcher to read: `memory by subsystem:`
+/// and then fields `name=MB` separated by spaces, each followed by
+/// `name_peak=MB`, its highest value at these looks so far. From counters
+/// only: nothing is walked. `list_allocators` is an estimate
+/// ([`CALL_BYTES`]); `gpu_*` are the system's numbers for the process.
+fn memory_line(host: &Host) {
+    let alive = |i: usize| ALIVE[i].load(Ordering::Relaxed);
+    let [windows, buffer_copies, card_copies] = crate::shadow::memory_counts();
+    let [texture_blocks, staging_blocks] = crate::pool::memory();
+    let kept = crate::pipeline::kept();
+    let video = host.video_memory().unwrap_or_default();
+    let fields: [(&str, u64); 16] = [
+        ("private", private_bytes()),
+        ("list_allocators", HELD_CALLS.load(Ordering::Relaxed) * CALL_BYTES),
+        ("list_scratch", alive(2)),
+        ("list_uploads", alive(7)),
+        ("texture_staging", crate::texture::staged_bytes()),
+        ("staging_blocks", staging_blocks << 20),
+        ("windows", windows),
+        ("buffer_copies", buffer_copies),
+        ("card_copies", card_copies),
+        ("host_textures", crate::resource::HOST_TEXTURES[1].load(Ordering::Relaxed)),
+        ("texture_blocks", texture_blocks << 20),
+        ("shader_tables", kept[1] + kept[3]),
+        ("pipeline_library", kept[4]),
+        ("gpu_used", video[1]),
+        ("gpu_budget", video[0]),
+        ("gpu_shared_used", video[3]),
+    ];
+    tracing::info!("{}", memory_text(&fields, &MEMORY_PEAKS));
+}
+
+/// The text of [`memory_line`] for `fields` (name, bytes), raising each
+/// one's peak in `peaks`.
+fn memory_text(fields: &[(&str, u64)], peaks: &[std::sync::atomic::AtomicU64]) -> String {
+    use std::fmt::Write;
+    let mut text = String::with_capacity(48 * fields.len());
+    text.push_str("memory by subsystem:");
+    for (&(name, bytes), peak) in fields.iter().zip(peaks) {
+        let peak = peak.fetch_max(bytes, Ordering::Relaxed).max(bytes);
+        let _ = write!(text, " {name}={} {name}_peak={}", bytes >> 20, peak >> 20);
+    }
+    text
 }
 
 struct Meter {
@@ -9028,6 +9261,9 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            if let Some(host) = host() {
+                memory_line(host);
+            }
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)

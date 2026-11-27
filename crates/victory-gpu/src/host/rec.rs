@@ -13,7 +13,7 @@
 //! its upload followed by the next texture's aliasing).
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -44,11 +44,24 @@ pub(crate) struct Rec {
     list: ID3D12GraphicsCommandList,
     any: AtomicBool,
     held: Mutex<Held>,
+    /// Uses of the list since its last reset: roughly how much command
+    /// memory the recording took from its allocator.
+    calls: AtomicU32,
 }
 
 impl Rec {
     pub(crate) fn new(list: ID3D12GraphicsCommandList) -> Self {
-        Self { list, any: AtomicBool::new(false), held: Mutex::new(Held(Vec::new())) }
+        Self { list, any: AtomicBool::new(false), held: Mutex::new(Held(Vec::new())), calls: AtomicU32::new(0) }
+    }
+
+    /// Uses of the list since its last reset.
+    pub(crate) fn calls(&self) -> u32 {
+        self.calls.load(Relaxed)
+    }
+
+    /// [`Rec::calls`], counted from 0 again (at a reset).
+    pub(crate) fn take_calls(&self) -> u32 {
+        self.calls.swap(0, Relaxed)
     }
 
     /// Records `barriers` now, or holds them for the next use of the list.
@@ -59,6 +72,7 @@ impl Rec {
         if barriers.is_empty() {
             return;
         }
+        self.calls.store(self.calls.load(Relaxed).wrapping_add(1), Relaxed);
         if !on() {
             // (What was held while it was on goes first.)
             if self.any.load(Relaxed) {
@@ -117,6 +131,9 @@ impl std::ops::Deref for Rec {
 
     /// The list, with what is held recorded first.
     fn deref(&self) -> &ID3D12GraphicsCommandList {
+        // One thread records a list at a time: a plain add, no locked one
+        // (this runs for every call of every list).
+        self.calls.store(self.calls.load(Relaxed).wrapping_add(1), Relaxed);
         if self.any.load(Relaxed) {
             self.flush();
         }

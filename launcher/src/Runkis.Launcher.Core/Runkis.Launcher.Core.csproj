@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>12</LangVersion>
+    <RootNamespace>Runkis.Launcher.Core</RootNamespace>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Windows performance counters (GPU engine utilisation and GPU memory per process). Microsoft's own package. -->
+    <PackageReference Include="System.Diagnostics.PerformanceCounter" Version="8.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Runkis.Launcher.Tests" />
+  </ItemGroup>
+
+</Project>

@@ -72,6 +72,9 @@ pub(super) fn folder() -> Option<PathBuf> {
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
+/// Of the loaded: those taken from a library of another translator into
+/// the new one ([`Library::earlier`]).
+pub(crate) static CARRIED: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
 /// that size is made, filled and written every time pipelines were added,
@@ -406,6 +409,32 @@ struct Library {
     /// Stores share it and a save takes it alone: the size the library
     /// asks for must still be its size when it is written out.
     saving: RwLock<()>,
+    /// The library on disk when it is of another translator ([`outdated`]):
+    /// pipelines are still loaded from it, and each one this run loads from
+    /// it is stored in `library` as well, which replaces it at the next
+    /// save. Pipelines whose translation changed are never asked for under
+    /// their old names again: before, they stayed in the file for good, and
+    /// the file only grew (1.3 to 1.5 GB, mapped and read at every start).
+    earlier: Option<Earlier>,
+}
+
+/// A library of another translator and its blob (in that order: the
+/// library goes first).
+struct Earlier {
+    library: ID3D12PipelineLibrary1,
+    _blob: Blob,
+}
+
+/// The translator the library's pipelines were made with
+/// ([`crate::shader_cache::generation`]), written beside the library's file
+/// when a save has replaced it.
+const GENERATION_FILE: &str = "host-pipelines.generation";
+
+/// Whether the library in `dir` was saved by a run of another translator,
+/// or by a build from before [`GENERATION_FILE`] (none is beside it).
+fn outdated(dir: &std::path::Path) -> bool {
+    let saved = std::fs::read_to_string(dir.join(GENERATION_FILE)).unwrap_or_default();
+    saved.trim() != crate::shader_cache::generation()
 }
 
 // SAFETY: D3D12 objects are free-threaded, and the library synchronises
@@ -447,14 +476,33 @@ fn library() -> Option<&'static Library> {
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
-            let library = open(&device, blob);
+            let library = open_in(&device, DIR.get().map(PathBuf::as_path));
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
             library
         })
         .as_ref()
+}
+
+/// The library kept in `dir` (none: an empty one). One of another
+/// translator ([`outdated`]) is opened as the earlier one beside a new,
+/// empty library ([`Library::earlier`]).
+fn open_in(device: &ID3D12Device1, dir: Option<&std::path::Path>) -> Option<Library> {
+    let blob = dir.map_or(Blob::None, Blob::of);
+    if blob.bytes().is_empty() || !dir.is_some_and(outdated) {
+        return open(device, blob);
+    }
+    let earlier = open(device, blob).filter(|l| !matches!(l._blob, Blob::None));
+    let mut library = open(device, Blob::None)?;
+    if let Some(Library { library: old, _blob, .. }) = earlier {
+        tracing::info!(
+            "host pipeline library of another translator: what this run loads from it is kept, \
+             the rest goes at the next save"
+        );
+        library.earlier = Some(Earlier { library: old, _blob });
+    }
+    Some(library)
 }
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
@@ -482,6 +530,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     _blob: blob,
                     added: AtomicU64::new(0),
                     saving: RwLock::new(()),
+                    earlier: None,
                 });
             }
             Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
@@ -498,6 +547,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
         _blob: Blob::None,
         added: AtomicU64::new(0),
         saving: RwLock::new(()),
+        earlier: None,
     })
 }
 
@@ -516,20 +566,46 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
     name: &str,
-    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
-    let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
+    pipeline_in(library, name, load, create)
+}
+
+/// [`pipeline`] in `library`.
+fn pipeline_in(
+    library: &Library,
+    name: &str,
+    load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<ID3D12PipelineState> {
+    let wide = HSTRING::from(name);
     let began = std::time::Instant::now();
     let loaded = {
         let _all = one_call();
         let _one = same_name(name);
         let _call = call("load", name);
-        load(&library.library, PCWSTR(wide.as_ptr()))
+        match (load(&library.library, PCWSTR(wide.as_ptr())), &library.earlier) {
+            // Not yet in the new library: from the earlier one, and kept in
+            // the new one from now on.
+            (Err(e), Some(earlier)) => match load(&earlier.library, PCWSTR(wide.as_ptr())) {
+                Ok(pso) => {
+                    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+                    // SAFETY: a live pipeline, of a name the new library lacks.
+                    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+                        library.added.fetch_add(1, Ordering::Relaxed);
+                        CARRIED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(pso)
+                }
+                Err(_) => Err(e),
+            },
+            (loaded, _) => loaded,
+        }
     };
     // The load read the library's file (see `trim`).
     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
@@ -582,6 +658,11 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    save_in(dir, library);
+}
+
+/// [`save`] of `library` into `dir`, now.
+fn save_in(dir: &std::path::Path, library: &Library) {
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
@@ -618,7 +699,14 @@ pub(crate) fn save(now: bool) {
     // Through `used`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
     let used: Vec<String> = used().iter().flatten().cloned().collect();
-    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+    // The translator goes beside the library only once the library is this
+    // run's: until then the file is the earlier one ([`outdated`]).
+    let library_written = if bytes > 0 {
+        replace_library(dir, &tmp)
+            .and_then(|()| write_atomically(&dir.join(GENERATION_FILE), crate::shader_cache::generation().as_bytes()))
+    } else {
+        Ok(())
+    };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
@@ -643,6 +731,7 @@ pub(crate) fn save(now: bool) {
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
+            carried = CARRIED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
@@ -794,6 +883,78 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    /// A compute pipeline of ours that writes `value`, with its root
+    /// signature in the code.
+    fn writes(device: &ID3D12Device1, value: u32) -> D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        let source = format!(
+            "RWByteAddressBuffer o : register(u0);\n[RootSignature(\"UAV(u0)\")] [numthreads(1, 1, 1)] \
+             void main() {{ o.Store(0, {value}); }}"
+        );
+        let code = crate::host::compile(&source, windows::core::s!("main"), windows::core::s!("cs_5_1")).unwrap();
+        // SAFETY: the code holds its root signature.
+        let root: ID3D12RootSignature = unsafe { device.CreateRootSignature(0, &code) }.unwrap();
+        // The code lives for the test (leaked): the description points at it.
+        let code = Box::leak(code.into_boxed_slice());
+        D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(root)),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+            ..Default::default()
+        }
+    }
+
+    /// A library saved by a run of another translator: this run still loads
+    /// what it asks for from it, and the next save keeps only that, under
+    /// this translator; the run after loads it as its own.
+    #[test]
+    fn a_library_of_another_translator_keeps_only_what_is_used() {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return; // no host GPU here
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (used, unused) = (writes(&device, 1), writes(&device, 2));
+        let made = std::sync::atomic::AtomicU32::new(0);
+        let get = |library: &Library, name: &str, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC| {
+            pipeline_in(
+                library,
+                name,
+                // SAFETY: a description of live data.
+                |l, n| unsafe { l.LoadComputePipeline(n, desc) },
+                || {
+                    made.fetch_add(1, Ordering::Relaxed);
+                    // SAFETY: as above.
+                    unsafe { device.CreateComputePipelineState(desc) }
+                },
+            )
+            .unwrap()
+        };
+        // A run of the current translator with nothing yet: both made.
+        let first = open_in(&device, Some(dir.path())).unwrap();
+        assert!(first.earlier.is_none());
+        get(&first, "used", &used);
+        get(&first, "unused", &unused);
+        save_in(dir.path(), &first);
+        assert!(!outdated(dir.path()));
+        assert_eq!(made.load(Ordering::Relaxed), 2);
+        // The library as another translator's run left it.
+        std::fs::write(dir.path().join(GENERATION_FILE), "another translator").unwrap();
+        let second = open_in(&device, Some(dir.path())).unwrap();
+        assert!(second.earlier.is_some(), "kept beside a new library");
+        get(&second, "used", &used);
+        assert_eq!(made.load(Ordering::Relaxed), 2, "loaded, not made");
+        save_in(dir.path(), &second);
+        assert!(!outdated(dir.path()));
+        // The next run: its own library, with only what was used.
+        let third = open_in(&device, Some(dir.path())).unwrap();
+        assert!(third.earlier.is_none());
+        get(&third, "used", &used);
+        assert_eq!(made.load(Ordering::Relaxed), 2);
+        get(&third, "unused", &unused);
+        assert_eq!(made.load(Ordering::Relaxed), 3, "what no run used went");
+        // (The libraries stay: the module's view of a mapped file is read
+        // for as long as the process runs, `removal_note`.)
+        std::mem::forget((first, second, third));
     }
 
     #[test]

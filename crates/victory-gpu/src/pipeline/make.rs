@@ -89,7 +89,16 @@ impl Pending {
     fn make(&self) {
         self.made.get_or_init(|| {
             let began = Instant::now();
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            // A panic is a pipeline not made: unwinding out of here left
+            // `made` unset, the worker dead and its counts never taken back
+            // (`workers`), so the pipeline was "being made" for good.
+            let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            }))
+            .unwrap_or_else(|_| {
+                tracing::warn!(shaders = %hashes(self), "making the host pipeline panicked; its draws are dropped");
+                None
+            });
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
         });
@@ -528,7 +537,9 @@ fn workers() -> bool {
                     }
                     loop {
                         let p = next(screens_only);
-                        p.make();
+                        // Whatever happens in it, the counts below are taken
+                        // back and the worker lives on (`Pending::make`).
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.make()));
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                             queue.slow_now -= 1;

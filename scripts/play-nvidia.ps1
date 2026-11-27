@@ -11,7 +11,7 @@
 # -Adapter         on a PC with more than one card, the one to use: part of its name (-Adapter 5060) or its index
 #                  (-Adapter '#1'). Default: Windows' default card (the one the main display is on).
 # -Build           target\diag (the default, the build all measurements are of) or target\release
-#                  (the release build ignores the ray-tracing skip list: VICTORY_SKIP_PIPELINES is a diagnostics switch)
+#                  (both builds honour the ray-tracing skip list since 56be6f9; DRED and debug-level logs need diag)
 # -More            other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
@@ -26,7 +26,9 @@ param(
     [hashtable]$More = @{},
     [switch]$Precompile,  # local: translate every shader with these exact settings (cache warm), no run
     [switch]$Warm,        # local: build every recorded pipeline into the driver's cache (victory warm), no run
-    [int]$WarmLimit = 0   # local: with -Warm, at most this many pipelines (0: all)
+    [int]$WarmLimit = 0,  # local: with -Warm, at most this many pipelines (0: all)
+    [switch]$PrintEnv     # launcher: print the settings, victory.exe path and arguments as JSON and stop. Nothing is
+                          # copied, set or started, so the launcher runs the same settings as this script.
 )
 $settings = @{
     # This fork's play set (scripts\play.ps1, not -Safe): the speed set.
@@ -129,9 +131,25 @@ if ($Resolution) {
 if ($Adapter) { $settings.VICTORY_ADAPTER = $Adapter }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 $scale = [double]::Parse($settings.VICTORY_RENDER_SCALE, [Globalization.CultureInfo]::InvariantCulture)
-Write-Host "Series $console, rendering at $([int]($outHeight * $scale))p (render scale $($settings.VICTORY_RENDER_SCALE))"
+if (-not $PrintEnv) { Write-Host "Series $console, rendering at $([int]($outHeight * $scale))p (render scale $($settings.VICTORY_RENDER_SCALE))" }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
+if ($PrintEnv) {
+    $runArgs = @('run', $Exe, '--execute')
+    if (-not $SeriesX) { $runArgs += @('--console', 'series-s') }
+    if ($Precompile) { $runArgs = @('shaders', (Split-Path $Exe)) }
+    if ($Warm) { $runArgs = @('warm'); if ($WarmLimit -gt 0) { $runArgs += @('--limit', "$WarmLimit") } }
+    $sorted = [ordered]@{}
+    foreach ($k in ($settings.Keys | Sort-Object)) { $sorted[$k] = [string]$settings[$k] }
+    [ordered]@{
+        victory      = [IO.Path]::GetFullPath($victory)
+        workdir      = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+        smoothMotion = -not $NoSmoothMotion
+        args         = $runArgs
+        settings     = $sorted
+    } | ConvertTo-Json -Depth 4 -Compress
+    return
+}
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; return }
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; return }
 if (-not $NoSmoothMotion) {
