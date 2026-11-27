@@ -40,6 +40,9 @@ $settings = @{
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = $(if ($env:VN_AMBIENT) { $env:VN_AMBIENT } else { '0.8' }); VICTORY_D3D12_DRED = $(if ($env:VN_DRED) { $env:VN_DRED } else { '0' }); VICTORY_SKIP_PIPELINES = 'none'
     # local: DRED 'light' cost an RTX 2070 SUPER 2-4x GPU time, so it is off ($env:VN_DRED='light' turns it on)
     VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '8'; VICTORY_UPLOAD_AHEAD = '1'
+    # local: measured in game on 8d8db49 (5500X3D, 2 runs each against all-off 16.98 fps): fetches in four parts
+    # 17.63 fps (waiting for fetches 10.1 -> 7.5 ms); the pool settled once a second 17.43 fps, ahead in three queues in a row
+    VICTORY_FETCH_PARTS = '4'; VICTORY_POOL_SETTLE = '1'
     # Cheap picture fixes, on in both sets:
     # - Overbright views: without rays the light probes keep the sky's light indoors. The fog is bounded by 1.5 times
     #   the light around, and what the title left by 2 times the estimate (was 4; ambient.rs).

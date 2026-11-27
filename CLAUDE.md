@@ -91,11 +91,11 @@ Pitfalls:
   (`VICTORY_KEYS`, format in `launcher/README.md`). Differences under the noise floor are marked as noise; runs on
   the reference PC vary by about ±0.4 fps.
 
-Switches that are off by default and worth an A/B run (details in `docs/changes-2026-11-27.md`):
-`VICTORY_HEAP_SYNC_GPU=1`, `VICTORY_RELAY_COPY=1`, `VICTORY_FETCH_PARTS=4`, `VICTORY_PORT_DESCRIPTORS_APART=1`,
-`VICTORY_POOL_SETTLE=1`, `VICTORY_LIST_CLASSES=1`, `VICTORY_SHARE_PIPELINES=1`. The last three were on in early
-commits and are suspects for the extra frames over 100 ms that the first game comparison showed; measure them one
-at a time. Measurement-only switches for the next profile: `VICTORY_DRAW_PARTS=1`, `VICTORY_BACK_CENSUS=1`, `VICTORY_CROSS_WAIT=count`; more A/B candidates (`VICTORY_RETIRE_APART`, `VICTORY_LAND_SEGMENTS`, `VICTORY_AHEAD_GAP_KIB`, `VICTORY_POOL_PRIORITY`, `VICTORY_SET_CACHE`, `VICTORY_CALL_TIMES=0`) are in `docs/changes-2026-11-27.md`, `docs/heap-records.md` and `docs/copy-back.md`.
+Measured in game on 8d8db49 (5500X3D, 2 runs each, all-off 16.98 fps) and now on in `play-nvidia.ps1`:
+`VICTORY_FETCH_PARTS=4` (+0.65), `VICTORY_POOL_SETTLE=1` (+0.45). Measured and left off: `VICTORY_LAND_SEGMENTS=1`
+(+0.34, noisy), `VICTORY_RETIRE_APART=1` (+0.21, worse 1 % low), `VICTORY_RELAY_COPY` stays as the script sets it,
+`VICTORY_PORT_DESCRIPTORS_APART=1` (0), `VICTORY_POOL_PRIORITY=1` and `VICTORY_HEAP_SYNC_GPU=1` (worse 1 % lows).
+Not yet measured: `VICTORY_LIST_CLASSES=1`, `VICTORY_SHARE_PIPELINES=1`. Measurement-only switches for the next profile: `VICTORY_DRAW_PARTS=1`, `VICTORY_BACK_CENSUS=1`, `VICTORY_CROSS_WAIT=count`; more A/B candidates (`VICTORY_RETIRE_APART`, `VICTORY_LAND_SEGMENTS`, `VICTORY_AHEAD_GAP_KIB`, `VICTORY_POOL_PRIORITY`, `VICTORY_SET_CACHE`, `VICTORY_CALL_TIMES=0`) are in `docs/changes-2026-11-27.md`, `docs/heap-records.md` and `docs/copy-back.md`.
 
 ## Open work, in priority order
 
