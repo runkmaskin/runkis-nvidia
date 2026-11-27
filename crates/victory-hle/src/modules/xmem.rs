@@ -17,7 +17,7 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
+    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_FREE,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
@@ -91,15 +91,20 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    virtual_alloc(base, size, kind, flags, protect, 0)
+}
+
+/// [`XMemVirtualAlloc`], at an address aligned to `align` as well (0, or a
+/// power of two: what the host's allocation granularity gives anyway is
+/// not asked for).
+fn virtual_alloc(base: *mut c_void, size: usize, kind: u32, flags: u64, protect: u32, align: usize) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
+    let pages = if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M { 2 * MIB } else { 0 };
+    let align = pages.max(align);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
-        Alignment: if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M {
-            2 * MIB
-        } else {
-            0
-        },
+        Alignment: if align > PAGE { align } else { 0 },
     };
     let asked = protect;
     let mut protect = match protect & HOST_PROTECTION {
@@ -325,12 +330,15 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ALLOC_32BIT != 0 {
-        return XMemVirtualAlloc(
+        // Whole allocations: 64 KiB aligned by the host; an alignment above
+        // that is asked for with the address range.
+        return virtual_alloc(
             std::ptr::null_mut(),
             size,
             MEM_RESERVE | MEM_COMMIT,
             GRAPHICS | ADDRESS_32BIT,
             PAGE_READWRITE,
+            1 << (attributes >> ALIGNMENT_SHIFT & 0x1f),
         );
     }
     let Some(layout) = layout(size, attributes) else {
@@ -672,7 +680,15 @@ pub(crate) fn stream_notice() -> bool {
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(Default::default);
 
 fn physical() -> MutexGuard<'static, Physical> {
-    PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
+    let mut physical = PHYSICAL.lock().unwrap_or_else(|e| e.into_inner());
+    // Placeholders the title released are no view's own any more.
+    if ANY_FREED.swap(false, Ordering::Acquire) {
+        let freed = std::mem::take(&mut *FREED.lock().unwrap_or_else(|e| e.into_inner()));
+        for (at, len) in freed {
+            physical.holes.retain(|&hole, &mut bytes| hole + bytes <= at || at + len <= hole);
+        }
+    }
+    physical
 }
 
 /// The title's pages. Apart from the views: DirectStorage looks pages up at
@@ -1339,29 +1355,27 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
         return 0;
     }
     lift_thread();
-    if side_by_side() > 1 && n > 1 {
-        // Read before any lock is taken, as in `XMemMapPhysicalPages`.
-        let wanted: Vec<(usize, usize)> = (0..n)
-            // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
-            .map(|i| unsafe { (*addresses.add(i) as usize, if pages.is_null() { 0 } else { *pages.add(i) }) })
-            .collect();
-        if wanted.iter().all(|w| w.0 % PAGE == 0) {
-            return scatter(&wanted).into();
+    // Read before any lock is taken, as in `XMemMapPhysicalPages`.
+    let wanted: Vec<(usize, usize)> = (0..n)
+        // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
+        .map(|i| unsafe { (*addresses.add(i) as usize, if pages.is_null() { 0 } else { *pages.add(i) }) })
+        .collect();
+    // Every page is looked up before anything is unmapped, as in
+    // `XMemMapPhysicalPages`: a call with a page the title does not own
+    // fails and leaves every address showing what it showed.
+    {
+        let table = page_table();
+        if let Some(&(_, page)) = wanted.iter().find(|&&(_, page)| page != 0 && !table.pages.contains_key(&page)) {
+            tracing::warn!(page, "XMemMapPhysicalPagesScatter: unknown page");
+            return 0;
         }
     }
-    for i in 0..n {
-        // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
-        let (address, page) = unsafe {
-            (
-                *addresses.add(i),
-                if pages.is_null() || *pages.add(i) == 0 {
-                    std::ptr::null()
-                } else {
-                    pages.add(i)
-                },
-            )
-        };
-        if XMemMapPhysicalPages(address, 1, page).is_null() {
+    if side_by_side() > 1 && n > 1 && wanted.iter().all(|w| w.0 % PAGE == 0) {
+        return scatter(&wanted).into();
+    }
+    for &(address, page) in &wanted {
+        let page = if page == 0 { std::ptr::null() } else { &raw const page };
+        if XMemMapPhysicalPages(address as *mut c_void, 1, page).is_null() {
             return 0;
         }
     }
@@ -2509,8 +2523,74 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         victory_gpu::title_memory_freed(address as usize, size);
     }
+    // What a release takes away, asked before it is gone: a release of a
+    // whole allocation passes no size. (Splitting a placeholder takes
+    // nothing away.)
+    let at = address as usize;
+    let gone = (kind & MEM_RELEASE != 0 && kind & MEM_PRESERVE_PLACEHOLDER == 0)
+        .then(|| (at, if size != 0 { size } else { allocation_len(at) }));
     // SAFETY: the title's own arguments.
-    unsafe { VirtualFree(address, size, kind) }
+    let freed = unsafe { VirtualFree(address, size, kind) };
+    if freed != 0
+        && let Some((at, len)) = gone
+    {
+        // Joined placeholders are none of the views' own any more either.
+        forget_holes(at, len);
+        if kind & MEM_COALESCE_PLACEHOLDERS == 0 {
+            forget_low_reservations(at, len);
+        }
+    }
+    freed
+}
+
+/// The bytes of the allocation that starts at `at` (0 if none does).
+fn allocation_len(at: usize) -> usize {
+    let mut end = at;
+    loop {
+        // SAFETY: plain data; zero is a valid value.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a sized out structure of ours.
+        let n = unsafe { VirtualQueryEx(GetCurrentProcess(), end as *const c_void, &mut info, size_of_val(&info)) };
+        if n == 0 || info.AllocationBase as usize != at || info.State == MEM_FREE {
+            return end - at;
+        }
+        end = info.BaseAddress as usize + info.RegionSize;
+    }
+}
+
+/// Ranges the title released, whose [`Physical::holes`] go the next time
+/// the views are locked: not here, since a mapping call may hold them for
+/// a long time, and the title's thread that frees would wait for it.
+static FREED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+static ANY_FREED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn forget_holes(at: usize, len: usize) {
+    FREED.lock().unwrap_or_else(|e| e.into_inner()).push((at, len));
+    ANY_FREED.store(true, Ordering::Release);
+}
+
+/// [`LOW_RESERVATIONS`] that a release reached and that are now free all
+/// through (the title may release the pieces it split one by one; the
+/// pages of what is left keep their places in the reservation).
+fn forget_low_reservations(at: usize, len: usize) {
+    let mut reservations = LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    reservations.retain(|&(base, bytes)| base + bytes <= at || at + len <= base || !all_free(base, bytes));
+}
+
+/// Whether nothing of `[at, at + len)` is reserved.
+fn all_free(at: usize, len: usize) -> bool {
+    let mut next = at;
+    while next < at + len {
+        // SAFETY: plain data; zero is a valid value.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a sized out structure of ours.
+        let n = unsafe { VirtualQueryEx(GetCurrentProcess(), next as *const c_void, &mut info, size_of_val(&info)) };
+        if n == 0 || info.State != MEM_FREE {
+            return false;
+        }
+        next = info.BaseAddress as usize + info.RegionSize;
+    }
+    true
 }
 
 pub(crate) fn module() -> HleModule {
@@ -2563,6 +2643,56 @@ mod tests {
         let p = XMemAlloc(4096, ALLOC_32BIT);
         assert!(!p.is_null() && (p as usize) < 1 << 32);
         XMemFree(p, ALLOC_32BIT);
+    }
+
+    #[test]
+    fn a_32_bit_alloc_honours_an_alignment_above_64_kib() {
+        // 16 MiB: four at once, so none is aligned by chance alone.
+        let attributes = ALLOC_32BIT | 0x18 << ALIGNMENT_SHIFT;
+        let blocks: Vec<_> = (0..4).map(|_| XMemAllocDefault(100, attributes)).collect();
+        for &p in &blocks {
+            assert!(!p.is_null() && (p as usize) < 1 << 32, "{p:p}");
+            assert_eq!(p as usize % (16 * MIB), 0, "{p:p}");
+        }
+        for p in blocks {
+            XMemFreeDefault(p, attributes);
+        }
+        // At or below 64 KiB: what the host gives anyway.
+        let p = XMemAllocDefault(100, ALLOC_32BIT | 0x10 << ALIGNMENT_SHIFT);
+        assert!(!p.is_null() && (p as usize).is_multiple_of(PAGE));
+        XMemFreeDefault(p, ALLOC_32BIT);
+    }
+
+    #[test]
+    fn a_released_32_bit_reservation_is_forgotten_with_its_last_piece() {
+        let known = |base: *mut c_void| LOW_RESERVATIONS.lock().unwrap().iter().any(|r| r.0 == base as usize);
+        let base = XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, GRAPHICS | ADDRESS_32BIT, PAGE_NOACCESS);
+        assert!(!base.is_null() && known(base));
+        let second = base.wrapping_byte_add(PAGE);
+        // Split in two: still the title's.
+        assert_ne!(title_virtual_free(base, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), 0);
+        assert!(known(base));
+        // One piece released: the other's page keeps its place.
+        assert_ne!(title_virtual_free(base, 0, MEM_RELEASE), 0);
+        assert!(known(base), "half of it is still reserved");
+        assert_ne!(title_virtual_free(second, 0, MEM_RELEASE), 0);
+        assert!(!known(base));
+    }
+
+    #[test]
+    fn a_released_placeholder_leaves_no_hole_behind() {
+        let pages = allocate(1);
+        let base = XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!base.is_null());
+        let hole = |at: *mut c_void| physical().holes.contains_key(&(at as usize));
+        assert_eq!(XMemMapPhysicalPages(base, 1, pages.as_ptr()), base);
+        assert_eq!(XMemMapPhysicalPages(base, 1, std::ptr::null()), base);
+        assert!(hole(base), "the view's own placeholder");
+        // The title releases both pieces (mapping split them).
+        assert_ne!(title_virtual_free(base, 0, MEM_RELEASE), 0);
+        assert_ne!(title_virtual_free(base.wrapping_byte_add(PAGE), 0, MEM_RELEASE), 0);
+        assert!(!hole(base));
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
 
     #[test]
@@ -2987,8 +3117,19 @@ mod tests {
             assert_eq!(XMemMapPhysicalPagesScatter([at(2), at(4), at(6)].as_ptr(), 3, [pages[8]; 3].as_ptr()), 1);
             assert_eq!((first(2).read(), first(4).read(), first(6).read()), (77, 77, 77));
         }
-        // A page the title does not own.
-        assert_eq!(XMemMapPhysicalPagesScatter([at(0), at(1)].as_ptr(), 2, [pages[0], 1].as_ptr()), 0);
+        // A page the title does not own: the call fails and every address
+        // still shows what it showed, whole calls and one page alike.
+        // SAFETY: mapped read-write, before the calls and after.
+        unsafe {
+            first(1).write(66);
+            assert_eq!(XMemMapPhysicalPagesScatter([at(0), at(1)].as_ptr(), 2, [pages[0], 1].as_ptr()), 0);
+            assert_eq!(XMemMapPhysicalPagesScatter([at(0), at(1)].as_ptr(), 2, [1, pages[0]].as_ptr()), 0);
+            assert_eq!(XMemMapPhysicalPagesScatter([at(1)].as_ptr(), 1, [1usize].as_ptr()), 0);
+            // (Asked first: a read of an unmapped page would fault.)
+            let mapped: Vec<bool> = [at(0), at(1)].iter().map(|&a| physical().slice_at(a as usize).is_some()).collect();
+            assert_eq!(mapped, [true, true], "still mapped");
+            assert_eq!((first(0).read(), first(1).read()), (77, 66));
+        }
         // All gone, also parts of a larger view.
         assert_eq!(XMemMapPhysicalPages(at(0), 4, std::ptr::null()), at(0));
         // SAFETY: placeholders of ours, nothing mapped in them.

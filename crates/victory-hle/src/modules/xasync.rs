@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::xgameruntime::{Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing};
 
@@ -32,6 +32,7 @@ pub const E_NOTIMPL: HRESULT = 0x8000_4001_u32 as i32;
 pub const E_INVALIDARG: HRESULT = 0x8007_0057_u32 as i32;
 pub const E_NOT_SUFFICIENT_BUFFER: HRESULT = 0x8007_007A_u32 as i32;
 pub const E_ILLEGAL_METHOD_CALL: HRESULT = 0x8000_000E_u32 as i32;
+pub const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 
 const WORK: u32 = 0;
 const COMPLETION: u32 = 1;
@@ -233,26 +234,241 @@ impl Queue {
             }
             delayed.insert(id, task);
         }
-        let queue = self.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(delay_ms.into()));
-            // Gone if the queue was terminated meanwhile, which canceled it.
-            let task = lock(&queue.delayed).remove(&id);
-            if let Some(task) = task {
-                queue.deliver(port, task);
-            }
-        });
+        let due = Instant::now() + Duration::from_millis(delay_ms.into());
+        if !TIMER.add(due, id, self.clone(), port) {
+            // No timer thread: refused, so the task never runs.
+            lock(&self.delayed).remove(&id);
+            return E_OUTOFMEMORY;
+        }
         S_OK
+    }
+
+    /// A delayed callback whose delay is over, on the timer's thread: queued
+    /// on its port unless the queue was terminated meanwhile, which canceled
+    /// it. What runs title code (an immediate port's callback, monitors)
+    /// goes to [`DELIVERIES`], so that the timer never waits for it.
+    fn deliver_delayed(self: &Arc<Self>, port: u32, id: u64) {
+        let target = &self.ports[port as usize];
+        if target.mode == Mode::Immediate {
+            // Looked up when it runs, as a thread of its own did.
+            DELIVERIES.hand(Job::Immediate(self.clone(), port, id));
+            return;
+        }
+        let task = lock(&self.delayed).remove(&id);
+        if let Some(task) = task {
+            target.submit(task);
+            if !lock(&self.monitors).is_empty() {
+                DELIVERIES.hand(Job::Monitors(self.clone(), port));
+            }
+        }
     }
 
     fn deliver(self: &Arc<Self>, port: u32, task: Task) {
         self.ports[port as usize].submit(task);
+        self.tell_monitors(port);
+    }
+
+    fn tell_monitors(self: &Arc<Self>, port: u32) {
         // Copied out: a monitor may unregister itself.
         let monitors = lock(&self.monitors).clone();
         for (_, context, callback) in monitors {
             // SAFETY: stored from a `MonitorCallback` in `register_monitor`.
             let callback: MonitorCallback = unsafe { std::mem::transmute(callback) };
             callback(context as *mut c_void, Arc::as_ptr(self), port);
+        }
+    }
+}
+
+/// One thread waits out every delayed callback's delay, of all queues: titles
+/// poll and retry with them, and a thread each would cost a thread's start
+/// (and the title's thread callbacks) every time. Callbacks are delivered by
+/// their deadline, those of the same deadline in the order submitted; title
+/// code of theirs runs in [`DELIVERIES`].
+struct Timer {
+    /// By deadline and submission: the queue, port and id in its `delayed`;
+    /// and whether the thread runs.
+    state: Mutex<(BTreeMap<(Instant, u64), (Arc<Queue>, u32)>, bool)>,
+    changed: Condvar,
+}
+
+static TIMER: Timer = Timer {
+    state: Mutex::new((BTreeMap::new(), false)),
+    changed: Condvar::new(),
+};
+
+impl Timer {
+    /// False if the thread could not be started.
+    fn add(&'static self, due: Instant, id: u64, queue: Arc<Queue>, port: u32) -> bool {
+        let mut state = lock(&self.state);
+        if !state.1 {
+            let started = std::thread::Builder::new()
+                .name("xasync timer".into())
+                .spawn(|| TIMER.run());
+            if let Err(error) = started {
+                tracing::warn!(%error, "XTaskQueue: no thread for delayed callbacks");
+                return false;
+            }
+            state.1 = true;
+        }
+        let first = state.0.first_key_value().is_none_or(|(&(at, _), _)| due < at);
+        state.0.insert((due, id), (queue, port));
+        if first {
+            self.changed.notify_one();
+        }
+        true
+    }
+
+    fn run(&self) {
+        // Deliveries taken when last looked.
+        let mut taken = 0;
+        loop {
+            // Outside the lock below, as all title code here: a callback may
+            // submit delayed callbacks.
+            for job in DELIVERIES.look(&mut taken) {
+                job.run();
+            }
+            let mut due = Vec::new();
+            {
+                let mut state = lock(&self.state);
+                let now = Instant::now();
+                while let Some(entry) = state.0.first_entry()
+                    && entry.key().0 <= now
+                {
+                    let ((_, id), (queue, port)) = entry.remove_entry();
+                    due.push((queue, port, id));
+                }
+                if due.is_empty() {
+                    let mut wait = state.0.first_key_value().map(|(&(at, _), _)| at - now);
+                    // Deliveries wait: looked at again soon.
+                    if DELIVERIES.waiting() {
+                        wait = Some(wait.map_or(STALLED, |w| w.min(STALLED)));
+                    }
+                    drop(match wait {
+                        None => self.changed.wait(state).unwrap_or_else(|e| e.into_inner()),
+                        Some(wait) => self.changed.wait_timeout(state, wait).unwrap_or_else(|e| e.into_inner()).0,
+                    });
+                    continue;
+                }
+            }
+            for (queue, port, id) in due {
+                queue.deliver_delayed(port, id);
+            }
+        }
+    }
+}
+
+/// Title code of delayed callbacks, for [`DELIVERIES`].
+enum Job {
+    /// A callback of an immediate port: run unless canceled meanwhile, then
+    /// the monitors told.
+    Immediate(Arc<Queue>, u32, u64),
+    /// The monitors told of a callback queued on a port.
+    Monitors(Arc<Queue>, u32),
+}
+
+impl Job {
+    fn run(self) {
+        match self {
+            Job::Immediate(queue, port, id) => {
+                let task = lock(&queue.delayed).remove(&id);
+                if let Some(task) = task {
+                    queue.deliver(port, task);
+                }
+            }
+            Job::Monitors(queue, port) => queue.tell_monitors(port),
+        }
+    }
+}
+
+/// The threads that run [`Job`]s, begun in the timer's order: an idle one
+/// takes the next; with none idle, another starts at once while there are
+/// fewer than [`FIRST_WORKERS`], and after that whenever jobs wait
+/// [`STALLED`] without one being taken (every worker waits in a callback,
+/// say, for one due later). So a callback that blocks never holds up
+/// another for long, and quick ones do not start a thread each. A worker
+/// idle for [`IDLE_EXIT`] ends.
+struct Deliveries {
+    state: Mutex<Workers>,
+    ready: Condvar,
+}
+
+struct Workers {
+    jobs: VecDeque<Job>,
+    idle: usize,
+    running: usize,
+    /// Jobs taken so far.
+    taken: u64,
+}
+
+const FIRST_WORKERS: usize = 4;
+const STALLED: Duration = Duration::from_millis(10);
+const IDLE_EXIT: Duration = Duration::from_secs(5);
+
+static DELIVERIES: Deliveries = Deliveries {
+    state: Mutex::new(Workers { jobs: VecDeque::new(), idle: 0, running: 0, taken: 0 }),
+    ready: Condvar::new(),
+};
+
+impl Deliveries {
+    fn hand(&'static self, job: Job) {
+        let mut workers = lock(&self.state);
+        workers.jobs.push_back(job);
+        if workers.idle > 0 {
+            self.ready.notify_one();
+        } else if workers.running < FIRST_WORKERS {
+            self.start(&mut workers);
+        }
+    }
+
+    /// False if the host would not start a thread.
+    fn start(&'static self, workers: &mut Workers) -> bool {
+        match std::thread::Builder::new().name("xasync delivery".into()).spawn(move || self.work()) {
+            Ok(_) => {
+                workers.running += 1;
+                true
+            }
+            Err(error) => {
+                tracing::warn!(%error, "XTaskQueue: no thread for a delayed callback");
+                false
+            }
+        }
+    }
+
+    fn waiting(&self) -> bool {
+        !lock(&self.state).jobs.is_empty()
+    }
+
+    /// From the timer: starts a worker if jobs wait and none was taken since
+    /// the last look (`taken`). Returns the jobs for the timer to run itself
+    /// when there is no worker and none can start.
+    fn look(&'static self, taken: &mut u64) -> Vec<Job> {
+        let mut workers = lock(&self.state);
+        let stalled = !workers.jobs.is_empty() && workers.idle == 0 && workers.taken == *taken;
+        *taken = workers.taken;
+        if stalled && !self.start(&mut workers) && workers.running == 0 {
+            return workers.jobs.drain(..).collect();
+        }
+        Vec::new()
+    }
+
+    fn work(&self) {
+        let mut workers = lock(&self.state);
+        loop {
+            if let Some(job) = workers.jobs.pop_front() {
+                workers.taken += 1;
+                drop(workers);
+                job.run();
+                workers = lock(&self.state);
+                continue;
+            }
+            workers.idle += 1;
+            let (back, waited) = self.ready.wait_timeout(workers, IDLE_EXIT).unwrap_or_else(|e| e.into_inner());
+            workers = back;
+            workers.idle -= 1;
+            if waited.timed_out() && workers.jobs.is_empty() {
+                workers.running -= 1;
+                return;
+            }
         }
     }
 }
@@ -1659,6 +1875,106 @@ mod tests {
         // Its delay passes without it running.
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(*lock(&EVENTS), ["canceled", "terminated"]);
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// Waits up to `limit` for `done`.
+    fn wait_for(limit: Duration, done: impl Fn() -> bool) -> bool {
+        let start = Instant::now();
+        while !done() {
+            if start.elapsed() > limit {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        true
+    }
+
+    #[test]
+    fn delayed_callbacks_come_by_deadline_then_in_order() {
+        static ORDER: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        extern "system" fn note(context: *mut c_void, canceled: bool) {
+            // (No assertion here: a panic cannot leave an `extern "system"` call.)
+            lock(&ORDER).push(context as usize + if canceled { 100 } else { 0 });
+        }
+        // A manual port: callbacks are queued in the order delivered.
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        for (context, delay) in [(1, 90), (2, 30), (3, 60), (4, 30), (5, 30)] {
+            assert_eq!(XTaskQueueSubmitDelayedCallback(q, WORK, delay, context as *mut c_void, Some(note)), S_OK);
+        }
+        for _ in 0..5 {
+            assert!(XTaskQueueDispatch(q, WORK, 5000));
+        }
+        assert_eq!(*lock(&ORDER), [2, 4, 5, 3, 1]);
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn terminating_one_queue_cancels_its_delayed_callbacks_alone() {
+        static RAN: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
+        extern "system" fn note(context: *mut c_void, canceled: bool) {
+            lock(&RAN).push((context as usize, canceled));
+        }
+        let (mut a, mut b) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueCreate(3, 3, &mut a), S_OK);
+        assert_eq!(XTaskQueueCreate(3, 3, &mut b), S_OK);
+        for context in [1, 2, 3] {
+            assert_eq!(XTaskQueueSubmitDelayedCallback(a, WORK, 40, context as *mut c_void, Some(note)), S_OK);
+        }
+        assert_eq!(XTaskQueueSubmitDelayedCallback(b, COMPLETION, 40, 4 as *mut c_void, Some(note)), S_OK);
+        assert_eq!(XTaskQueueTerminate(a, true, std::ptr::null_mut(), None), S_OK);
+        assert_eq!(*lock(&RAN), [(1, true), (2, true), (3, true)]);
+        assert!(wait_for(Duration::from_secs(5), || lock(&RAN).len() == 4));
+        // The canceled ones' deadlines pass without them running again.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(*lock(&RAN), [(1, true), (2, true), (3, true), (4, false)]);
+        XTaskQueueCloseHandle(a);
+        XTaskQueueCloseHandle(b);
+    }
+
+    /// A waits for what B, due later, does: B still runs.
+    #[test]
+    fn a_blocked_delayed_callback_holds_up_no_other() {
+        static B_RAN: AtomicBool = AtomicBool::new(false);
+        static A_SAW: Mutex<Option<bool>> = Mutex::new(None);
+        extern "system" fn a(_: *mut c_void, _: bool) {
+            // Gives up after a while, so that the test fails, not hangs.
+            let saw = wait_for(Duration::from_secs(5), || B_RAN.load(Ordering::SeqCst));
+            *lock(&A_SAW) = Some(saw);
+        }
+        extern "system" fn b(_: *mut c_void, _: bool) {
+            B_RAN.store(true, Ordering::SeqCst);
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(3, 3, &mut q), S_OK);
+        let none = std::ptr::null_mut();
+        assert_eq!(XTaskQueueSubmitDelayedCallback(q, WORK, 10, none, Some(a)), S_OK);
+        assert_eq!(XTaskQueueSubmitDelayedCallback(q, WORK, 60, none, Some(b)), S_OK);
+        assert!(wait_for(Duration::from_secs(10), || lock(&A_SAW).is_some()), "A never ran");
+        assert_eq!(*lock(&A_SAW), Some(true), "B never ran while A waited");
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn many_delayed_callbacks_share_a_few_threads() {
+        const N: usize = 10_000;
+        static THREADS: Mutex<Option<std::collections::HashSet<std::thread::ThreadId>>> = Mutex::new(None);
+        static DONE: AtomicUsize = AtomicUsize::new(0);
+        extern "system" fn note(_: *mut c_void, _: bool) {
+            lock(&THREADS).get_or_insert_default().insert(std::thread::current().id());
+            DONE.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(3, 3, &mut q), S_OK);
+        for i in 0..N {
+            let delay = 1 + (i % 20) as u32;
+            assert_eq!(XTaskQueueSubmitDelayedCallback(q, WORK, delay, std::ptr::null_mut(), Some(note)), S_OK);
+        }
+        assert!(wait_for(Duration::from_secs(10), || DONE.load(Ordering::SeqCst) == N), "{} of {N} ran", DONE.load(Ordering::SeqCst));
+        // Immediate ports run them on the delivery workers: a few.
+        let threads = lock(&THREADS).as_ref().map_or(0, |t| t.len());
+        assert!((1..=32).contains(&threads), "{threads} threads");
         XTaskQueueCloseHandle(q);
     }
 }

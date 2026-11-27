@@ -153,8 +153,23 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
-    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
+    if walls_trace() > 0 {
+        walls_files().push((file as usize, kept));
+    }
     put(out, file)
+}
+
+/// [`release`] of a file object, which the walls trace forgets first: the
+/// address may be another file's the moment it is free.
+extern "system" fn release_file(this: *mut Instance<File>) -> u32 {
+    // SAFETY: an instance we created and the title still holds.
+    let left = unsafe { &*this }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    if left == 0 {
+        walls_files().retain(|f| f.0 != this as usize);
+        // SAFETY: the last reference; created by `Instance::create`.
+        drop(unsafe { Box::from_raw(this) });
+    }
+    left
 }
 
 /// `(capacity, name, iid, out)`.
@@ -450,7 +465,7 @@ fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Re
 static FILE_VTABLE: Methods<8> = Methods([
     missing::<0> as *const (),
     add_ref_instance::<File> as *const (),
-    release::<File> as *const (),
+    release_file as *const (),
     missing::<3> as *const (),
     missing::<4> as *const (),
     missing::<5> as *const (),
@@ -650,9 +665,13 @@ fn walls_trace() -> u8 {
     })
 }
 
-/// The files opened, by the address of our file object, with their paths
-/// (for the walls trace: a request names its file by that address).
+/// The files open while the walls trace is on, by the address of our file
+/// object, with their paths (a request names its file by that address).
 static WALLS_FILES: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+
+fn walls_files() -> MutexGuard<'static, Vec<(usize, String)>> {
+    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// The walls trace's line for a request that is done.
 fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::time::Instant) {
@@ -663,7 +682,7 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     let file = if request.options & MEMORY_SOURCE != 0 {
         "memory".to_string()
     } else {
-        let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        let files = walls_files();
         let source = request.source as usize;
         files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
     };
@@ -2624,5 +2643,24 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn the_walls_trace_keeps_open_files_alone() {
+        let known = |file: *mut c_void| walls_files().iter().any(|f| f.0 == file as usize);
+        // The trace is off in tests: an open file is not noted.
+        let (_dir, file) = file_with(&[1, 2, 3]);
+        assert_eq!(walls_trace(), 0);
+        assert!(!known(file));
+        // Noted as with the trace on, it is forgotten with its last release.
+        walls_files().push((file as usize, "data.bin".into()));
+        let add_ref: extern "system" fn(*mut c_void) -> u32 = call(file, 0x8);
+        let release: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        assert_eq!(add_ref(file), 2);
+        assert_eq!(release(file), 1);
+        assert!(known(file), "still open");
+        let address = file as usize;
+        assert_eq!(release(file), 0);
+        assert!(!walls_files().iter().any(|f| f.0 == address));
     }
 }
