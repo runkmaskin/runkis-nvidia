@@ -150,6 +150,91 @@ fn render_scale_patches(base: usize, scale: f32, fsr: bool) -> Vec<OwnedPatch> {
     patches
 }
 
+/// Environment variable that enlarges the two memory pools the title sizes
+/// for the Series S and which run out above a render height of 768 lines: a
+/// factor (`1.5`, up to 16) or the graphics pool's size in MiB (`2200`,
+/// above 16); the page pool grows by the same factor. Off by default.
+pub(crate) const TITLE_POOL_ENV: &str = "VICTORY_TITLE_POOL";
+
+/// At start-up the title reserves its memory pools from a read-only table
+/// of sizes, one row per console (Series S when the device type is 6, else
+/// Series X). Its third pool is write-combined graphics memory, which GPU
+/// buffers come from. On Series S it is 1277 MiB; above 768 lines the
+/// title runs out of it, calls its out-of-memory handler and stops at an
+/// int3. This is that entry's RVA in the Series S row: the title reads it
+/// once, before it reserves the pool. Nothing in the title derives a size
+/// from what the layer reports as title memory; the row goes by device type.
+const SERIES_S_GRAPHICS_POOL: usize = 0x6186268;
+/// The size the Series S row asks for (Series X asks for 2199 MiB).
+const SERIES_S_GRAPHICS_POOL_BYTES: u64 = 0x4fd0_0000;
+/// The title also allocates physical 64 KiB pages at start-up
+/// (`XMemAllocatePhysicalPages`) and maps them under GPU resources later.
+/// The count is an immediate chosen by device type: `mov eax, 4752` (297
+/// MiB; Series X 11360). What it maps grows with the render height (432 MiB
+/// at 1080 lines), and the title checks that against the count with an
+/// int3. This is that `mov`.
+const SERIES_S_PAGE_POOL: usize = 0x1d488ac;
+/// Series S's count of 64 KiB pages.
+const SERIES_S_PAGE_POOL_PAGES: u32 = 0x1290;
+/// The title turns the count into bytes with a 32-bit shift, so it stays
+/// below 2^16 pages (4 GiB).
+const PAGE_POOL_MOST: u32 = 0xffff;
+/// Graphics pool sizes are rounded up to this: the title hands the pool out
+/// in 128 KiB blocks, and 2 MiB keeps large pages possible.
+const POOL_ROUNDING: u64 = 2 << 20;
+/// No more than 16 GiB: the pools share the space below 2^40 with the
+/// title's other reservations, and the host has to commit it all.
+const POOL_MOST: u64 = 16 << 30;
+
+/// The graphics pool size `VICTORY_TITLE_POOL` asks for, in bytes, rounded
+/// up to [`POOL_ROUNDING`]. A plain number up to 16 is a factor of the
+/// Series S size, a larger one is MiB. Shrinking is refused: the title would
+/// only run out sooner.
+fn parse_pool(text: &str) -> Option<u64> {
+    let v: f64 = text.trim().parse().ok()?;
+    if !v.is_finite() {
+        return None;
+    }
+    let bytes = if v <= 16.0 {
+        v * SERIES_S_GRAPHICS_POOL_BYTES as f64
+    } else {
+        v * (1u64 << 20) as f64
+    };
+    if !(SERIES_S_GRAPHICS_POOL_BYTES as f64..=POOL_MOST as f64).contains(&bytes) {
+        return None;
+    }
+    // POOL_MOST is a multiple of the rounding, so rounding up stays within it.
+    Some((bytes as u64).div_ceil(POOL_ROUNDING) * POOL_ROUNDING)
+}
+
+/// The page count that grows the page pool as the graphics pool grew to
+/// `bytes`, rounded up.
+fn page_pool_pages(bytes: u64) -> u32 {
+    let pages = (u64::from(SERIES_S_PAGE_POOL_PAGES) * bytes).div_ceil(SERIES_S_GRAPHICS_POOL_BYTES);
+    pages.min(u64::from(PAGE_POOL_MOST)) as u32
+}
+
+/// The patches that give the Series S graphics pool `bytes` and its page
+/// pool as many more pages.
+fn title_pool_patches(bytes: u64) -> [OwnedPatch; 2] {
+    let mut mov = vec![0xB8];
+    mov.extend_from_slice(&page_pool_pages(bytes).to_le_bytes());
+    [
+        OwnedPatch {
+            what: "title pool: Series S graphics pool size",
+            rva: SERIES_S_GRAPHICS_POOL,
+            expect: SERIES_S_GRAPHICS_POOL_BYTES.to_le_bytes().to_vec(),
+            new: bytes.to_le_bytes().to_vec(),
+        },
+        OwnedPatch {
+            what: "title pool: Series S physical page count",
+            rva: SERIES_S_PAGE_POOL,
+            // mov eax, 0x1290
+            expect: vec![0xB8, 0x90, 0x12, 0x00, 0x00],
+            new: mov,
+        },
+    ]
+}
 /// The scale `VICTORY_RENDER_SCALE` asks for, if valid.
 fn parse_scale(text: &str) -> Option<f32> {
     let v: f32 = text.trim().parse().ok()?;
@@ -164,7 +249,8 @@ fn parse_scale(text: &str) -> Option<f32> {
 pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usize {
     let scale = std::env::var(RENDER_SCALE_ENV).ok();
     let own = std::env::var_os(OWN_UPSCALER_ENV).is_some_and(|v| v != "0");
-    if scale.is_none() && !own {
+    let pool = std::env::var(TITLE_POOL_ENV).ok().filter(|v| v.trim() != "0");
+    if scale.is_none() && !own && pool.is_none() {
         return 0;
     }
     // Every image the loader maps comes here (the title's DLLs too); only
@@ -194,6 +280,35 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
                 }
             }
             None => tracing::warn!(text, "{RENDER_SCALE_ENV} wants a number in 0.2..=1.0"),
+        }
+    }
+    if let Some(text) = pool {
+        match parse_pool(&text) {
+            Some(bytes) => {
+                for p in title_pool_patches(bytes) {
+                    let p = Patch {
+                        what: p.what,
+                        rva: p.rva,
+                        expect: &p.expect,
+                        new: &p.new,
+                    };
+                    // SAFETY: forwarded from this function's contract. The
+                    // table entry is read-only data; `apply` makes it
+                    // writable for the copy.
+                    applied += usize::from(unsafe { apply(base, &p) });
+                }
+                // Series X's sizes are left alone, so on that profile this
+                // changes nothing.
+                tracing::info!(
+                    graphics_mib = bytes >> 20,
+                    page_mib = u64::from(page_pool_pages(bytes)) >> 4,
+                    "{TITLE_POOL_ENV}: Series S pools"
+                );
+            }
+            None => tracing::warn!(
+                text,
+                "{TITLE_POOL_ENV} wants a factor (1..=16) or MiB (1277..=16384) of the Series S graphics pool"
+            ),
         }
     }
     applied
@@ -247,6 +362,70 @@ mod tests {
         assert_eq!(p[2].new, [0xC5, 0xFA, 0x10, 0x05, 0x22, 0x78, 0x6D, 0x03]);
         assert_eq!(p[3].new, ((base + 0x28ef680) as u64).to_le_bytes());
         assert!(p.iter().all(|p| p.new.len() == p.expect.len()));
+    }
+
+    #[test]
+    fn pool_sizes_are_factors_or_mib_and_never_shrink() {
+        let s = SERIES_S_GRAPHICS_POOL_BYTES;
+        assert_eq!(parse_pool("1"), Some(s.div_ceil(POOL_ROUNDING) * POOL_ROUNDING));
+        assert_eq!(parse_pool(" 2 "), Some(2 * s));
+        assert_eq!(parse_pool("2200"), Some(2200 << 20));
+        // 2199 MiB (Series X's size) is rounded up to 2 MiB.
+        assert_eq!(parse_pool("2199"), Some(2200 << 20));
+        assert_eq!(parse_pool("16384"), Some(16 << 30));
+        assert_eq!(parse_pool("0.5"), None);
+        assert_eq!(parse_pool("1000"), None);
+        assert_eq!(parse_pool("16385"), None);
+        assert_eq!(parse_pool("NaN"), None);
+        assert_eq!(parse_pool("big"), None);
+        assert!(parse_pool("1.7").is_some_and(|b| b % POOL_ROUNDING == 0));
+    }
+
+    #[test]
+    fn the_page_pool_grows_with_the_graphics_pool() {
+        assert_eq!(page_pool_pages(SERIES_S_GRAPHICS_POOL_BYTES), SERIES_S_PAGE_POOL_PAGES);
+        assert_eq!(page_pool_pages(2 * SERIES_S_GRAPHICS_POOL_BYTES), 2 * SERIES_S_PAGE_POOL_PAGES);
+        // Rounded up: never fewer pages than the factor asks for.
+        assert_eq!(page_pool_pages(SERIES_S_GRAPHICS_POOL_BYTES + 1), SERIES_S_PAGE_POOL_PAGES + 1);
+        // The largest graphics pool stays under the title's 32-bit shift.
+        assert!(page_pool_pages(POOL_MOST) < PAGE_POOL_MOST);
+        assert_eq!(page_pool_pages(u64::MAX / 0x2000), PAGE_POOL_MOST);
+    }
+
+    /// `apply` on a synthetic copy of `p`'s site: written when the bytes are
+    /// the expected ones, left alone otherwise. Returns what the site holds.
+    fn patch_site(p: &OwnedPatch, site: &[u8]) -> (bool, Vec<u8>) {
+        let patch = Patch {
+            what: p.what,
+            rva: p.rva,
+            expect: &p.expect,
+            new: &p.new,
+        };
+        let mut site = site.to_vec();
+        // A fake image base that puts the RVA on the buffer.
+        let base = (site.as_mut_ptr() as usize).wrapping_sub(p.rva);
+        // SAFETY: base + rva is `site`, as long as the expected bytes.
+        let done = unsafe { apply(base, &patch) };
+        (done, site)
+    }
+
+    #[test]
+    fn pool_patches_check_their_sites_before_writing() {
+        let [size, count] = title_pool_patches(2 * SERIES_S_GRAPHICS_POOL_BYTES);
+        assert_eq!(size.expect, [0x00, 0x00, 0xD0, 0x4F, 0, 0, 0, 0]);
+        let (done, now) = patch_site(&size, &size.expect);
+        assert!(done);
+        assert_eq!(u64::from_le_bytes(now.try_into().unwrap()), 2 * SERIES_S_GRAPHICS_POOL_BYTES);
+        // mov eax, 0x2520: twice the pages, the instruction's length kept.
+        let (done, now) = patch_site(&count, &count.expect);
+        assert!(done);
+        assert_eq!(now, [0xB8, 0x20, 0x25, 0x00, 0x00]);
+        // Another build, or an entry already changed: untouched.
+        for p in [&size, &count] {
+            let mut other = p.expect.clone();
+            other[1] ^= 1;
+            assert_eq!(patch_site(p, &other), (false, other));
+        }
     }
 
     #[test]
