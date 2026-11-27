@@ -49,6 +49,9 @@ $settings = @{
     # local: the title's 30 fps lock (33,333 us frame interval) lifted to 60: 27.1 -> 35.5 fps at 540p in the same
     # stretch; the game keeps its speed at 60 (checked in play 2026-11-27)
     VICTORY_FRAME_INTERVAL_US = '16667'
+    # local: host copies of placed textures whose memory is gone let go after 2.5 s: peak commit 24.5 -> 24.0-24.1 GB in
+    # 5-minute runs, fps the same (27.4 vs 26.9, two runs each); the saving grows with play time
+    VICTORY_TEXTURE_UNMAPPED_GO = '1'
     # local: the mouse turns the camera (right stick), left button fires, right aims (gameinput.rs)
     VICTORY_MOUSE = '1'
     # Cheap picture fixes, on in both sets:
