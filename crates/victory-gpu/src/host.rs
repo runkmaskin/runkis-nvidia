@@ -445,6 +445,21 @@ pub(crate) fn submissions() -> (u64, u64) {
     (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire))
 }
 
+mod retire;
+
+/// Whether retired objects wait in queues kept apart per thread
+/// (`VICTORY_RETIRE_APART=1`; off: one queue, as before). See
+/// [`retire::Graves`]: when an object goes is as before or a little
+/// sooner where threads overtook each other, never before the submissions
+/// it waits for finished.
+fn retire_apart() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RETIRE_APART").is_some_and(|v| v == "1"))
+}
+
+/// The queues of [`retire_apart`].
+static GRAVES: retire::Graves<Retired> = retire::Graves::new();
+
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
@@ -454,6 +469,11 @@ pub(crate) fn retire<T: 'static>(object: T) {
     if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
+        return;
+    }
+    if retire_apart() {
+        // (Counted in its queue, and into `RETIREMENTS` at the next bury.)
+        GRAVES.push(started, Retired::Any(Box::new(object)));
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
@@ -470,6 +490,10 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
     if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
+        return;
+    }
+    if retire_apart() {
+        GRAVES.push(started, Retired::Resource(object));
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
@@ -492,6 +516,14 @@ fn bury_lag() -> u64 {
 /// those is dropped a little later than it could be.
 fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
+    if retire_apart() {
+        // Dropped outside the queues' locks, as below.
+        let mut done: Vec<Retired> = Vec::new();
+        let pushed = GRAVES.take(finished, &mut done);
+        RETIREMENTS[1].fetch_add(pushed, Ordering::Relaxed);
+        drop(done);
+        return;
+    }
     let done: Vec<(u64, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         let n = retired.iter().take_while(|(at, _)| *at <= finished).count();

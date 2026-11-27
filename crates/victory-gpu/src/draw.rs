@@ -534,16 +534,154 @@ impl<T> HeapRanges<T> {
         self.0[slot] = range;
     }
 
-    /// Forgets the slots of one of `parts` parts
-    /// (`HostHeap::buffer_slots_of`).
-    fn forget_part(&mut self, part: u32, parts: u32) {
-        self.0.iter_mut().skip(part as usize).step_by(parts as usize).for_each(|r| *r = None);
-    }
-
     fn ranges(&self) -> impl Iterator<Item = &(T, u64, u64)> {
         self.0.iter().flatten()
     }
+
+    /// [`HeapRanges::set`], and whether the slot holds another range than
+    /// it held (`same`: whether two copies are one).
+    fn put(&mut self, slot: u32, range: Option<(T, u64, u64)>, same: fn(&T, &T) -> bool) -> bool {
+        let changed = !alike(self.0.get(slot as usize).and_then(Option::as_ref), range.as_ref(), same);
+        self.set(slot, range);
+        changed
+    }
+
+    /// Forgets the slots of one of `parts` parts
+    /// (`HostHeap::buffer_slots_of`), giving what they held, in the part's
+    /// order, for [`HeapRanges::part_as`].
+    fn take_part(&mut self, part: u32, parts: u32) -> Vec<Option<(T, u64, u64)>> {
+        self.0.iter_mut().skip(part as usize).step_by(parts as usize).map(std::mem::take).collect()
+    }
+
+    /// Whether the part's slots hold what `before` ([`HeapRanges::take_part`])
+    /// says they held.
+    fn part_as(&self, part: u32, parts: u32, before: &[Option<(T, u64, u64)>], same: fn(&T, &T) -> bool) -> bool {
+        let mut now = self.0.iter().skip(part as usize).step_by(parts as usize);
+        let mut was = before.iter();
+        loop {
+            match (now.next(), was.next()) {
+                (None, None) => return true,
+                (a, b) => {
+                    if !alike(a.and_then(Option::as_ref), b.and_then(Option::as_ref), same) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
 }
+
+/// Whether two ranges of slots are the same.
+fn alike<T>(a: Option<&(T, u64, u64)>, b: Option<&(T, u64, u64)>, same: fn(&T, &T) -> bool) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.1 == b.1 && a.2 == b.2 && same(&a.0, &b.0),
+        _ => false,
+    }
+}
+
+/// Per host copy (by `key`), the span the picked views of a heap cover.
+type SpansOf<T> = crate::host::ByCopy<(T, u64, u64)>;
+
+/// What the heap pass keeps of a heap ([`RANGES`]).
+struct KeptOf<T> {
+    passes: u64,
+    ranges: HeapRanges<T>,
+    /// The spans made from `ranges` as they are now, and the views they
+    /// were made from: a pass that leaves every slot's range as it was
+    /// takes them as they are. (Each pass made them from all 72,000 slots
+    /// again, though most passes change a few slots or none.)
+    spans: Option<(std::sync::Arc<SpansOf<T>>, u32)>,
+}
+
+impl<T> Default for KeptOf<T> {
+    fn default() -> Self {
+        Self { passes: 0, ranges: HeapRanges(Vec::new()), spans: None }
+    }
+}
+
+/// The spans of `ranges` and the views counted, as the pass made them.
+fn spans_of<T: Clone>(ranges: &HeapRanges<T>, key: fn(&T) -> usize) -> (SpansOf<T>, u32) {
+    let mut spans = SpansOf::default();
+    let mut views = 0u32;
+    for (copy, from, to) in ranges.ranges() {
+        views += 1;
+        let span = spans.entry(key(copy)).or_insert_with(|| (copy.clone(), *from, *to));
+        span.1 = span.1.min(*from);
+        span.2 = span.2.max(*to);
+    }
+    (spans, views)
+}
+
+impl<T: Clone> KeptOf<T> {
+    /// One pass's bookkeeping: the slots it looks at (all of them, or with
+    /// `spread` the part that is this pass's and the written ones, or the
+    /// written ones alone), and what `look` found at each.
+    fn pass(
+        &mut self,
+        spread: bool,
+        all_slots: impl FnOnce() -> Vec<u32>,
+        part_slots: impl FnOnce(u32, u32) -> Vec<u32>,
+        changed: Vec<u32>,
+        look: impl FnOnce(&[u32]) -> Vec<(u32, Option<(T, u64, u64)>)>,
+        same: fn(&T, &T) -> bool,
+    ) -> Pass<T> {
+        let all = self.passes == 0 || (self.passes.is_multiple_of(HEAP_ROUND) && !spread);
+        let (part, parts) = ((self.passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
+        let mut before = None;
+        let slots = if all {
+            self.ranges.0.clear();
+            all_slots()
+        } else if spread {
+            // The written ones, and this pass's part of the others.
+            before = Some(self.ranges.take_part(part, parts));
+            let mut slots = part_slots(part, parts);
+            slots.extend(changed);
+            slots
+        } else {
+            changed
+        };
+        self.passes += 1;
+        // Whether a slot holds another range than before the pass. (The
+        // slots of a spread pass's part were forgotten: they are compared
+        // with what they held as a whole, below.)
+        let mut moved = all;
+        for (index, range) in look(&slots) {
+            let other = self.ranges.put(index, range, same);
+            moved |= other && (before.is_none() || index % parts != part);
+        }
+        if let Some(before) = &before {
+            moved |= !self.ranges.part_as(part, parts, before, same);
+        }
+        Pass { all, slots: slots.len(), moved, forgotten: before.unwrap_or_default() }
+    }
+
+    /// The spans of what the slots hold now and the views counted: those
+    /// of the pass before if no slot's range `moved` since.
+    fn spans(&mut self, moved: bool, key: fn(&T) -> usize) -> (std::sync::Arc<SpansOf<T>>, u32) {
+        if let Some((spans, views)) = self.spans.as_ref().filter(|_| !moved) {
+            return (spans.clone(), *views);
+        }
+        let (spans, views) = spans_of(&self.ranges, key);
+        let spans = std::sync::Arc::new(spans);
+        self.spans = Some((spans.clone(), views));
+        (spans, views)
+    }
+}
+
+/// What a pass found ([`KeptOf::pass`]).
+struct Pass<T> {
+    all: bool,
+    slots: usize,
+    /// Whether a slot's range moved.
+    moved: bool,
+    /// What the forgotten slots held: let go of outside the lock.
+    forgotten: Vec<Option<(T, u64, u64)>>,
+}
+
+#[cfg(test)]
+#[path = "draw/heap_pass_tests.rs"]
+mod heap_pass_tests;
 
 #[cfg(test)]
 mod heap_range_tests {
@@ -563,7 +701,7 @@ mod heap_range_tests {
         let parts = HEAP_ROUND as u32;
         for pass in 1..=HEAP_ROUND {
             let part = (pass % HEAP_ROUND) as u32;
-            ranges.forget_part(part, parts);
+            let _ = ranges.take_part(part, parts);
             for slot in (0..SLOTS).step_by(3).filter(|slot| slot % parts == part) {
                 assert!(ranges.0[slot as usize].is_none(), "slot {slot} not forgotten");
                 ranges.set(slot, Some(((), pass, pass)));
@@ -759,8 +897,8 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 /// copy is only made then. By number, not address: a heap made where a
 /// released one was starts afresh; and the entry goes with its heap
 /// ([`forget_heap`]), else the host copies it holds were never let go.
-type Ranges = HeapRanges<std::sync::Arc<crate::shadow::Shadow>>;
-static RANGES: std::sync::Mutex<Option<std::collections::HashMap<u64, (u64, Ranges)>>> = std::sync::Mutex::new(None);
+type Ranges = KeptOf<std::sync::Arc<crate::shadow::Shadow>>;
+static RANGES: std::sync::Mutex<Option<std::collections::HashMap<u64, Ranges>>> = std::sync::Mutex::new(None);
 
 /// The title heap whose host heap is numbered `serial` is gone: what the
 /// heap pass kept of it goes too.
@@ -790,26 +928,8 @@ pub(crate) fn heap_ranges_kept(serial: u64) -> bool {
 fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) -> Vec<crate::host::aside::Refresh> {
     let started = std::time::Instant::now();
     let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-    let (passes, ranges) = kept
-        .get_or_insert_with(Default::default)
-        .entry(host.serial())
-        .or_insert_with(|| (0, HeapRanges(Vec::new())));
+    let kept_here = kept.get_or_insert_with(Default::default).entry(host.serial()).or_default();
     let changed = host.buffer_changes();
-    let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
-    let slots = if all {
-        ranges.0.clear();
-        host.buffer_slots()
-    } else if heap_spread() {
-        // The written ones, and this pass's part of the others.
-        let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
-        ranges.forget_part(part, parts);
-        let mut slots = host.buffer_slots_of(part, parts);
-        slots.extend(changed);
-        slots
-    } else {
-        changed
-    };
-    *passes += 1;
     // Whether the device was there before the pass: a view that removes
     // it is named below.
     static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -845,51 +965,59 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         Some(((shadow, address, address + len), written))
     };
     // Some slots at a time, on several threads.
-    const AT_A_TIME: usize = 256;
-    let parts: Vec<&[u32]> = slots.chunks(AT_A_TIME).collect();
-    let found: Vec<std::sync::OnceLock<Vec<_>>> = parts.iter().map(|_| Default::default()).collect();
-    crate::land::each_view(false, parts.len(), &|n| {
-        let looked: Vec<_> = parts[n].iter().map(|&index| (index, look(index))).collect();
-        // (After each piece while the device lives: a cheap query.)
-        if alive
-            && let Some(why) = crate::descriptor::host::device_removed()
-            && !GONE.swap(true, Ordering::Relaxed)
-        {
-            let last: Vec<String> = parts[n]
-                .iter()
-                .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
-                .map(|s| s.chars().take(200).collect())
-                .collect();
-            tracing::error!(why, "the host device went while buffer views of the heap were made; perhaps one of: {last:#?}");
-            crate::host::log_removal_context();
-        }
-        let _ = found[n].set(looked);
-    });
-    for (index, shows) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
-        let range = shows.map(|(range, written)| {
-            if written {
-                unordered.push(range.clone());
+    let look_all = |slots: &[u32]| {
+        const AT_A_TIME: usize = 256;
+        let parts: Vec<&[u32]> = slots.chunks(AT_A_TIME).collect();
+        let found: Vec<std::sync::OnceLock<Vec<_>>> = parts.iter().map(|_| Default::default()).collect();
+        crate::land::each_view(false, parts.len(), &|n| {
+            let looked: Vec<_> = parts[n].iter().map(|&index| (index, look(index))).collect();
+            // (After each piece while the device lives: a cheap query.)
+            if alive
+                && let Some(why) = crate::descriptor::host::device_removed()
+                && !GONE.swap(true, Ordering::Relaxed)
+            {
+                let last: Vec<String> = parts[n]
+                    .iter()
+                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+                    .map(|s| s.chars().take(200).collect())
+                    .collect();
+                tracing::error!(why, "the host device went while buffer views of the heap were made; perhaps one of: {last:#?}");
+                crate::host::log_removal_context();
             }
-            range
+            let _ = found[n].set(looked);
         });
-        ranges.set(index, range);
-    }
+        found
+            .into_iter()
+            .filter_map(std::sync::OnceLock::into_inner)
+            .flatten()
+            .map(|(index, shows)| {
+                let range = shows.map(|(range, written)| {
+                    if written {
+                        unordered.push(range.clone());
+                    }
+                    range
+                });
+                (index, range)
+            })
+            .collect()
+    };
+    let Pass { all, slots, moved, forgotten } = kept_here.pass(
+        heap_spread(),
+        || host.buffer_slots(),
+        |part, parts| host.buffer_slots_of(part, parts),
+        changed,
+        look_all,
+        std::sync::Arc::ptr_eq,
+    );
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
     }
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
     // Per host copy, the span its picked views cover.
-    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
-    let mut views = 0u32;
-    for (shadow, from, to) in ranges.ranges() {
-        views += 1;
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
-        let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-        span.1 = span.1.min(*from);
-        span.2 = span.2.max(*to);
-    }
+    let (spans, views) = kept_here.spans(moved, |shadow| std::sync::Arc::as_ptr(shadow) as usize);
     drop(kept);
+    drop(forgotten);
     let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
     // Memory that is not write-watched is copied whole by every refresh.
     // It was once refreshed only every 120 frames (unmapped pages read
@@ -942,7 +1070,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     if u64::from(views) > seen + seen / 2 {
         LOGGED.store(u64::from(views), Ordering::Relaxed);
         tracing::info!(
-            slots = slots.len(),
+            slots,
             views,
             copies = spans.len(),
             mb = bytes >> 20,

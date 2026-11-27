@@ -400,6 +400,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
     rounds.0 += 1;
     let mine = rounds.0;
+    ROUND_ASKED_US.store(crate::host::now_us(), std::sync::atomic::Ordering::Relaxed);
     drop(rounds);
     SYNC_ROUNDS.1.notify_all();
     SyncedHeaps(Some(mine))
@@ -466,6 +467,12 @@ pub(crate) fn sync_heaps() {
         return;
     }
     let started = std::time::Instant::now();
+    // For a submission that waits (asked and not done), or early.
+    let for_submission = sync_aside() && {
+        let rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+        rounds.0 != rounds.1
+    };
+    let began_us = crate::host::now_us();
     let (mut pages, mut looked, mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut views, mut bytes) = (0u64, 0u64);
     let mut spent = [0u64; 3];
@@ -769,6 +776,51 @@ pub(crate) fn sync_heaps() {
         count.fetch_add(n, Relaxed);
     }
     SYNC_SHORT.fetch_add(short, Relaxed);
+    if sync_aside() {
+        if for_submission {
+            ROUNDS[0].fetch_add(1, Relaxed);
+            ROUNDS[1].fetch_add(micros, Relaxed);
+            ROUNDS[2].fetch_add(began_us.saturating_sub(ROUND_ASKED_US.load(Relaxed)), Relaxed);
+        } else {
+            ROUNDS[3].fetch_add(1, Relaxed);
+            ROUNDS[4].fetch_add(micros, Relaxed);
+        }
+    }
+}
+
+/// When the last round was asked for ([`crate::host::now_us`]).
+#[cfg(windows)]
+static ROUND_ASKED_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the last frame line, [`sync_heaps`]'s rounds on its thread: for
+/// submissions (begun while one waited), their microseconds, and the
+/// microseconds from the last ask to their beginning (an early round in
+/// front of them, or the thread not running); early rounds and their
+/// microseconds. Then the microseconds of [`make_waiting`].
+#[cfg(windows)]
+static ROUNDS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// With the frame line: where the submitting thread's wait at its end goes.
+#[cfg(windows)]
+fn rounds_line(frames: f64, waited_us: u64) {
+    let [asked, asked_us, late_us, early, early_us, waiting_us] =
+        [0, 1, 2, 3, 4, 5].map(|i| ROUNDS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
+    if asked + early == 0.0 {
+        return;
+    }
+    let per = |us: f64, n: f64| if n > 0.0 { us / n / 1e3 } else { 0.0 };
+    tracing::info!(
+        "the heaps' records' rounds per frame: {:.1} for submissions of {:.2} ms each, begun {:.2} ms after they were asked for; \
+         {:.1} early of {:.2} ms each; the submitting thread waited {:.2} ms for them and {:.2} ms making slots that waited for a \
+         texture (the two are its \"at the end waiting for the heaps' records\")",
+        asked / frames,
+        per(asked_us, asked),
+        per(late_us, asked),
+        early / frames,
+        per(early_us, early),
+        waited_us as f64 / 1e3 / frames,
+        waiting_us / 1e3 / frames,
+    );
 }
 
 /// Pages [`sync_heaps`] read in place of which a part could not be read
@@ -897,6 +949,7 @@ pub(crate) fn sync_line(frames: f64) {
     let jobs = [0, 1, 2].map(|i| SYNC_JOBS_NS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6 / frames);
     let quick = [0, 1].map(|i| host::SPANS_QUICK[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     let short = SYNC_SHORT.swap(0, std::sync::atomic::Ordering::Relaxed);
+    rounds_line(frames, waited);
     if pages == 0 {
         return;
     }
@@ -1569,6 +1622,13 @@ fn wait_for(resource: usize, handle: u64) {
 /// the thread that submits: a slot is read when a list runs.
 #[cfg(windows)]
 pub(crate) fn make_waiting() {
+    let began = std::time::Instant::now();
+    make_waiting_now();
+    ROUNDS[5].fetch_add(began.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(windows)]
+fn make_waiting_now() {
     let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
     for resource in made {
         let handles = WAITING

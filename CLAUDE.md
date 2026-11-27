@@ -95,7 +95,7 @@ Switches that are off by default and worth an A/B run (details in `docs/changes-
 `VICTORY_HEAP_SYNC_GPU=1`, `VICTORY_RELAY_COPY=1`, `VICTORY_FETCH_PARTS=4`, `VICTORY_PORT_DESCRIPTORS_APART=1`,
 `VICTORY_POOL_SETTLE=1`, `VICTORY_LIST_CLASSES=1`, `VICTORY_SHARE_PIPELINES=1`. The last three were on in early
 commits and are suspects for the extra frames over 100 ms that the first game comparison showed; measure them one
-at a time.
+at a time. Measurement-only switches for the next profile: `VICTORY_DRAW_PARTS=1`, `VICTORY_BACK_CENSUS=1`, `VICTORY_CROSS_WAIT=count`; more A/B candidates (`VICTORY_RETIRE_APART`, `VICTORY_LAND_SEGMENTS`, `VICTORY_AHEAD_GAP_KIB`, `VICTORY_POOL_PRIORITY`, `VICTORY_SET_CACHE`, `VICTORY_CALL_TIMES=0`) are in `docs/changes-2026-11-27.md`, `docs/heap-records.md` and `docs/copy-back.md`.
 
 ## Open work, in priority order
 
