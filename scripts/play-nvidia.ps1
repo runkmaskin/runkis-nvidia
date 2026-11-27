@@ -43,6 +43,9 @@ $settings = @{
     # local: measured in game on 8d8db49 (5500X3D, 2 runs each against all-off 16.98 fps): fetches in four parts
     # 17.63 fps (waiting for fetches 10.1 -> 7.5 ms); the pool settled once a second 17.43 fps, ahead in three queues in a row
     VICTORY_FETCH_PARTS = '4'; VICTORY_POOL_SETTLE = '1'
+    # local: measured in game 2026-11-27 (7800X3D, RTX 4070 SUPER, 540p, one run each, seconds 150-240): 25.95 fps,
+    # 1 % low 8.0, 5 frames over 100 ms -> 27.14 fps, 1 % low 14.0, none; heap-record wait 4.2 -> 2.8 ms
+    VICTORY_TABLE_CACHE = '1'; VICTORY_HEAP_ROUNDS_EARLY = '1'
     # local: the mouse turns the camera (right stick), left button fires, right aims (gameinput.rs)
     VICTORY_MOUSE = '1'
     # Cheap picture fixes, on in both sets:

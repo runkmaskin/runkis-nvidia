@@ -49,11 +49,12 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    let asked = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    let interval = interval_set().map_or(asked, |set| set.min(asked));
+    tracing::info!(?interval, ?asked, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -66,6 +67,22 @@ pub(crate) extern "system" fn set_interval(
         first,
     });
     S_OK
+}
+
+/// LOCAL: `VICTORY_FRAME_INTERVAL_US=<microseconds>` (unset: the title's): the shortest frame interval
+/// the title gets, in place of a longer one it asks for. The title asks for 33,333 us (30 fps) and in
+/// a 540p run 21 % of frames waited for that tick, 5.6 ms a frame on average. 16667 allows 60 fps,
+/// 1000 is as good as no limit. shortcut: a title that steps its world by the interval it asked for,
+/// not by the time that passed, would run fast; check the game's speed against a clock.
+fn interval_set() -> Option<Duration> {
+    static SET: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| {
+        std::env::var("VICTORY_FRAME_INTERVAL_US")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&us| us > 0)
+            .map(Duration::from_micros)
+    })
 }
 
 /// Device method: events are scheduled at every tick.
