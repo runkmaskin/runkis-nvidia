@@ -103,6 +103,13 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 /// and store). Not where a group barrier would wait for lanes that left, nor
 /// where two host waves of 32 stand for a console wave (they exchange, which
 /// takes all lanes).
+/// LOCAL: `VICTORY_LDS_LEAN=1` (off by default): the meetings `split_lds` adds only where an
+/// access could see the other host wave out of order (`Lower::lds_seen`).
+pub(crate) fn lds_lean() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_LEAN").is_some_and(|v| v == "1"))
+}
+
 /// LOCAL: `VICTORY_NAN_SCRUB=1` (off by default): see `Lower::scrub_nan`.
 pub(crate) fn nan_scrub() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -348,6 +355,11 @@ struct Lower<'a> {
     fence_only: HashSet<usize>,
     /// A group barrier before every LDS access (a console wave run as two host waves).
     split_lds: bool,
+    /// LOCAL (`VICTORY_LDS_LEAN=1`): with `split_lds`, the LDS accesses since the host waves
+    /// last met: bit 0 a read, bit 1 a write. A meeting is only needed before a read after a
+    /// write, or before a write after any access (both host waves run the same accesses in
+    /// the same order in a block every lane runs). Unknown (3) at a block's start.
+    lds_seen: u8,
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
@@ -1693,6 +1705,7 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             split_lds,
+            lds_seen: 3,
             lds_meet,
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
@@ -2413,8 +2426,10 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
+            self.lds_seen = 3;
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
                 self.lds_meeting();
+                self.lds_seen = 0;
             }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
@@ -2423,6 +2438,8 @@ impl<'a> Lower<'a> {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
                     }
+                    // (what a section does is not tracked)
+                    self.lds_seen = 3;
                     i = end;
                     continue;
                 }
@@ -5332,9 +5349,27 @@ impl<'a> Lower<'a> {
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
-            let void = self.s.t.void;
-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            let read = name.starts_with("ds_read");
+            let needed = !lds_lean() || if read { self.lds_seen & 2 != 0 } else { self.lds_seen != 0 };
+            if needed {
+                let mode = self.s.m.i32(meeting_mode());
+                let void = self.s.t.void;
+                self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                self.lds_seen = 0;
+            }
+            self.lds_seen |= if read { 1 } else { 2 };
+        }
+        if name == "s_barrier" && !self.no_barrier.contains(&b) {
+            // (a title barrier that waits for the group is a meeting too; one that does not,
+            // and anything else, leaves what was seen as it is)
+            let waits = match super::group_sync() {
+                0 => false,
+                1 => !self.fence_only.contains(&b),
+                _ => true,
+            };
+            if waits && matches!(inst.fields, Fields::Sopp { .. }) {
+                self.lds_seen = 0;
+            }
         }
         // The structure builder's threads take turns through atomics (a tree
         // built from its leaves up): what one wrote before its atomic is

@@ -23,7 +23,8 @@ param(
     [ValidateSet('2160', '1440', '1080', '720', '540', '480')][string]$Resolution,
     [string]$Adapter,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [hashtable]$More = @{}
+    [hashtable]$More = @{},
+    [switch]$Precompile   # local: translate every shader with these exact settings (cache warm), no run
 )
 $settings = @{
     # This fork's play set (scripts\play.ps1, not -Safe): the speed set.
@@ -122,5 +123,6 @@ foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 $Exe = (Resolve-Path $Exe).Path
 $runArgs = @('run', $Exe, '--execute')
 if (-not $SeriesX) { $runArgs += @('--console', 'series-s') }
+if ($Precompile) { $runArgs = @('shaders', (Split-Path $Exe)) }
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try { & $victory @runArgs } finally { Pop-Location }

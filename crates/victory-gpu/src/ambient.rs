@@ -488,6 +488,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = 0.04f32.to_bits();
     words[9] = most().to_bits();
     words[10] = air().to_bits();
+    words[11] = steady().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
