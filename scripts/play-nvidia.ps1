@@ -58,6 +58,10 @@ $settings = @{
     VICTORY_TEXTURE_MIP_DROP = '1'; VICTORY_TEXTURE_MIP_DROP_MIN_SIZE = '2048'
     # local: 6 threads for the big memory compares on a 12-thread CPU, not 3 (foxhound f502018)
     VICTORY_WIDE_THREADS = '6'
+    # local: when free RAM falls under 4 GB, pool pages the title gave back are dropped from RAM (foxhound d2de2ea,
+    # from Yaekai): idle on a PC with room, keeps a full 32 GB PC from paging (4-5 fps seen on one). Forced on always
+    # in test Q7 it cost re-loads; at the default threshold it does nothing until RAM is short.
+    VICTORY_POOL_DISCARD = '1'
     # local: write down every pipeline the title creates (pipeline/known.rs), so -Warm can build them all into the
     # driver's cache before play: fewer hitches the first time a place is seen.
     VICTORY_PIPELINE_BOOK = '1'
