@@ -52,6 +52,9 @@ $settings = @{
     # local: host copies of placed textures whose memory is gone let go after 2.5 s: peak commit 24.5 -> 24.0-24.1 GB in
     # 5-minute runs, fps the same (27.4 vs 26.9, two runs each); the saving grows with play time
     VICTORY_TEXTURE_UNMAPPED_GO = '1'
+    # local: programs the shader validator refused (all their draws dropped) now validate: 41 with mixed interpolation
+    # in a signature row, 3 alpha-clip materials with a level query on an array; game run: nothing new refused, same fps
+    VICTORY_SIG_ROWS = '1'; VICTORY_LOD_ARRAY = '1'
     # local: the mouse turns the camera (right stick), left button fires, right aims (gameinput.rs)
     VICTORY_MOUSE = '1'
     # Cheap picture fixes, on in both sets:

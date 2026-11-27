@@ -160,11 +160,11 @@ public class ThisPcPresetTests
     [Fact]
     public void A_bigger_pc_keeps_the_measured_set()
     {
-        // Nothing measured says a 12 GB card or 16 threads want other values: the measured ones stay (a 3 GB
-        // render-target reserve and full-size textures had made frames worse).
+        // A 12 GB card gets full-size textures (measured on one: about 50 MB more of the card, same fps); the rest
+        // stays as measured (a 3 GB render-target reserve had made frames worse).
         var preset = Presets.ForThisPc([Card(0, "NVIDIA GeForce RTX 4070 SUPER", 12)], Pc(16, 32), null);
         var p = Presets.Make(preset, new LaunchProfile { GameExe = "x.exe" });
-        Assert.Null(p.MipDrop);
+        Assert.Equal(0, p.MipDrop);
         Assert.Null(p.TargetRoomMb);
         Assert.Null(p.WideThreads);
         Assert.Equal(540, p.Resolution);

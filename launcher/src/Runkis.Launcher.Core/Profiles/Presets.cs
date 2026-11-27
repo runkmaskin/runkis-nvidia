@@ -62,6 +62,13 @@ public static class Presets
             (resolution, mipDrop, mipMin) = (480, 1, 1024);
             why.Add($"{gb:0.#} GB of video memory: 480p and smaller large textures, so the card does not run out");
         }
+        else if (gb >= 11)
+        {
+            // Measured on a 12 GB RTX 4070 SUPER (2026-11-27, 540p, prison route): full-size textures took about
+            // 50 MB more of the card (7.6 of 11.2 GB in use), fps the same.
+            mipDrop = 0;
+            why.Add($"{gb:0} GB of video memory: full-size textures (measured: about 50 MB more on a 12 GB card)");
+        }
         else if (gb > 0)
             why.Add($"{gb:0} GB of video memory: the video-memory settings as measured");
         // The measured set kept 6 of 12 threads for the big memory compares. Fewer threads: half of them; 12 and more:
