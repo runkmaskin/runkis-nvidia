@@ -1712,55 +1712,6 @@ impl PlanePass {
 /// heap, graphics root signature, pipeline, depth target, viewport,
 /// scissor and topology and puts none of them back: it is for a list that
 /// records nothing of the title's after it.
-/// Whether a depth plane whose twin shaders wrote is drawn from the twin
-/// before the next draw or dispatch, in the middle of the list
-/// (`VICTORY_PLANE_NOW=1`; off by default: when the list closes).
-///
-/// Why: a depth-stencil texture that shaders also write (the strand hair
-/// is drawn into the depth by a compute program) keeps a colour twin for
-/// those writes. Its depth plane cannot be copied from the twin; a pass of
-/// ours draws it, and that pass ran only when the list closed. A draw that
-/// tests against the depth later in the same list saw the plane without
-/// what the shaders wrote: in the prologue's cell the window's glass was
-/// drawn over the character's hair, cut off at a sharp edge. The frame line
-/// counts it: "times used before the pass", about one a frame in the world
-/// (a game run with the pass only before draws that bind the plane as their
-/// depth target found none: the uses are shaders reading the depth). With
-/// the switch the pass runs before the next draw or dispatch; it leaves its own
-/// pipeline and target set, so the draw's state is set again on the host
-/// list as for a list cut in two (`crate::draw::State::replay`).
-pub(crate) fn planes_now() -> bool {
-    #[cfg(test)]
-    if PLANES_NOW_TEST.load(Ordering::Relaxed) > 0 {
-        return true;
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PLANE_NOW").is_some_and(|v| v == "1"))
-}
-
-/// Tests that run with [`planes_now`] on, at this moment.
-#[cfg(test)]
-static PLANES_NOW_TEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// [`planes_now`] on while it lives (tests).
-#[cfg(test)]
-pub(crate) struct PlanesNowForTest;
-
-#[cfg(test)]
-impl PlanesNowForTest {
-    pub(crate) fn on() -> PlanesNowForTest {
-        PLANES_NOW_TEST.fetch_add(1, Ordering::Relaxed);
-        PlanesNowForTest
-    }
-}
-
-#[cfg(test)]
-impl Drop for PlanesNowForTest {
-    fn drop(&mut self) {
-        PLANES_NOW_TEST.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
 fn record_plane_pass(
     list: &ID3D12GraphicsCommandList,
     depth: &ID3D12Resource,
@@ -8606,43 +8557,6 @@ impl HostList {
         true
     }
 
-    /// A draw or dispatch is about to be prepared ([`planes_now`]): every
-    /// depth texture with a depth plane whose twin shaders wrote in this
-    /// list since the plane was last drawn from it is brought up to date
-    /// here, and not when the list closes: the draw may test against the
-    /// plane, or its shaders read it (the depth a shader samples is not seen
-    /// until its tables are made, after its pipeline is set). True if a pass
-    /// was recorded: it set a pipeline, a root signature, heaps and a target
-    /// of ours, and the caller sets the title's again
-    /// (`crate::draw::State::replay`) before it binds.
-    pub(crate) fn planes_pending(&self) -> bool {
-        if !planes_now() {
-            return false;
-        }
-        let due: Vec<_> = {
-            let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
-            twins
-                .values_mut()
-                .filter(|u| u.behind[0] == Some(true) && u.twin.plane.is_some())
-                .map(|u| {
-                    // The depth side is brought up to date here, whole: the
-                    // next use (`twin_use`) finds nothing left to copy.
-                    u.behind[0] = Some(false);
-                    u.late = false;
-                    (u.depth.clone(), u.twin.clone())
-                })
-                .collect()
-        };
-        for (depth, twin) in &due {
-            // What the twin holds besides the plane (the stencil), as any
-            // use copies it; then the plane's own pass.
-            self.twin_copy(depth, twin, false);
-            self.pass_plane(depth, twin);
-            crate::resource::PLANES[3].fetch_add(1, Ordering::Relaxed);
-        }
-        !due.is_empty()
-    }
-
     /// Records the pass that draws the twin of the depth plane of `depth`
     /// into the plane, if `twin` has one, with the moves to the states the
     /// pass needs; the twin is left in the unordered access state. Only
@@ -11351,14 +11265,6 @@ impl Meter {
                 tracing::info!(
                     "texture reads through the kernel that met a change of mapping, read again at the next refresh, per frame \
                      (VICTORY_TEXTURE_RECHECK=1): {rechecked:.1}"
-                );
-            }
-            let now = crate::resource::PLANES[3].load(Ordering::Relaxed);
-            if now > 0 {
-                tracing::info!(
-                    "depth planes drawn from their twins before the next draw or dispatch, since the start \
-                     (VICTORY_PLANE_NOW=1): {now}; left for the list's close although used before it: {}",
-                    crate::resource::PLANES[2].load(Ordering::Relaxed)
                 );
             }
             let bake = crate::texture::BAKE_WAITED.swap(0, Ordering::Relaxed);

@@ -388,12 +388,10 @@ pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] =
 /// frame-rate line; and since the start, how often a depth plane's twin
 /// lacked what was written to the plane (not given to it), and how often a
 /// depth plane was used in the list that had written its twin, before the
-/// pass (which runs when the list closes); and since the start, the passes
-/// drawn in the middle of a list instead, before the next draw or dispatch
-/// (`VICTORY_PLANE_NOW=1`).
+/// pass (which runs when the list closes).
 #[cfg(windows)]
-pub(crate) static PLANES: [std::sync::atomic::AtomicU64; 4] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub(crate) static PLANES: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// The colour twin of title texture `this`, if it has one.
 #[cfg(windows)]
@@ -4354,23 +4352,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_depth_planes_twin_is_drawn_into_the_plane() {
-        plane_drawn_into(false);
-    }
-
-    /// `VICTORY_PLANE_NOW`: a draw in the list whose shader wrote the twin
-    /// tests against the plane with what the shader wrote. Without the
-    /// switch the plane is drawn only when the list closes, and these draws
-    /// find the plane as it was (nothing is covered).
-    #[test]
-    fn a_depth_planes_twin_is_drawn_into_the_plane_before_a_draw_in_the_same_list() {
-        let _on = crate::host::PlanesNowForTest::on();
-        plane_drawn_into(true);
-    }
-
-    /// A shader writes class numbers into a depth plane's twin; then draws
-    /// at the depths of two classes test "equal" against the plane: in the
-    /// next list, or (`same_list`) in the same one.
-    fn plane_drawn_into(same_list: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
@@ -4546,21 +4527,12 @@ mod tests {
         host.execute(&[&fill]);
 
         // A list in which a shader writes the twins: closing it draws the
-        // depth plane's twin into the plane; or, in the same list, the next
-        // draw does (`planes_pending`).
+        // depth plane's twin into the plane.
         let list = host.new_list().unwrap();
         assert!(list.twin_use(depth, true, true));
         list.twins_written();
-        let back = if same_list {
-            assert!(list.planes_pending());
-            // Nothing is left for the next draw.
-            assert!(!list.planes_pending());
-            list
-        } else {
-            list.close();
-            host.execute(&[&list]);
-            host.new_list().unwrap()
-        };
+        list.close();
+        host.execute(&[&list]);
 
         // The draws: a triangle over the target at the depth of a class,
         // as the title's lighting places its rectangles.
@@ -4632,12 +4604,11 @@ float4 lit() : SV_Target { return 1.0; }
                 ..Default::default()
             }),
         );
+        let back = host.new_list().unwrap();
         // SAFETY: an open list and live resources and views.
         unsafe {
             let l = &back.list;
-            // (In the same list the pass left the depth texture in the
-            // depth-write state.)
-            if !same_list && state != tested {
+            if state != tested {
                 l.ResourceBarrier(&[moved(host_depth, state, tested)]);
             }
             l.ClearRenderTargetView(colour, &[0.0; 4], None);

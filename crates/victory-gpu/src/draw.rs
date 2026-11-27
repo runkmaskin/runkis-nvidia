@@ -1365,16 +1365,6 @@ impl State {
         }
     }
 
-    /// Before a draw or dispatch is bound: depth planes whose twins shaders
-    /// wrote in this list are drawn from them now (`crate::host::planes_now`),
-    /// so that this one tests against or reads what was written. That pass
-    /// leaves its own pipeline and target set: the title's are set again.
-    fn planes_first(&mut self, list: &HostList) {
-        if list.planes_pending() {
-            self.replay(list);
-        }
-    }
-
     /// The user-data value of a root argument, as translated shaders read
     /// it: a table's byte offset in its heap, a constant's value.
     fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
@@ -1553,7 +1543,6 @@ impl State {
             once!("a rectangle pipeline drawn with another topology");
         }
         parts::mark(Part::Pipeline);
-        self.planes_first(list);
         if !self.bind(list, p, false) {
             return false;
         }
@@ -3074,7 +3063,6 @@ impl State {
             return;
         }
         parts::mark(Part::Pipeline);
-        self.planes_first(list);
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -4505,10 +4493,7 @@ impl State {
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => {
-                self.planes_first(list);
-                self.bind(list, p, true)
-            }
+            DISPATCH => self.bind(list, p, true),
             _ => false,
         };
         if !ran {
