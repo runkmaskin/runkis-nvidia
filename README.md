@@ -5,8 +5,10 @@ Xbox Series title's own executable on Windows. This fork is based on
 [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA). It includes renderer ports from
 [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX), plus fixes taken from
 [louketa/foxhound](https://github.com/louketa/foxhound) and
-[Yaekai/victory-scarlett-3070](https://github.com/Yaekai/victory-scarlett-3070). Every change here was measured
-on the PC below before it was kept.
+[Yaekai/victory-scarlett-3070](https://github.com/Yaekai/victory-scarlett-3070). Every change up to 2026-11-26 was
+measured on the PC below before it was kept. The changes of 2026-11-27 (fixes, CPU work, the launcher; see the end of
+this page) are tested with the project's tests and offline benchmarks but **not yet measured in the game**: the
+results below are from before them.
 
 > **No game files are included.** You need your own copy of the title (Xbox Series build v1.0.2.1).
 > Not affiliated with or endorsed by the title's developer or publisher, nor by NVIDIA. GPL-3.0-or-later.
