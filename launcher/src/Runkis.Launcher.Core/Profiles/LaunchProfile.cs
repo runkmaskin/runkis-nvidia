@@ -60,6 +60,11 @@ public sealed class LaunchProfile
     public bool Mouse { get; set; } = true;
     /// <summary>VICTORY_MOUSE_SENSE, with <see cref="Mouse"/> only (1: 12 pixels in 8 ms is a full stick).</summary>
     public double MouseSense { get; set; } = 1.0;
+    /// <summary>
+    /// VICTORY_KEYMAP (gameinput.rs): pad target ("A", "LT", "LSUp", ...) to its keys ("C|Mouse1", "" for none),
+    /// see <see cref="KeyMap"/>. null, or a target left out: the layer's default.
+    /// </summary>
+    public Dictionary<string, string>? KeyMap { get; set; }
 
     // ---- Performance overrides (null: what the script sets) ----
     /// <summary>VICTORY_PIPELINE_WAIT_MS (pipeline/make.rs).</summary>

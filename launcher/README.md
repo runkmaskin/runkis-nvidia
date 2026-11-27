@@ -131,9 +131,9 @@ without focus. The format, exactly as the layer reads it:
   not including, `to`. Seconds are decimal numbers (`2.5`); spaces around them and the key are ignored.
 - A key is one letter or digit (either case), or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right`.
   These names are case-sensitive.
-- The keys are keyboard keys to the title, and they drive the keyboard's stand-in pad (`fallback()`): Enter A,
-  Back B, Esc Menu, Tab View, X X, Y Y, arrows the d-pad, Q/E the shoulders, F/H the stick clicks, W/A/S/D the
-  left stick, I/J/K/L the right stick, Z/C the triggers. By default (`VICTORY_ONE_PAD` unset) the title sees one
+- The keys are keyboard keys to the title, and they drive the keyboard's stand-in pad (`fallback()`) as the
+  Controls page binds them. By default: Enter A, Back B, Esc Menu, Tab View, X X, Y Y, arrows the d-pad, Q/E the
+  shoulders, F/H the stick clicks, W/A/S/D the left stick, I/J/K/L the right stick, Z/C the triggers. By default (`VICTORY_ONE_PAD` unset) the title sees one
   pad fed by the stand-in and every real pad, so all of these work with a pad connected too. With
   `VICTORY_ONE_PAD=0` and a real pad connected, only the buttons reach it (pad 0), not the sticks or triggers.
 - **The clock** starts when the title first opens its input (`GameInputCreate`), not when the process starts and
@@ -146,6 +146,38 @@ page warns about keys that come after the run is stopped (warm-up + measured) or
 `from`), and says whether any key is held during the measured window. The script's clock and the warm-up's
 (first picture) both start during start-up, at moments the launcher cannot see, so their offset is not known in
 advance: each run records when its first picture came after the process started, to fit a script after one trial.
+
+## Controls
+
+The Controls page sets what the keyboard and mouse press on the stand-in controller the layer gives the game (the
+keyboard's stand-in pad, `crates/victory-hle/src/modules/gameinput.rs`). With the default one-pad mode the game
+sees it merged with every real pad.
+
+- **The table.** One row per pad button, trigger and stick direction, named for the Xbox pad and the PS5
+  DualSense (A/Cross, B/Circle, X/Square, Y/Triangle, LB/L1, RB/R1, LT/L2, RT/R2, View/Create, Menu/Options,
+  LS click/L3, RS click/R3, the d-pad and both sticks' four directions). Each row has two key buttons.
+- **Rebinding.** Click a key button; it shows "press a key…". Press a key or a mouse button and it is bound. Esc
+  cancels (so Esc itself is bound back only by "Reset to defaults"). ✕ leaves the row without a key. A key on two
+  rows presses both; the page warns about it but allows it.
+- **Keys the layer reads:** letters, digits, Space, Enter, Esc, Tab, Backspace, the left Shift, Ctrl and Alt (the
+  right ones are not read), the arrows, F1-F12, and mouse buttons 1-5 (left, right, middle, back, forward). Mouse
+  buttons drive the pad only; the game never sees them as keyboard keys.
+- **Mouse camera** (`VICTORY_MOUSE`) and its sensitivity are here too. With it on, the defaults add left mouse to
+  RT, right mouse to LT and middle mouse to the RS click.
+- **Save** the profile to keep the bindings. They are stored in the profile as `KeyMap` (null: the defaults).
+  Presets keep your controls.
+
+The run gets `VICTORY_KEYMAP` only when the bindings differ from the defaults; with the defaults, nothing is set
+and the layer's mapping is exactly the old one. The value lists every target in order, keys joined by `|`:
+
+```
+VICTORY_KEYMAP=A=Space,B=Back,X=R,Y=F,LB=Q,RB=E,LT=Z|Mouse2,RT=C|Mouse1,View=Tab,Menu=Esc,LS=Shift,RS=H|Mouse3,Up=Up,Down=Down,Left=Left,Right=Right,LSUp=W,LSDown=S,LSLeft=A,LSRight=D,RSUp=I,RSDown=K,RSLeft=J,RSRight=L
+```
+
+The layer reads it once. Target and key names ignore case. A target it lists has only the keys listed (`Y=` none);
+a target left out keeps its default (with `VICTORY_MOUSE=1`, the mouse's roles included). An entry it does not
+understand is skipped with a warning in the log, and one info line gives the mapping in force. The tests check
+the launcher's names and defaults against the layer's own lists.
 
 ## Profiles
 

@@ -61,6 +61,8 @@ public static partial class ProfileValidator
         if (p.Dred == DredMode.Full)
             Add(nameof(p.Dred), "Full DRED cost an RTX 2070 SUPER 2-4x GPU time; use it only to find a device loss.", blocking: false);
 
+        issues.AddRange(KeyMap.Check(p));
+
         foreach (var (field, dir) in new[] { (nameof(p.CacheDir), p.CacheDir), (nameof(p.DataDir), p.DataDir) })
         {
             if (string.IsNullOrWhiteSpace(dir)) continue;

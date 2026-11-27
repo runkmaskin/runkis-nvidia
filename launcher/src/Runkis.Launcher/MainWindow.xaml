@@ -73,6 +73,7 @@
           <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Play" Command="{Binding Go}" CommandParameter="Play" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=0}"/>
           <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Benchmark" Command="{Binding Go}" CommandParameter="Benchmark" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=5}"/>
           <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Settings" Command="{Binding Go}" CommandParameter="Settings" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=1}"/>
+          <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Controls" Command="{Binding Go}" CommandParameter="Controls" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=6}"/>
           <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Diagnostics" Command="{Binding Go}" CommandParameter="Diagnostics" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=2}"/>
           <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="Logs" Command="{Binding Go}" CommandParameter="Logs" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=3}"/>
           <RadioButton Style="{StaticResource Nav}" GroupName="nav" Content="System" Command="{Binding Go}" CommandParameter="System" IsChecked="{Binding PageIndex, Mode=OneWay, Converter={StaticResource IsPage}, ConverterParameter=4}"/>
@@ -330,16 +331,7 @@
                   <StackPanel><TextBlock Text="Upscale sharpening"/><TextBlock Style="{StaticResource Hint}" Text="0-1, with the upscale only. 0: none; 0.3: light (default)."/></StackPanel>
                   <TextBox Grid.Column="1" Text="{Binding Profile.PresentSharpen, UpdateSourceTrigger=LostFocus}" VerticalAlignment="Center"/>
                 </Grid>
-                <Grid Style="{StaticResource Row}">
-                  <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
-                  <StackPanel><TextBlock Text="Mouse camera"/><TextBlock Style="{StaticResource Hint}" Text="The mouse turns the camera; left button fires, right aims, middle clicks the stick. The cursor is held in the game's window while it has focus (Alt+Tab to leave). VICTORY_MOUSE"/></StackPanel>
-                  <CheckBox Grid.Column="1" IsChecked="{Binding Profile.Mouse}" VerticalAlignment="Center"/>
-                </Grid>
-                <Grid Style="{StaticResource Row}">
-                  <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition Width="140"/><ColumnDefinition/></Grid.ColumnDefinitions>
-                  <StackPanel><TextBlock Text="Mouse sensitivity"/><TextBlock Style="{StaticResource Hint}" Text="0.1-10; 1 is the default. Higher turns faster."/></StackPanel>
-                  <TextBox Grid.Column="1" Text="{Binding Profile.MouseSense, UpdateSourceTrigger=LostFocus}" VerticalAlignment="Center"/>
-                </Grid>
+
                 <Grid Style="{StaticResource Row}">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
                   <StackPanel><TextBlock Text="Graphics card"/><TextBlock Style="{StaticResource Hint}" Text="Numbered in the order Windows lists them; the emulator uses the same order (VICTORY_ADAPTER)."/></StackPanel>
@@ -822,6 +814,76 @@
                     </DataTemplate>
                   </ListBox.ItemTemplate>
                 </ListBox>
+              </StackPanel>
+            </Border>
+          </StackPanel>
+        </ScrollViewer>
+      </TabItem>
+      <!-- ============================== CONTROLS ============================== -->
+      <TabItem>
+        <ScrollViewer VerticalScrollBarVisibility="Auto" DataContext="{Binding Controls}">
+          <StackPanel Margin="32,8,32,32" MaxWidth="980" HorizontalAlignment="Left">
+            <TextBlock Text="Controls" Style="{StaticResource H1}" Margin="0,0,0,6"/>
+            <TextBlock Style="{StaticResource Hint}" Margin="0,0,0,18" TextWrapping="Wrap">
+              The keyboard and mouse drive one stand-in controller, which the game sees together with any real pad.
+              Click a key to change it, then press a key or a mouse button (Esc cancels). Each button can have two keys.
+              Save the profile on the Settings page (or below) to keep the change.
+            </TextBlock>
+
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,16">
+              <StackPanel>
+                <TextBlock Text="Mouse" Style="{StaticResource H2}"/>
+                <Grid Style="{StaticResource Row}">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                  <StackPanel><TextBlock Text="Mouse camera"/><TextBlock Style="{StaticResource Hint}" TextWrapping="Wrap" Text="The mouse turns the camera (right stick). Its buttons are in the table: by default left fires (RT), right aims (LT), middle clicks the stick. The cursor is held in the game's window while it has focus (Alt+Tab to leave). VICTORY_MOUSE"/></StackPanel>
+                  <CheckBox Grid.Column="1" IsChecked="{Binding Mouse}" VerticalAlignment="Center"/>
+                </Grid>
+                <Grid>
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition Width="140"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                  <StackPanel><TextBlock Text="Mouse sensitivity"/><TextBlock Style="{StaticResource Hint}" Text="0.1-10; 1 is the default. Higher turns faster."/></StackPanel>
+                  <TextBox Grid.Column="1" Text="{Binding MouseSense, UpdateSourceTrigger=LostFocus}" VerticalAlignment="Center"/>
+                </Grid>
+              </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource CardBorder}" Margin="0,0,0,16">
+              <StackPanel>
+                <DockPanel Margin="0,0,0,10">
+                  <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                    <Button Content="Reset to defaults" Command="{Binding Reset}" Margin="0,0,8,0"/>
+                    <Button Style="{StaticResource Primary}" Content="Save profile" Command="{Binding DataContext.Save, RelativeSource={RelativeSource AncestorType=Window}}" Padding="18,7"/>
+                  </StackPanel>
+                  <TextBlock Text="Key bindings" Style="{StaticResource H2}" Margin="0" VerticalAlignment="Center"/>
+                </DockPanel>
+                <Grid Margin="0,0,0,6">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="200"/><ColumnDefinition Width="200"/><ColumnDefinition Width="170"/><ColumnDefinition Width="170"/><ColumnDefinition Width="Auto"/>
+                  </Grid.ColumnDefinitions>
+                  <TextBlock Text="XBOX" Style="{StaticResource Label}"/>
+                  <TextBlock Grid.Column="1" Text="PS5 (DUALSENSE)" Style="{StaticResource Label}"/>
+                  <TextBlock Grid.Column="2" Text="KEY" Style="{StaticResource Label}"/>
+                  <TextBlock Grid.Column="3" Text="SECOND KEY" Style="{StaticResource Label}"/>
+                </Grid>
+                <ItemsControl ItemsSource="{Binding Rows}">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                      <Border BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Padding="0,5">
+                        <Grid>
+                          <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="200"/><ColumnDefinition Width="200"/><ColumnDefinition Width="170"/><ColumnDefinition Width="170"/><ColumnDefinition Width="Auto"/>
+                          </Grid.ColumnDefinitions>
+                          <TextBlock Text="{Binding Xbox}" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                          <TextBlock Grid.Column="1" Text="{Binding Ps5}" Foreground="{StaticResource Muted}" VerticalAlignment="Center"/>
+                          <Button Grid.Column="2" Content="{Binding Key1}" Command="{Binding Bind1}" Margin="0,0,8,0" Padding="10,5" HorizontalContentAlignment="Center"/>
+                          <Button Grid.Column="3" Content="{Binding Key2}" Command="{Binding Bind2}" Margin="0,0,8,0" Padding="10,5" HorizontalContentAlignment="Center"/>
+                          <Button Grid.Column="4" Content="✕" Command="{Binding Clear}" ToolTip="No key for this button" Padding="10,5"/>
+                        </Grid>
+                      </Border>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <TextBlock Text="{Binding Summary}" Style="{StaticResource Hint}" TextWrapping="Wrap" Margin="0,10,0,0"/>
+                <TextBlock Text="{Binding Issues}" Foreground="{StaticResource Warn}" TextWrapping="Wrap" Margin="0,6,0,0" Visibility="{Binding Issues, Converter={StaticResource Vis}}"/>
               </StackPanel>
             </Border>
           </StackPanel>

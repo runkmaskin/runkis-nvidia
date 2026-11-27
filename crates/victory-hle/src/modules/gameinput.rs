@@ -1,6 +1,6 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
 //! (host slots 0-3); while none is connected, the keyboard drives one
-//! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
+//! stand-in gamepad (`DEFAULT_KEYMAP`, or `VICTORY_KEYMAP`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
 #![allow(non_snake_case)]
@@ -61,24 +61,267 @@ const DEVICES: usize = PADS + 2;
 const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
-/// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
-    (0x1B, MENU), // Esc
-    (0x09, VIEW), // Tab
-    (0x0D, A),    // Enter
-    (0x08, B),    // Backspace
-    (b'X', X),
-    (b'Y', Y),
-    (0x26, UP), // arrows
-    (0x28, DOWN),
-    (0x25, LEFT),
-    (0x27, RIGHT),
-    (b'Q', LEFT_SHOULDER),
-    (b'E', RIGHT_SHOULDER),
-    (b'F', LEFT_STICK),
-    (b'H', RIGHT_STICK),
+/// What a key drives on the keyboard's stand-in pad.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Target {
+    Button(u32),
+    LeftTrigger,
+    RightTrigger,
+    /// A stick (right: the right one) pushed one way: x, y of -1, 0 or 1.
+    Stick(bool, i8, i8),
+}
+
+/// The names `VICTORY_KEYMAP` gives the targets, in the launcher's order.
+/// The launcher's tests read this list.
+const TARGET_NAMES: [(&str, Target); 24] = [
+    ("A", Target::Button(A)),
+    ("B", Target::Button(B)),
+    ("X", Target::Button(X)),
+    ("Y", Target::Button(Y)),
+    ("LB", Target::Button(LEFT_SHOULDER)),
+    ("RB", Target::Button(RIGHT_SHOULDER)),
+    ("LT", Target::LeftTrigger),
+    ("RT", Target::RightTrigger),
+    ("View", Target::Button(VIEW)),
+    ("Menu", Target::Button(MENU)),
+    ("LS", Target::Button(LEFT_STICK)),
+    ("RS", Target::Button(RIGHT_STICK)),
+    ("Up", Target::Button(UP)),
+    ("Down", Target::Button(DOWN)),
+    ("Left", Target::Button(LEFT)),
+    ("Right", Target::Button(RIGHT)),
+    ("LSUp", Target::Stick(false, 0, 1)),
+    ("LSDown", Target::Stick(false, 0, -1)),
+    ("LSLeft", Target::Stick(false, -1, 0)),
+    ("LSRight", Target::Stick(false, 1, 0)),
+    ("RSUp", Target::Stick(true, 0, 1)),
+    ("RSDown", Target::Stick(true, 0, -1)),
+    ("RSLeft", Target::Stick(true, -1, 0)),
+    ("RSRight", Target::Stick(true, 1, 0)),
 ];
+
+/// Key names besides single letters and digits (virtual keys). Shift, Ctrl
+/// and Alt are the left ones: the keyboard reading has only those. The
+/// launcher's tests read this list.
+const KEY_NAMES: [(&str, u8); 29] = [
+    ("Space", 0x20),
+    ("Enter", 0x0D),
+    ("Esc", 0x1B),
+    ("Tab", 0x09),
+    ("Back", 0x08),
+    ("Shift", 0xA0),
+    ("Ctrl", 0xA2),
+    ("Alt", 0xA4),
+    ("Up", 0x26),
+    ("Down", 0x28),
+    ("Left", 0x25),
+    ("Right", 0x27),
+    ("F1", 0x70),
+    ("F2", 0x71),
+    ("F3", 0x72),
+    ("F4", 0x73),
+    ("F5", 0x74),
+    ("F6", 0x75),
+    ("F7", 0x76),
+    ("F8", 0x77),
+    ("F9", 0x78),
+    ("F10", 0x79),
+    ("F11", 0x7A),
+    ("F12", 0x7B),
+    ("Mouse1", 0x01),
+    ("Mouse2", 0x02),
+    ("Mouse3", 0x04),
+    ("Mouse4", 0x05),
+    ("Mouse5", 0x06),
+];
+
+/// Mouse buttons are virtual keys below this; they are never keyboard keys.
+const FIRST_KEYBOARD_KEY: u8 = 0x08;
+
+/// The keyboard's stand-in gamepad (virtual key, target); README lists it.
+const DEFAULT_KEYMAP: [(u8, Target); 24] = [
+    (0x1B, Target::Button(MENU)), // Esc
+    (0x09, Target::Button(VIEW)), // Tab
+    (0x0D, Target::Button(A)),    // Enter
+    (0x08, Target::Button(B)),    // Backspace
+    (b'X', Target::Button(X)),
+    (b'Y', Target::Button(Y)),
+    (0x26, Target::Button(UP)), // arrows
+    (0x28, Target::Button(DOWN)),
+    (0x25, Target::Button(LEFT)),
+    (0x27, Target::Button(RIGHT)),
+    (b'Q', Target::Button(LEFT_SHOULDER)),
+    (b'E', Target::Button(RIGHT_SHOULDER)),
+    (b'F', Target::Button(LEFT_STICK)),
+    (b'H', Target::Button(RIGHT_STICK)),
+    (b'Z', Target::LeftTrigger),
+    (b'C', Target::RightTrigger),
+    (b'W', Target::Stick(false, 0, 1)),
+    (b'S', Target::Stick(false, 0, -1)),
+    (b'A', Target::Stick(false, -1, 0)),
+    (b'D', Target::Stick(false, 1, 0)),
+    (b'I', Target::Stick(true, 0, 1)),
+    (b'K', Target::Stick(true, 0, -1)),
+    (b'J', Target::Stick(true, -1, 0)),
+    (b'L', Target::Stick(true, 1, 0)),
+];
+
+/// The mouse buttons' roles with `VICTORY_MOUSE=1`: left fires (right
+/// trigger), right aims (left trigger), middle clicks the right stick.
+const MOUSE_KEYMAP: [(u8, Target); 3] = [
+    (0x01, Target::RightTrigger),
+    (0x02, Target::LeftTrigger),
+    (0x04, Target::Button(RIGHT_STICK)),
+];
+
+/// Keys (virtual keys) and what each drives.
+#[derive(Clone, Debug, PartialEq)]
+struct Keymap(Vec<(u8, Target)>);
+
+static DEFAULT: LazyLock<Keymap> = LazyLock::new(|| Keymap(DEFAULT_KEYMAP.to_vec()));
+
+fn key_by_name(name: &str) -> Option<u8> {
+    if let [c] = name.as_bytes()
+        && c.is_ascii_alphanumeric()
+    {
+        return Some(c.to_ascii_uppercase());
+    }
+    KEY_NAMES
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|&(_, vk)| vk)
+}
+
+fn key_name(vk: u8) -> String {
+    match KEY_NAMES.iter().find(|&&(_, k)| k == vk) {
+        Some((name, _)) => (*name).to_owned(),
+        None => char::from(vk).to_string(),
+    }
+}
+
+impl Keymap {
+    /// `VICTORY_KEYMAP`'s list over the defaults (with the mouse's roles when
+    /// `mouse`): `<target>=<key>|<key>...,...`. A target listed has only the
+    /// keys listed (none when the value is empty); the others keep theirs. An
+    /// entry not understood is skipped and returned.
+    fn parse(list: &str, mouse: bool) -> (Keymap, Vec<String>) {
+        let mut map = DEFAULT_KEYMAP.to_vec();
+        if mouse {
+            map.extend(MOUSE_KEYMAP);
+        }
+        let mut bad = Vec::new();
+        for entry in list.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            let parsed = entry.split_once('=').and_then(|(target, keys)| {
+                let target = TARGET_NAMES
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(target.trim()))?
+                    .1;
+                let keys = keys.split('|').map(str::trim).filter(|k| !k.is_empty());
+                Some((target, keys.map(key_by_name).collect::<Option<Vec<u8>>>()?))
+            });
+            match parsed {
+                Some((target, keys)) => {
+                    map.retain(|&(_, t)| t != target);
+                    map.extend(keys.into_iter().map(|vk| (vk, target)));
+                }
+                None => bad.push(entry.to_owned()),
+            }
+        }
+        (Keymap(map), bad)
+    }
+
+    /// The map in `VICTORY_KEYMAP`'s own format, every target in order.
+    fn describe(&self) -> String {
+        let entry = |&(name, target): &(&str, Target)| {
+            let keys: Vec<String> = self
+                .0
+                .iter()
+                .filter(|&&(_, t)| t == target)
+                .map(|&(vk, _)| key_name(vk))
+                .collect();
+            format!("{name}={}", keys.join("|"))
+        };
+        TARGET_NAMES.iter().map(entry).collect::<Vec<_>>().join(",")
+    }
+
+    /// The stand-in pad with the keys `held` (virtual keys) down.
+    fn pad(&self, held: impl Iterator<Item = u8> + Clone) -> PadState {
+        let on = |want: Target| {
+            if self
+                .0
+                .iter()
+                .any(|&(vk, t)| t == want && held.clone().any(|h| h == vk))
+            {
+                1.0
+            } else {
+                0.0
+            }
+        };
+        let axis = |right: bool, x: bool| {
+            let (plus, minus) = if x { ((1, 0), (-1, 0)) } else { ((0, 1), (0, -1)) };
+            on(Target::Stick(right, plus.0, plus.1)) - on(Target::Stick(right, minus.0, minus.1))
+        };
+        PadState {
+            buttons: self
+                .0
+                .iter()
+                .filter(|&&(vk, _)| held.clone().any(|h| h == vk))
+                .fold(0, |all, &(_, t)| match t {
+                    Target::Button(bit) => all | bit,
+                    _ => all,
+                }),
+            left_trigger: on(Target::LeftTrigger),
+            right_trigger: on(Target::RightTrigger),
+            left_x: axis(false, true),
+            left_y: axis(false, false),
+            right_x: axis(true, true),
+            right_y: axis(true, false),
+        }
+    }
+
+    /// The buttons `vk` presses.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn buttons(&self, vk: u8) -> u32 {
+        self.pad(std::iter::once(vk)).buttons
+    }
+
+    /// The mouse buttons the map uses.
+    fn mouse_keys(&self) -> Vec<u8> {
+        let mut keys: Vec<u8> = self
+            .0
+            .iter()
+            .map(|&(vk, _)| vk)
+            .filter(|&vk| vk < FIRST_KEYBOARD_KEY)
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+}
+
+/// `VICTORY_MOUSE=1`: the mouse is the right stick (off unless asked for).
+fn mouse_on() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_MOUSE").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// `VICTORY_KEYMAP`, `None` when unset: the default table, and the mouse's
+/// buttons keep their own roles.
+static CUSTOM_KEYMAP: LazyLock<Option<Keymap>> = LazyLock::new(|| {
+    let list = std::env::var("VICTORY_KEYMAP").ok()?;
+    let (map, bad) = Keymap::parse(&list, mouse_on());
+    for entry in bad {
+        tracing::warn!(entry, "VICTORY_KEYMAP entry not understood; skipped");
+    }
+    tracing::info!(keymap = map.describe(), "keys of the stand-in pad");
+    Some(map)
+});
+
+/// The keys of the stand-in pad in force.
+fn keymap() -> &'static Keymap {
+    CUSTOM_KEYMAP.as_ref().unwrap_or(&DEFAULT)
+}
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
@@ -117,6 +360,11 @@ trait Source: Send {
     fn mouse(&mut self) -> Option<PadState> {
         None
     }
+    /// The mouse buttons of `wanted` (virtual keys) held down. They drive the
+    /// stand-in pad only: the title never sees them as keyboard keys.
+    fn mouse_buttons(&mut self, _wanted: &[u8]) -> Vec<u8> {
+        Vec::new()
+    }
 }
 
 /// The mouse's movement in one poll as the right stick: `dx`, `dy` pixels (down positive), `sense` the
@@ -134,26 +382,9 @@ fn mouse_stick(dx: f32, dy: f32, sense: f32) -> (f32, f32) {
     (axis(dx), -axis(dy))
 }
 
-fn fallback(keys: &[KeyState]) -> PadState {
-    let on = |vk: u8| {
-        if keys.iter().any(|k| k.virtual_key == vk) {
-            1.0
-        } else {
-            0.0
-        }
-    };
-    PadState {
-        buttons: FALLBACK_BUTTONS
-            .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
-            .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
-        left_x: on(b'D') - on(b'A'),
-        left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
-    }
+/// The stand-in pad from the keys and mouse buttons held.
+fn fallback(map: &Keymap, keys: &[KeyState], mouse: &[u8]) -> PadState {
+    map.pad(keys.iter().map(|k| k.virtual_key).chain(mouse.iter().copied()))
 }
 
 /// Two pads as one: buttons of both, and of each axis and trigger the one
@@ -380,6 +611,8 @@ pub struct Hub {
     source: Mutex<Box<dyn Source>>,
     /// The title sees one pad ([`one_pad`]).
     one_pad: bool,
+    /// The stand-in pad's keys.
+    keymap: &'static Keymap,
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
@@ -403,7 +636,7 @@ fn now() -> u64 {
 }
 
 impl Hub {
-    fn new(source: Box<dyn Source>, one_pad: bool) -> &'static Hub {
+    fn new(source: Box<dyn Source>, one_pad: bool, keymap: &'static Keymap) -> &'static Hub {
         let hub = Box::into_raw(Box::new(Hub {
             object: Object {
                 vtable: &INPUT,
@@ -412,6 +645,7 @@ impl Hub {
             devices: std::array::from_fn(Device::new),
             source: Mutex::new(source),
             one_pad,
+            keymap,
             state: Mutex::new(State {
                 slots: Default::default(),
                 callbacks: Vec::new(),
@@ -432,7 +666,7 @@ impl Hub {
 
     /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
-        let hub = Hub::new(source, one_pad());
+        let hub = Hub::new(source, one_pad(), keymap());
         hub.poll();
         std::thread::spawn(move || {
             loop {
@@ -449,7 +683,7 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let mut pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             // The mouse joins the one pad (it has no device of its own here).
@@ -458,9 +692,11 @@ impl Hub {
             {
                 pads[0] = Some(pads[0].map_or(mouse, |pad| merged(pad, mouse)));
             }
-            (pads, source.keys())
+            let mouse = source.mouse_buttons(&self.keymap.mouse_keys());
+            (pads, source.keys(), mouse)
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
+        let stand_in = fallback(self.keymap, &keys, &mouse);
+        let events = self.state().poll(&self.devices, self.one_pad, pads, stand_in, keys);
         self.deliver(events);
     }
 
@@ -505,12 +741,13 @@ impl State {
         devices: &[Device; DEVICES],
         one_pad: bool,
         pads: [Option<PadState>; PADS],
+        stand_in: PadState,
         keys: Vec<KeyState>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(stand_in, merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -519,7 +756,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then_some(Value::Pad(stand_in));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1224,9 +1461,7 @@ mod host {
             // to the pad (the title's start screen) saw nothing.
             if slot == 0 {
                 for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
-                    }
+                    pad.buttons |= keymap().buttons(vk);
                 }
             }
             Some(pad)
@@ -1256,6 +1491,18 @@ mod host {
                 .collect()
         }
 
+        fn mouse_buttons(&mut self, wanted: &[u8]) -> Vec<u8> {
+            if wanted.is_empty() || !focused() {
+                return Vec::new();
+            }
+            wanted
+                .iter()
+                .copied()
+                // SAFETY: plain queries.
+                .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
+                .collect()
+        }
+
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
@@ -1274,7 +1521,7 @@ mod host {
             use windows_sys::Win32::Foundation::{POINT, RECT};
             use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect, SetCursorPos};
             static SENSE: LazyLock<Option<f32>> = LazyLock::new(|| {
-                if std::env::var_os("VICTORY_MOUSE").is_none_or(|v| v != "1") {
+                if !mouse_on() {
                     return None;
                 }
                 let sense = std::env::var("VICTORY_MOUSE_SENSE")
@@ -1299,7 +1546,9 @@ mod host {
                 let centre = ((window.left + window.right) / 2, (window.top + window.bottom) / 2);
                 SetCursorPos(centre.0, centre.1);
                 let (x, y) = mouse_stick((at.x - centre.0) as f32, (at.y - centre.1) as f32, sense);
-                let held = |vk: i32| GetAsyncKeyState(vk) < 0;
+                // With `VICTORY_KEYMAP` set the buttons go by the map instead
+                // (`mouse_buttons`), which starts from these same roles.
+                let held = |vk: i32| CUSTOM_KEYMAP.is_none() && GetAsyncKeyState(vk) < 0;
                 Some(PadState {
                     buttons: if held(0x04) { RIGHT_STICK } else { 0 },
                     right_trigger: if held(0x01) { 1.0 } else { 0.0 },
@@ -1316,7 +1565,7 @@ mod host {
     /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
     /// time), with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// `Left`, `Right` (the stand-in pad's keymap maps them to buttons).
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
@@ -1411,6 +1660,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: Vec<u8>,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1426,6 +1676,10 @@ mod tests {
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
         }
+        fn mouse_buttons(&mut self, wanted: &[u8]) -> Vec<u8> {
+            let host = self.0.lock().unwrap();
+            host.mouse.iter().copied().filter(|b| wanted.contains(b)).collect()
+        }
     }
 
     fn fake() -> (&'static Hub, Arc<Mutex<FakeHost>>) {
@@ -1433,8 +1687,12 @@ mod tests {
     }
 
     fn fake_with(one_pad: bool) -> (&'static Hub, Arc<Mutex<FakeHost>>) {
+        fake_mapped(one_pad, &DEFAULT)
+    }
+
+    fn fake_mapped(one_pad: bool, keymap: &'static Keymap) -> (&'static Hub, Arc<Mutex<FakeHost>>) {
         let host = Arc::new(Mutex::new(FakeHost::default()));
-        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))), one_pad);
+        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))), one_pad, keymap);
         hub.poll();
         (hub, host)
     }
@@ -1787,5 +2045,173 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    /// The launcher's tests read these two lines: the defaults in
+    /// `VICTORY_KEYMAP`'s format, without and with the mouse.
+    const DEFAULTS_AS_TEXT: &str = "A=Enter,B=Back,X=X,Y=Y,LB=Q,RB=E,LT=Z,RT=C,View=Tab,Menu=Esc,LS=F,RS=H,Up=Up,Down=Down,Left=Left,Right=Right,LSUp=W,LSDown=S,LSLeft=A,LSRight=D,RSUp=I,RSDown=K,RSLeft=J,RSRight=L";
+    const MOUSE_DEFAULTS_AS_TEXT: &str = "A=Enter,B=Back,X=X,Y=Y,LB=Q,RB=E,LT=Z|Mouse2,RT=C|Mouse1,View=Tab,Menu=Esc,LS=F,RS=H|Mouse3,Up=Up,Down=Down,Left=Left,Right=Right,LSUp=W,LSDown=S,LSLeft=A,LSRight=D,RSUp=I,RSDown=K,RSLeft=J,RSRight=L";
+
+    /// The stand-in pad before `VICTORY_KEYMAP`, kept as the reference.
+    fn old_fallback(keys: &[KeyState]) -> PadState {
+        const OLD_BUTTONS: [(u8, u32); 14] = [
+            (0x1B, MENU),
+            (0x09, VIEW),
+            (0x0D, A),
+            (0x08, B),
+            (b'X', X),
+            (b'Y', Y),
+            (0x26, UP),
+            (0x28, DOWN),
+            (0x25, LEFT),
+            (0x27, RIGHT),
+            (b'Q', LEFT_SHOULDER),
+            (b'E', RIGHT_SHOULDER),
+            (b'F', LEFT_STICK),
+            (b'H', RIGHT_STICK),
+        ];
+        let on = |vk: u8| {
+            if keys.iter().any(|k| k.virtual_key == vk) {
+                1.0
+            } else {
+                0.0
+            }
+        };
+        PadState {
+            buttons: OLD_BUTTONS
+                .iter()
+                .filter(|(vk, _)| on(*vk) != 0.0)
+                .fold(0, |all, (_, bit)| all | bit),
+            left_trigger: on(b'Z'),
+            right_trigger: on(b'C'),
+            left_x: on(b'D') - on(b'A'),
+            left_y: on(b'W') - on(b'S'),
+            right_x: on(b'L') - on(b'J'),
+            right_y: on(b'I') - on(b'K'),
+        }
+    }
+
+    #[test]
+    fn without_a_keymap_the_stand_in_pad_is_the_old_table() {
+        let old = |vks: &[u8]| old_fallback(&vks.iter().map(|&vk| key(vk)).collect::<Vec<_>>());
+        let new = |vks: &[u8]| fallback(&DEFAULT, &vks.iter().map(|&vk| key(vk)).collect::<Vec<_>>(), &[]);
+        for a in 0..=255_u8 {
+            assert_eq!(new(&[a]), old(&[a]), "key {a:#x}");
+            // Pairs: opposite stick directions, two buttons, a trigger and a button.
+            for &(b, _) in &DEFAULT_KEYMAP {
+                assert_eq!(new(&[a, b]), old(&[a, b]), "keys {a:#x} {b:#x}");
+            }
+        }
+        let every: Vec<u8> = DEFAULT_KEYMAP.iter().map(|&(vk, _)| vk).collect();
+        assert_eq!(new(&every), old(&every));
+        assert_eq!(DEFAULT.describe(), DEFAULTS_AS_TEXT);
+        // An empty list is the defaults; with the mouse, the mouse's own roles join them.
+        assert_eq!(Keymap::parse("", false), (DEFAULT.clone(), vec![]));
+        assert_eq!(Keymap::parse(" , ", true).0.describe(), MOUSE_DEFAULTS_AS_TEXT);
+        // The written form reads back as the same map.
+        assert_eq!(Keymap::parse(MOUSE_DEFAULTS_AS_TEXT, false).0.describe(), MOUSE_DEFAULTS_AS_TEXT);
+    }
+
+    #[test]
+    fn a_full_keymap_replaces_every_key() {
+        let list = "A=Space,B=Back,X=R,Y=F,LB=Q,RB=E,LT=Mouse2,RT=Mouse1,LS=Shift,RS=Mouse3,View=Tab,Menu=Esc,\
+                    Up=Up,Down=Down,Left=Left,Right=Right,LSUp=W,LSDown=S,LSLeft=A,LSRight=D,RSUp=I,RSDown=K,RSLeft=J,RSRight=L";
+        let (map, bad) = Keymap::parse(list, true);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(
+            map.describe(),
+            "A=Space,B=Back,X=R,Y=F,LB=Q,RB=E,LT=Mouse2,RT=Mouse1,View=Tab,Menu=Esc,LS=Shift,RS=Mouse3,\
+             Up=Up,Down=Down,Left=Left,Right=Right,LSUp=W,LSDown=S,LSLeft=A,LSRight=D,RSUp=I,RSDown=K,RSLeft=J,RSRight=L"
+        );
+        let pad = |vks: &[u8]| map.pad(vks.iter().copied());
+        assert_eq!(pad(&[0x20]).buttons, A);
+        assert_eq!(pad(&[0x0D]), PadState::default(), "Enter is no longer A");
+        assert_eq!(pad(b"C").right_trigger, 0.0, "C is no longer the trigger");
+        assert_eq!(pad(&[b'R', b'F', 0xA0]).buttons, X | Y | LEFT_STICK);
+        assert_eq!((pad(b"WD").left_y, pad(b"WD").left_x), (1.0, 1.0));
+        assert_eq!(pad(b"WS").left_y, 0.0);
+        assert_eq!(map.mouse_keys(), [0x01, 0x02, 0x04]);
+        // Two keys for one target, and names in any case.
+        let (two, bad) = Keymap::parse("a=space|ENTER, rsleft=f1", false);
+        assert!(bad.is_empty());
+        assert_eq!((two.buttons(0x20), two.buttons(0x0D)), (A, A));
+        assert_eq!(two.pad(std::iter::once(0x70)).right_x, -1.0);
+        assert_eq!(two.pad(std::iter::once(b'J')).right_x, 0.0);
+    }
+
+    #[test]
+    fn mouse_buttons_drive_the_pad_but_are_no_keyboard_keys() {
+        let map = Box::leak(Box::new(Keymap::parse("RT=Mouse1,A=Mouse4|Enter", false).0));
+        let (hub, host) = fake_mapped(true, map);
+        // Mouse2 is bound to nothing here, so it is not even read.
+        host.lock().unwrap().mouse = vec![0x01, 0x05, 0x02];
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(
+            pad(r),
+            PadState { buttons: A, right_trigger: 1.0, ..Default::default() }
+        );
+        release(r);
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        assert_eq!(slot::<extern "system" fn(*const Reading) -> u32, _>(r, 0x70)(r), 0);
+        release(r);
+        // Without a keymap no mouse button is asked for: the mouse keeps its own roles.
+        assert!(DEFAULT.mouse_keys().is_empty());
+        // With the mouse on, a keymap keeps the mouse's roles it does not list...
+        let (map, _) = Keymap::parse("A=Space", true);
+        assert_eq!(map.pad(std::iter::once(0x01)).right_trigger, 1.0);
+        assert_eq!(map.buttons(0x04), RIGHT_STICK);
+        // ...and a target it lists has only what it lists.
+        let (map, _) = Keymap::parse("RT=Mouse2", true);
+        assert_eq!(map.pad(std::iter::once(0x01)), PadState::default());
+        let both = map.pad(std::iter::once(0x02));
+        assert_eq!((both.left_trigger, both.right_trigger), (1.0, 1.0));
+    }
+
+    #[test]
+    fn keymap_entries_not_understood_are_skipped() {
+        let (map, bad) = Keymap::parse("A=Nope,Jump=Space,B,=X,LB=Q|??,  ,RB=Mouse9,X=,Y=Space", false);
+        assert_eq!(bad, ["A=Nope", "Jump=Space", "B", "=X", "LB=Q|??", "RB=Mouse9"]);
+        // The skipped targets keep their keys; `X=` leaves X with none.
+        let mut want = DEFAULT.0.clone();
+        want.retain(|&(_, t)| t != Target::Button(X) && t != Target::Button(Y));
+        want.push((0x20, Target::Button(Y)));
+        assert_eq!(map, Keymap(want));
+        assert_eq!(map.buttons(b'X'), 0);
+    }
+
+    #[test]
+    fn scripted_keys_press_the_buttons_of_the_keymap() {
+        // `Host::pad` presses `keymap().buttons(vk)` for each scripted key.
+        for (vk, target) in DEFAULT_KEYMAP {
+            let want = match target {
+                Target::Button(bit) => bit,
+                _ => 0,
+            };
+            assert_eq!(DEFAULT.buttons(vk), want, "key {vk:#x}");
+        }
+        let (map, _) = Keymap::parse("X=R,A=Space", false);
+        assert_eq!((map.buttons(b'R'), map.buttons(0x20), map.buttons(b'X')), (X, A, 0));
+        // The stand-in pad sees scripted keys like typed ones.
+        let (hub, host) = fake_mapped(true, Box::leak(Box::new(map)));
+        host.lock().unwrap().keys = vec![key(b'R')];
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(r).buttons, X);
+        release(r);
+    }
+
+    #[test]
+    fn every_key_name_reads_back() {
+        let mut names: Vec<String> = KEY_NAMES.iter().map(|(n, _)| (*n).to_owned()).collect();
+        names.extend(('A'..='Z').chain('0'..='9').map(String::from));
+        for name in &names {
+            let vk = key_by_name(name).unwrap_or_else(|| panic!("{name}"));
+            assert_eq!(&key_name(vk), name);
+        }
+        assert_eq!(key_by_name("a"), Some(b'A'));
+        assert_eq!(key_by_name("Mouse6"), None);
+        // Mouse buttons and nothing else sit below the first keyboard key.
+        assert!(KEY_NAMES.iter().all(|(n, vk)| n.starts_with("Mouse") == (*vk < FIRST_KEYBOARD_KEY)));
     }
 }

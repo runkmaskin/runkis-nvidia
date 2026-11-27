@@ -163,6 +163,8 @@ public sealed class PlanBuilder(RepoLayout repo)
         }
         else
             o["VICTORY_MOUSE"] = "0"; // the script turns it on
+        // The layer's own defaults need no list, so an unchanged map leaves the old mapping exactly.
+        if (KeyMap.Variable(p) is string keys) o["VICTORY_KEYMAP"] = keys;
         o["VICTORY_LOG"] = p.LogFilter.Trim();
         return o;
     }

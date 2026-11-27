@@ -64,6 +64,7 @@ public sealed class MainViewModel : Observable, IDisposable
         LogView = CollectionViewSource.GetDefaultView(LogLines);
         LogView.Filter = o => o is LogLine l && (!ErrorsOnly || l.Level != Severity.Info)
                               && (LogSearch.Length == 0 || l.Text.Contains(LogSearch, StringComparison.OrdinalIgnoreCase));
+        Controls = new ControlsViewModel(() => profile, () => { Raise(nameof(ValidationText)); Raise(nameof(ProfileSummary)); });
         LoadProfiles();
         Machine = SystemInfo.Read();
         Bench = new BenchmarkViewModel(this);
@@ -106,8 +107,10 @@ public sealed class MainViewModel : Observable, IDisposable
     }
 
     // ---------------------------------------------------------------- navigation and state
-    public string Page { get => page; set { if (Set(ref page, value)) { Raise(nameof(PageIndex)); if (value == "Benchmark") Bench.RefreshSources(); } } }
-    public int PageIndex => Page switch { "Settings" => 1, "Diagnostics" => 2, "Logs" => 3, "System" => 4, "Benchmark" => 5, _ => 0 };
+    public string Page { get => page; set { if (Set(ref page, value)) { Raise(nameof(PageIndex)); Controls.CancelCapture(); if (value == "Benchmark") Bench.RefreshSources(); } } }
+    public int PageIndex => Page switch { "Settings" => 1, "Diagnostics" => 2, "Logs" => 3, "System" => 4, "Benchmark" => 5, "Controls" => 6, _ => 0 };
+    /// <summary>The Controls page: keys of the stand-in pad and the mouse camera.</summary>
+    public ControlsViewModel Controls { get; }
     public string RepoText => repo?.Root ?? "Not found: choose the runkis-nvidia folder";
     public bool RepoFound => repo != null;
     public SystemSnapshot Machine { get; private set; }
@@ -221,6 +224,7 @@ public sealed class MainViewModel : Observable, IDisposable
         Raise(nameof(ProfileSummary));
         Raise(nameof(ValidationText));
         Raise(nameof(StartDescription));
+        Controls.Load();
     }
 
     private void LoadProfiles()
@@ -642,6 +646,7 @@ public sealed class MainViewModel : Observable, IDisposable
 
     private string toast = "";
     public string ToastText { get => toast; private set => Set(ref toast, value); }
+    public void ShowToast(string text) => Toast(text);
     private void Toast(string text)
     {
         ToastText = text;

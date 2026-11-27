@@ -104,6 +104,10 @@ public static class Presets
             Build = basis.Build,
             LogFilter = basis.LogFilter,
             WarmLimit = basis.WarmLimit,
+            // The controls are the player's, not a speed choice.
+            Mouse = basis.Mouse,
+            MouseSense = basis.MouseSense,
+            KeyMap = basis.KeyMap == null ? null : new(basis.KeyMap),
         };
         preset.Apply(p);
         return p;
