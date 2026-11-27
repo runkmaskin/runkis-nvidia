@@ -24,7 +24,9 @@ param(
     [string]$Adapter,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{},
-    [switch]$Precompile   # local: translate every shader with these exact settings (cache warm), no run
+    [switch]$Precompile,  # local: translate every shader with these exact settings (cache warm), no run
+    [switch]$Warm,        # local: build every recorded pipeline into the driver's cache (victory warm), no run
+    [int]$WarmLimit = 0   # local: with -Warm, at most this many pipelines (0: all)
 )
 $settings = @{
     # This fork's play set (scripts\play.ps1, not -Safe): the speed set.
@@ -49,6 +51,9 @@ $settings = @{
     # waited for at most once (VICTORY_PIPELINE_WAIT_ONCE, on by default): one that takes longer no longer stops the
     # picture in every frame it is in view (pipeline/make.rs).
     VICTORY_PIPELINE_WAIT_MS = '10000'
+    # local: write down every pipeline the title creates (pipeline/known.rs), so -Warm can build them all into the
+    # driver's cache before play: fewer hitches the first time a place is seen.
+    VICTORY_PIPELINE_BOOK = '1'
     # NVIDIA caps the shader-visible view heap at 1,000,000: without more dynamic slots thousands of draws a frame
     # are dropped (descriptor/host.rs dynamic_slots).
     VICTORY_DYNAMIC_SLOTS = '524288'
@@ -125,5 +130,6 @@ $Exe = (Resolve-Path $Exe).Path
 $runArgs = @('run', $Exe, '--execute')
 if (-not $SeriesX) { $runArgs += @('--console', 'series-s') }
 if ($Precompile) { $runArgs = @('shaders', (Split-Path $Exe)) }
+if ($Warm) { $runArgs = @('warm'); if ($WarmLimit -gt 0) { $runArgs += @('--limit', "$WarmLimit") } }
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try { & $victory @runArgs } finally { Pop-Location }

@@ -3459,7 +3459,9 @@ impl Shadow {
                 return to;
             }
             let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
+            // (saturating: near the copy's start, the piece `at` lies in may
+            // begin before the copy does; Yaekai b4e351c, fxceless#1407)
+            at.saturating_sub((start + at) % PIECE).max(from)
         };
         let scan = &scan;
         std::thread::scope(|s| {
