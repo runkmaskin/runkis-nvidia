@@ -30,7 +30,8 @@ public class ProfileTests
     [InlineData(2160, ConsoleModel.SeriesS, false)]
     [InlineData(1080, ConsoleModel.SeriesS, true)]
     [InlineData(2160, ConsoleModel.SeriesX, true)]
-    [InlineData(900, ConsoleModel.SeriesS, false)]
+    [InlineData(1000, ConsoleModel.SeriesS, false)]   // not a height the script takes
+    [InlineData(900, ConsoleModel.SeriesS, true)]
     public void Resolution_must_fit_the_console(int height, ConsoleModel console, bool ok)
     {
         using var d = new TempDir();

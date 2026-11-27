@@ -20,7 +20,7 @@ param(
     [switch]$SeriesX,
     [switch]$Quality,
     [switch]$RayTracing,
-    [ValidateSet('2160', '1440', '1080', '768', '720', '540', '480')][string]$Resolution,
+    [ValidateSet('2160', '1440', '1080', '960', '900', '768', '720', '540', '480')][string]$Resolution,
     [string]$Adapter,
     [ValidateSet('diag', 'release', 'ab')][string]$Build = 'diag',
     [hashtable]$More = @{},
@@ -141,6 +141,9 @@ if ($Resolution) {
         return
     }
     $settings.VICTORY_RENDER_SCALE = ([int]$Resolution / $outHeight).ToString('0.####', [Globalization.CultureInfo]::InvariantCulture)
+    # local: above 768p the Series S title runs out of two start-up pools (graphics memory, physical pages); twice
+    # their size lets 810-1080p start (victory-loader hooks.rs, VICTORY_TITLE_POOL; 1080p measured into gameplay)
+    if (-not $SeriesX -and [int]$Resolution -gt 768) { $settings.VICTORY_TITLE_POOL = '2' }
 }
 if ($Adapter) { $settings.VICTORY_ADAPTER = $Adapter }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
