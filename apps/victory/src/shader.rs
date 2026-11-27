@@ -27,10 +27,39 @@ impl Source<'_> {
         }
     }
 
+    /// Where it is in its file, to find it there again ([`Found::source`])
+    /// on another thread than the one that searched the file.
+    pub(crate) fn found(&self) -> Found {
+        match self {
+            Source::Raw { offset, .. } => Found::Raw(*offset),
+            Source::Packed(r) => Found::Packed(r.offset),
+        }
+    }
+
     pub(crate) fn label(&self) -> String {
         match self {
             Source::Raw { offset, .. } => format!("@{offset:#x}"),
             Source::Packed(r) => format!("@{:#x} {}", r.offset, r.name.unwrap_or("?")),
+        }
+    }
+}
+
+/// A [`Source`] by its offset in its file.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Found {
+    Raw(usize),
+    Packed(usize),
+}
+
+impl Found {
+    /// The source in `data`, the file it was found in.
+    pub(crate) fn source(self, data: &[u8]) -> Option<Source<'_>> {
+        match self {
+            Found::Raw(offset) => Some(Source::Raw {
+                offset,
+                data: data.get(offset..)?,
+            }),
+            Found::Packed(at) => sgd5::record_at(data, at).map(Source::Packed),
         }
     }
 }

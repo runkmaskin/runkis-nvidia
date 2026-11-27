@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
@@ -15,7 +15,7 @@ use victory_shader::{
 };
 use victory_shader::{io, resource};
 
-use crate::shader::{MAX_FILE, Source, sources};
+use crate::shader::{Found, MAX_FILE, Source, sources};
 
 #[derive(Default)]
 struct Tally {
@@ -404,43 +404,59 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
     let seen = Mutex::new(HashSet::new());
     let done = AtomicUsize::new(0);
     let failed = Mutex::new(BTreeMap::<String, (usize, String)>::new());
-    for root in &paths {
-        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
-                continue;
-            }
-            let Ok(data) = std::fs::read(entry.path()) else {
-                continue;
-            };
-            let jobs = sources(&data);
-            let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
-                for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
-                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            let Some(bytes) = job.bytes() else { continue };
-                            let hash = blake3::hash(&bytes);
-                            if !lock(&seen).insert(hash) {
-                                continue;
-                            }
-                            match victory_hle::modules::d3d12x::precompile(&bytes) {
-                                Ok(_) => {
-                                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                                    if n.is_multiple_of(1000) {
-                                        println!("{n} shaders in the cache, {:.0} s", started.elapsed().as_secs_f64());
-                                    }
-                                }
-                                Err(why) => {
-                                    let mut failed = lock(&failed);
-                                    failed.entry(why).or_insert_with(|| (0, hash.to_hex()[..16].to_owned())).0 += 1;
-                                }
+    // One set of workers for every file: this thread reads and searches the
+    // files while the workers translate what the earlier ones held. (With a
+    // set of workers per file, every worker waited for each file to be read,
+    // and for the last shader of a file before it started on the next one's:
+    // a file of one shader was translated by one thread.) The queue holds a
+    // few shaders per worker, and a file is kept until its last one is taken.
+    let (send, queue) = std::sync::mpsc::sync_channel::<(Arc<Vec<u8>>, Found)>(4 * threads.max(1));
+    let queue = Mutex::new(queue);
+    std::thread::scope(|s| {
+        for _ in 0..threads.max(1) {
+            s.spawn(|| {
+                loop {
+                    let Ok((data, found)) = lock(&queue).recv() else { break };
+                    let Some(job) = found.source(&data) else { continue };
+                    let Some(bytes) = job.bytes() else { continue };
+                    let hash = blake3::hash(&bytes);
+                    if !lock(&seen).insert(hash) {
+                        continue;
+                    }
+                    match victory_hle::modules::d3d12x::precompile(&bytes) {
+                        Ok(_) => {
+                            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n.is_multiple_of(1000) {
+                                println!("{n} shaders in the cache, {:.0} s", started.elapsed().as_secs_f64());
                             }
                         }
-                    });
+                        Err(why) => {
+                            let mut failed = lock(&failed);
+                            failed.entry(why).or_insert_with(|| (0, hash.to_hex()[..16].to_owned())).0 += 1;
+                        }
+                    }
                 }
             });
         }
-    }
+        'files: for root in &paths {
+            for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+                if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                    continue;
+                }
+                let Ok(data) = std::fs::read(entry.path()) else {
+                    continue;
+                };
+                let found: Vec<Found> = sources(&data).iter().map(Source::found).collect();
+                let data = Arc::new(data);
+                for f in found {
+                    if send.send((Arc::clone(&data), f)).is_err() {
+                        break 'files;
+                    }
+                }
+            }
+        }
+        drop(send);
+    });
     let failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
     println!(
         "{} shaders in the cache, {} do not translate, {:.0} s",

@@ -30,7 +30,7 @@
 //! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
 //! the translation and so of the shader cache's key.
 
-use std::collections::HashMap;
+use crate::fx::Map;
 
 use super::{
     Attr, Bin, Cast, Const, Func, MdDef, Module, Op, Term, Ty, TypeDef, V, for_each_operand, pred,
@@ -133,8 +133,8 @@ fn opposite(p: u8) -> u8 {
 /// and comparisons (by their operands) with a known outcome.
 #[derive(Default)]
 struct Facts {
-    bits: HashMap<V, bool>,
-    compares: HashMap<(u8, V, V), bool>,
+    bits: Map<V, bool>,
+    compares: Map<(u8, V, V), bool>,
 }
 
 /// The facts a block added, to forget when its part of the tree is done.
@@ -798,9 +798,9 @@ impl Module {
         }
         // The values every path to the block being walked has computed
         // (those of the blocks above it in the tree, and its own so far).
-        let mut known: HashMap<Key, V> = HashMap::new();
+        let mut known: Map<Key, V> = Map::default();
         // The reads of the block being walked since its last store.
-        let mut read: HashMap<Key, V> = HashMap::new();
+        let mut read: Map<Key, V> = Map::default();
         let mut facts = Facts::default();
         let (yes, no) = (self.bool(true), self.bool(false));
         enum Step {
@@ -843,7 +843,7 @@ impl Module {
             read.clear();
             // Two joins of the same values from the same blocks are one.
             if passes & REUSE != 0 && self.blocks[b].phis.len() > 1 {
-                let mut joins: HashMap<Vec<(usize, V)>, V> = HashMap::new();
+                let mut joins: Map<Vec<(usize, V)>, V> = Map::default();
                 for &p in &self.blocks[b].phis {
                     if repl[p as usize].is_some() {
                         continue;

@@ -269,6 +269,9 @@ pub(crate) struct Shader {
     lds: Option<V>,
     main: V,
     pub entry: usize,
+    /// The `dx.op` declarations [`Self::op`] has made, by name: result and
+    /// parameter types, and the function.
+    ops: crate::fx::Map<Box<str>, Vec<(Ty, Vec<Ty>, V)>>,
 }
 
 impl Shader {
@@ -322,6 +325,7 @@ impl Shader {
             lds: None,
             main,
             entry,
+            ops: Default::default(),
         }
     }
 
@@ -347,14 +351,39 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
-        let mut params = vec![self.t.i32];
-        params.extend(args.iter().map(|&a| self.m.type_of(a)));
-        let fty = self.m.func_ty(ret, params);
-        self.m.ptr(fty);
-        let f = self
-            .m
-            .function(&format!("dx.op.{name}"), fty, Some(attr), false);
-        let mut all = vec![self.m.i32(opcode)];
+        // Declared before with these types (the opcode's, then the
+        // arguments'): the type and the function are found as they were
+        // then, so nothing is made or looked up again.
+        let (i32t, m) = (self.t.i32, &self.m);
+        let made = self
+            .ops
+            .get(name)
+            .and_then(|fs| {
+                fs.iter().find(|(r, p, _)| {
+                    *r == ret
+                        && p.len() == args.len() + 1
+                        && p[0] == i32t
+                        && p[1..].iter().zip(args).all(|(&t, &a)| t == m.type_of(a))
+                })
+            })
+            .map(|f| f.2);
+        let f = match made {
+            Some(f) => f,
+            None => {
+                let mut params = Vec::with_capacity(args.len() + 1);
+                params.push(self.t.i32);
+                params.extend(args.iter().map(|&a| self.m.type_of(a)));
+                let fty = self.m.func_ty(ret, params.clone());
+                self.m.ptr(fty);
+                let f = self
+                    .m
+                    .function(&format!("dx.op.{name}"), fty, Some(attr), false);
+                self.ops.entry(name.into()).or_default().push((ret, params, f));
+                f
+            }
+        };
+        let mut all = Vec::with_capacity(args.len() + 1);
+        all.push(self.m.i32(opcode));
         all.extend(args);
         self.m.call(block, f, all)
     }
@@ -591,7 +620,11 @@ impl Shader {
         // validator compares the flags with what the code uses).
         let passes = super::shader_opt() & super::bitcode::opt::MODULE;
         if passes != 0 {
+            #[cfg(test)]
+            let started = std::time::Instant::now();
             self.m.optimise(passes);
+            #[cfg(test)]
+            super::clock(0, started);
             let used = self.m.usage();
             for (flag, used) in [
                 (flags::ROVS, used.rovs),
@@ -913,7 +946,11 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
+        #[cfg(test)]
+        let started = std::time::Instant::now();
         let bitcode = self.m.write();
+        #[cfg(test)]
+        super::clock(1, started);
         super::bitcode::census::note(&self.m, &bitcode);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());

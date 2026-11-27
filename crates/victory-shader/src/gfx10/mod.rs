@@ -79,6 +79,66 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     if !code.len().is_multiple_of(4) {
         return Err(isa(code.len(), "code size is not a multiple of 4"));
     }
+    decode_by_dword(code).unwrap_or_else(|| decode_anywhere(code))
+}
+
+/// [`decode`] for code whose every instruction starts on a dword, which a
+/// table of the dwords finds faster than a tree (the tree's insertions were
+/// a tenth of building the IR); `None` when control flow reaches an offset
+/// that is not a dword's, for [`decode_anywhere`] to follow.
+fn decode_by_dword(code: &[u8]) -> Option<Result<Vec<Instruction>, ShaderError>> {
+    let mut found: Vec<Option<Instruction>> = Vec::new();
+    found.resize_with(code.len() / 4, || None);
+    let mut pending = vec![0usize];
+    let mut count = 0;
+    while let Some(mut offset) = pending.pop() {
+        loop {
+            if !offset.is_multiple_of(4) {
+                return None;
+            }
+            if found.get(offset / 4).is_some_and(Option::is_some) {
+                break;
+            }
+            let inst = match instruction(code, offset) {
+                Ok(inst) => inst,
+                Err(e) => return Some(Err(e)),
+            };
+            let next = offset + 4 * inst.words.len();
+            let flow = control(&inst, code.len(), |at| {
+                // (the instruction found with the highest offset below `at`)
+                found[..at.div_ceil(4).min(found.len())].iter().rev().find_map(Option::as_ref)
+            });
+            let flow = match flow {
+                Ok(flow) => flow,
+                Err(e) => return Some(Err(e)),
+            };
+            // (`instruction` read the dword at `offset`, so it is in the table)
+            found[offset / 4] = Some(inst);
+            count += 1;
+            match flow {
+                Flow::Next => offset = next,
+                Flow::Stop => break,
+                Flow::Jump(target) => offset = target,
+                Flow::Branch(target) => {
+                    pending.push(target);
+                    offset = next;
+                }
+            }
+        }
+    }
+    let mut list = Vec::with_capacity(count);
+    list.extend(found.into_iter().flatten());
+    if let Some(w) = list
+        .windows(2)
+        .find(|w| w[0].offset + 4 * w[0].words.len() > w[1].offset)
+    {
+        return Some(Err(isa(w[1].offset, "a branch lands inside an instruction")));
+    }
+    Some(Ok(list))
+}
+
+/// [`decode`] for any offsets control flow reaches.
+fn decode_anywhere(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     let mut found = BTreeMap::new();
     let mut pending = vec![0usize];
     while let Some(mut offset) = pending.pop() {

@@ -152,7 +152,19 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
     }
     leaders.sort_unstable();
     leaders.dedup();
-    let parked = unspill(&mut list, &flows, &leaders, wave64, lanes, vgprs);
+    // Each instruction's fields and register effects, made once for `unspill`
+    // and the blocks below (they were made twice); `None` where it is to be
+    // made again: an instruction without a name, or one `unspill` rewrote.
+    let mut prepared: Vec<Option<Prepared>> = list
+        .iter()
+        .map(|inst| {
+            let name = inst.name()?;
+            let fields = inst.fields(wave64);
+            let effects = effects(inst, &fields, name, lanes, vgprs);
+            Some((fields, effects))
+        })
+        .collect();
+    let parked = unspill(&mut list, &mut prepared, &flows, &leaders, wave64);
     let block_at = |offset: usize| {
         leaders
             .binary_search(&offset)
@@ -178,7 +190,10 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             offset: machine.offset,
             what: "unknown opcode",
         })?;
-        let mut fields = machine.fields(wave64);
+        let (mut fields, mut made) = match prepared[n].take() {
+            Some((fields, effects)) => (fields, Some(effects)),
+            None => (machine.fields(wave64), None),
+        };
         // A move to or from a scalar parked in a VGPR lane (`unspill`): its register
         // codes may be ones the machine word cannot hold.
         if let Ok(k) = parked.binary_search_by_key(&n, |m| m.0)
@@ -186,6 +201,7 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             && let Some(Operand::Scalar { code: from, .. }) = src.first_mut()
         {
             (*to, *from) = (parked[k].1, parked[k].2);
+            made = None;
         }
         let fallthrough = || block_at(next.ok_or(isa(machine.offset, "falls off the code"))?);
         // A conditional SOPP branch to fallthrough has no register effects
@@ -210,7 +226,8 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
                 Flow::Stop => Exit::End,
             };
         }
-        if let Some((mut reads, writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
+        let made = made.unwrap_or_else(|| effects(&machine, &fields, name, lanes, vgprs));
+        if let Some((mut reads, writes)) = made? {
             // Lanes disabled in EXEC keep the old value.
             for w in writes.iter().filter(|w| matches!(w, Reg::V(_))) {
                 if !reads.contains(w) {
@@ -268,11 +285,10 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
 /// store of its own.
 fn unspill(
     list: &mut [gfx10::Instruction],
+    prepared: &mut [Option<Prepared>],
     flows: &[Flow],
     leaders: &[usize],
     wave64: bool,
-    lanes: u8,
-    vgprs: u16,
 ) -> Vec<(usize, u8, u8)> {
     /// `v_writelane_b32 vN, sX, K` / `v_readlane_b32 sX, vN, K`: (save, N, X, K).
     fn parked(inst: &gfx10::Instruction, fields: &Fields) -> Option<(bool, u8, u8, u32)> {
@@ -302,22 +318,22 @@ fn unspill(
     let mut parks: Vec<Option<(bool, u8, u8, u32)>> = Vec::with_capacity(list.len());
     let mut written: Vec<Vec<u8>> = Vec::with_capacity(list.len());
     let mut read: Vec<Vec<u8>> = Vec::with_capacity(list.len());
-    for inst in list.iter() {
+    for (inst, prepared) in list.iter().zip(prepared.iter()) {
         let Some(name) = inst.name() else { return Vec::new() };
-        let fields = inst.fields(wave64);
-        let park = parked(inst, &fields);
-        let Ok(effects) = effects(inst, &fields, name, lanes, vgprs) else {
+        let Some((fields, effects)) = prepared else { return Vec::new() };
+        let park = parked(inst, fields);
+        let Ok(effects) = effects else {
             return Vec::new();
         };
         let mut codes = Vec::new();
         let mut from = Vec::new();
         if let Some((reads, writes)) = effects {
-            for &reg in &writes {
+            for &reg in writes {
                 if let Reg::S(c) = reg {
                     codes.push(c);
                 }
             }
-            for &reg in &reads {
+            for &reg in reads {
                 if let Reg::S(c) = reg {
                     from.push(c);
                 }
@@ -328,7 +344,7 @@ fn unspill(
             // ordinary ones. (Relative writes still do.)
             let relative = name == "v_movrels_b32";
             let n_reads = reads.len();
-            for (k, reg) in reads.into_iter().chain(writes).enumerate() {
+            for (k, &reg) in reads.iter().chain(writes).enumerate() {
                 if relative && k < n_reads && matches!(reg, Reg::V(_)) {
                     continue;
                 }
@@ -577,8 +593,10 @@ fn unspill(
         chosen = split;
     }
     let (store, pairs, codes) = chosen;
-    let put = |list: &mut [gfx10::Instruction], i: usize, encoding, opcode: u16, word: u32| {
+    // (what was made of the old instruction is made again of the new one)
+    let put = |list: &mut [gfx10::Instruction], prepared: &mut [Option<Prepared>], i: usize, encoding, opcode: u16, word: u32| {
         list[i] = gfx10::Instruction::new(list[i].offset, encoding, opcode, vec![word]);
+        prepared[i] = None;
     };
     // `s_mov_b32` / `s_mov_b64 dst, src` (SOP1, opcodes 3 and 4); `s_nop`. A code
     // from `PARKED` up does not fit the word: s0 stands in for it there.
@@ -610,10 +628,10 @@ fn unspill(
     for (i, edit) in edits {
         match edit {
             Some((wide, dst, src)) => {
-                put(list, i, gfx10::Encoding::Sop1, 3 + u16::from(wide), mov(wide, dst, src));
+                put(list, prepared, i, gfx10::Encoding::Sop1, 3 + u16::from(wide), mov(wide, dst, src));
                 moves.push((i, dst, src));
             }
-            None => put(list, i, gfx10::Encoding::Sopp, 0, NOP),
+            None => put(list, prepared, i, gfx10::Encoding::Sopp, 0, NOP),
         }
     }
     moves.sort_unstable();
@@ -947,9 +965,15 @@ fn contains(set: &RegSet, reg: Reg) -> bool {
 
 /// In [`Reg`] order, which is also index order.
 fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
-    (0..REGS)
-        .filter(|&i| set[i / 64] >> (i % 64) & 1 != 0)
-        .map(reg_at)
+    // (the set bits of each word, lowest first, rather than a test of every
+    // register)
+    set.iter().enumerate().flat_map(|(w, &bits)| {
+        std::iter::successors((bits != 0).then_some(bits), |&b| {
+            let rest = b & (b - 1);
+            (rest != 0).then_some(rest)
+        })
+        .map(move |b| reg_at(w * 64 + b.trailing_zeros() as usize))
+    })
 }
 
 /// `outs` is sorted by register, and holds every register live out.
@@ -1320,6 +1344,9 @@ const DROPPED: &[&str] = &[
 
 /// Registers read, registers written.
 type Effects = (Vec<Reg>, Vec<Reg>);
+
+/// An instruction's decoded fields and what [`effects`] makes of them.
+type Prepared = (Fields, Result<Option<Effects>, ShaderError>);
 
 /// The registers `inst` of `p` reads as operands: its reads without the old
 /// value of a VGPR it only writes.

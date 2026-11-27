@@ -17,7 +17,6 @@
 //! through derivatives.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
@@ -66,36 +65,8 @@ pub struct Bools {
     overflow: bool,
 }
 
-/// The tables below have small integer keys; SipHash dominated run time.
-type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
-
-/// FxHash's multiply-rotate step.
-#[derive(Default)]
-struct Fx(u64);
-
-impl Hasher for Fx {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_u64(u64::from(b));
-        }
-    }
-
-    fn write_u32(&mut self, n: u32) {
-        self.write_u64(u64::from(n));
-    }
-
-    fn write_u64(&mut self, n: u64) {
-        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x517c_c1b7_2722_0a95);
-    }
-
-    fn write_usize(&mut self, n: usize) {
-        self.write_u64(n as u64);
-    }
-}
+// The tables below have small integer keys; SipHash dominated run time.
+use crate::fx::{Map, Set};
 
 const TERMINAL: u32 = u32::MAX;
 const MAX_NODES: usize = 1 << 21;
@@ -379,15 +350,43 @@ impl Bools {
     /// `b` with each atom that `known` decides replaced by its value.
     fn given(&mut self, mut b: Bool, known: Bool) -> Bool {
         for v in self.vars(b) {
-            let x = self.mk(v, Bool::FALSE, Bool::TRUE);
-            let nx = self.not(x);
-            if self.implies(known, x) {
+            // Whether `known` implies the atom or its negation, without
+            // making `known` and the negation (`implies`): making those
+            // nodes, which nothing read again, was about half of
+            // structurisation's time. The answer is the same.
+            if !self.sat_with(known, v, false, &mut Set::default()) {
                 b = self.restrict(b, v, true, &mut Map::default());
-            } else if self.implies(known, nx) {
+            } else if !self.sat_with(known, v, true, &mut Set::default()) {
                 b = self.restrict(b, v, false, &mut Map::default());
             }
         }
         b
+    }
+
+    /// Whether some lane satisfies `b` with atom `v` `value`: a path from `b`
+    /// to true that goes the `value` way where it tests `v`. `unsat` holds
+    /// the nodes found to have none. Makes no node.
+    fn sat_with(&self, b: Bool, v: u32, value: bool, unsat: &mut Set<Bool>) -> bool {
+        let (bv, lo, hi) = self.nodes[b.0 as usize];
+        if bv == TERMINAL {
+            return b == Bool::TRUE;
+        }
+        // Below `v` nothing tests it, and every node but false has a path
+        // to true (the diagram is reduced).
+        if bv > v {
+            return true;
+        }
+        if bv == v {
+            return (if value { hi } else { lo }) != Bool::FALSE;
+        }
+        if unsat.contains(&b) {
+            return false;
+        }
+        let sat = self.sat_with(lo, v, value, unsat) || self.sat_with(hi, v, value, unsat);
+        if !sat {
+            unsat.insert(b);
+        }
+        sat
     }
 }
 

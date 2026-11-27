@@ -214,9 +214,9 @@ enum MdDef {
 #[derive(Default)]
 pub(crate) struct Module {
     types: Vec<TypeDef>,
-    type_ids: HashMap<TypeDef, u32>,
+    type_ids: crate::fx::Map<TypeDef, u32>,
     consts: Vec<(Ty, Const)>,
-    const_ids: HashMap<(Ty, Const), u32>,
+    const_ids: crate::fx::Map<(Ty, Const), u32>,
     globals: Vec<Global>,
     funcs: Vec<Func>,
     func_ids: HashMap<String, u32>,

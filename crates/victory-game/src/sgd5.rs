@@ -90,6 +90,11 @@ pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
     memchr::memmem::find_iter(file, &MARKER).filter_map(|at| record(file, at))
 }
 
+/// The record whose marker is at `at` (a [`Record::offset`] of `file`).
+pub fn record_at(file: &[u8], at: usize) -> Option<Record<'_>> {
+    record(file, at)
+}
+
 fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
     let u32_at = |o: usize| {
         file.get(o..o + 4)

@@ -108,6 +108,8 @@ mod probe_tests;
 mod salu_tests;
 #[cfg(all(test, windows))]
 mod size_tests;
+#[cfg(test)]
+mod speed_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
@@ -129,6 +131,24 @@ pub use shader::{
     SLOT_STRIDE_CONSTANT, SLOT_STRIDES_COUNT, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constant_marks, constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
+
+#[cfg(test)]
+thread_local! {
+    /// Time this thread spent in the clean-up passes and in writing the
+    /// bitcode, for the speed test ([`speed_tests`]).
+    pub(crate) static CLOCK: std::cell::Cell<[std::time::Duration; 2]> =
+        const { std::cell::Cell::new([std::time::Duration::ZERO; 2]) };
+}
+
+/// Adds `since`'s elapsed time to slot `n` of [`CLOCK`].
+#[cfg(test)]
+pub(crate) fn clock(n: usize, since: std::time::Instant) {
+    CLOCK.with(|c| {
+        let mut t = c.get();
+        t[n] += since.elapsed();
+        c.set(t);
+    });
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
