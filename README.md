@@ -116,7 +116,9 @@ RTX 20, an external tool such as Lossless Scaling can add generated frames.
 - Textures can still appear late or briefly wrong while the title streams.
 - The first frame of the world freezes for about 4 s while it loads.
 
-What changed on 2026-11-27 (audit fixes, memory work, the launcher) and what still needs a game run:
-[docs/changes-2026-11-27.md](docs/changes-2026-11-27.md).
+What changed on 2026-11-27 (audit and translator fixes, CPU hot paths, memory work, the launcher with presets,
+warm-up and a benchmark page), the switches worth trying in a game run, and what still needs one:
+[docs/changes-2026-11-27.md](docs/changes-2026-11-27.md). Where the submitting thread's time goes:
+[docs/submit-thread.md](docs/submit-thread.md).
 
 The upstream README with full background and credits is in [UPSTREAM-README.md](UPSTREAM-README.md).
