@@ -568,6 +568,8 @@ struct Lanes {
     refused: u64,
     /// BCPack bytes written and time spent on them.
     bcpack: (u64, std::time::Duration),
+    /// Workers woken that found nothing to start ([`wake_few`]).
+    woken_idle: u64,
     since: Option<std::time::Instant>,
 }
 
@@ -626,6 +628,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     done: Default::default(),
                     refused: 0,
                     bcpack: Default::default(),
+                    woken_idle: 0,
                     since: None,
                 }),
                 work: Condvar::new(),
@@ -634,7 +637,10 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = worker_count(
+            std::env::var("VICTORY_DSTORAGE_WORKERS").ok().and_then(|v| v.trim().parse().ok()),
+            std::thread::available_parallelism().map_or(4, |n| n.get()),
+        );
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -643,14 +649,57 @@ fn scheduler() -> Option<&'static Scheduler> {
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(
+            workers = started,
+            wake_few = wake_few(),
+            "dstorage: workers (VICTORY_DSTORAGE_WORKERS, VICTORY_DSTORAGE_WAKE_FEW)"
+        );
     });
     Some(scheduler)
+}
+
+/// How many workers read: `asked` (`VICTORY_DSTORAGE_WORKERS`, 1 to 64),
+/// else one per logical processor, as before. Unset is the default: it was
+/// measured on the reference PC. With 16 processors the 16 workers come on
+/// top of some 40 threads of ours (land, records, views, under, wide, lists,
+/// mapping, pipelines) and the title's own; a lower count is for an A/B run.
+fn worker_count(asked: Option<usize>, processors: usize) -> usize {
+    match asked {
+        Some(n) => n.clamp(1, 64),
+        None => processors,
+    }
+}
+
+/// Whether a submit wakes one worker per read it hands them, not all of
+/// them (`VICTORY_DSTORAGE_WAKE_FEW=1`; off by default: all, as before).
+///
+/// A submit of one read woke all 16 workers: one took the read, the others
+/// took the scheduler's lock in turn, found nothing and slept again. Which
+/// read starts when is the same either way: `Lanes::start` picks it under
+/// the lock, whichever worker asks. A woken worker that finds the staging
+/// buffer full marks it, and the finish that frees room wakes them all.
+fn wake_few() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_WAKE_FEW").is_some_and(|v| v == "1"))
 }
 
 impl Scheduler {
     fn lock(&self) -> MutexGuard<'_, Lanes> {
         self.lanes.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Wakes workers for `reads` reads just handed to them ([`wake_few`]).
+    fn wake(&self, reads: usize) {
+        self.wake_as(reads, wake_few());
+    }
+
+    fn wake_as(&self, reads: usize, few: bool) {
+        if !few {
+            self.work.notify_all();
+            return;
+        }
+        // (More than there are workers wakes none more.)
+        (0..reads.min(64)).for_each(|_| self.work.notify_one());
     }
 }
 
@@ -784,11 +833,15 @@ pub(crate) mod stream_log {
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
+    let mut woken = false;
     loop {
         let Some(job) = lanes.start() else {
+            lanes.woken_idle += u64::from(woken);
             lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
+            woken = true;
             continue;
         };
+        woken = false;
         drop(lanes);
         let started = std::time::Instant::now();
         let traced = Traced::start(&job);
@@ -810,6 +863,23 @@ fn work(scheduler: &'static Scheduler) {
     }
 }
 
+#[cfg(test)]
+impl Scheduler {
+    /// A scheduler of its own with `workers` workers, for tests: they live
+    /// for as long as the test process does.
+    fn for_test(workers: usize, staging: u64) -> &'static Scheduler {
+        let scheduler: &'static Scheduler = Box::leak(Box::new(Scheduler {
+            lanes: Mutex::new(tests::lanes(staging)),
+            work: Condvar::new(),
+            finished: Condvar::new(),
+        }));
+        for _ in 0..workers {
+            std::thread::spawn(move || work(scheduler));
+        }
+        scheduler
+    }
+}
+
 impl Lanes {
     /// Counts a finished request; every 5 s a debug line sums them up.
     fn count(&mut self, job: &Job, started: std::time::Instant) {
@@ -826,6 +896,7 @@ impl Lanes {
         if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
+            let woken_idle = std::mem::take(&mut self.woken_idle);
             tracing::debug!(
                 requests = *requests,
                 mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
@@ -835,6 +906,7 @@ impl Lanes {
                 bcpack_mb = self.bcpack.0 / 1_000_000,
                 bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
                 waiting,
+                woken_idle,
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
             );
@@ -891,10 +963,10 @@ impl Lanes {
     }
 
     /// Moves a queue's enqueued commands to the workers; `early` when the
-    /// title has not asked for it ([`queue`]).
-    fn submit(&mut self, id: u64, early: bool) {
+    /// title has not asked for it ([`queue`]). Returns the reads moved.
+    fn submit(&mut self, id: u64, early: bool) -> usize {
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
-            return;
+            return 0;
         };
         // A class that had nothing waiting starts from now, not from the
         // credit it left behind.
@@ -906,12 +978,13 @@ impl Lanes {
             self.clock[class] = self.clock[class].max(self.now);
         }
         let Some(lane) = self.lanes.get_mut(&id) else {
-            return;
+            return 0;
         };
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
         trace_batch(id, &lane.unsubmitted, early);
+        let reads = lane.unsubmitted.iter().filter(|c| matches!(c, Command::Read(_))).count();
         for command in std::mem::take(&mut lane.unsubmitted) {
             let seq = self.next_seq;
             self.next_seq += 1;
@@ -924,6 +997,7 @@ impl Lanes {
             }
         }
         lane.flush();
+        reads
     }
 }
 
@@ -1338,8 +1412,8 @@ fn queue(this: QueueRef, command: Command) {
                 commands = lane.unsubmitted.len(),
                 "dstorage: a queue full of commands that are not submitted submits itself"
             );
-            lanes.submit(id, true);
-            scheduler.work.notify_all();
+            let reads = lanes.submit(id, true);
+            scheduler.wake(reads);
             continue;
         }
         lanes = scheduler
@@ -1352,8 +1426,8 @@ fn queue(this: QueueRef, command: Command) {
     };
     lane.unsubmitted.push(command);
     if half_submits() && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
-        lanes.submit(id, true);
-        scheduler.work.notify_all();
+        let reads = lanes.submit(id, true);
+        scheduler.wake(reads);
     }
 }
 
@@ -1370,8 +1444,8 @@ extern "system" fn submit(this: QueueRef) {
     let mut lanes = scheduler.lock();
     let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len());
     tracing::debug!(commands = pending, "dstorage: submit");
-    lanes.submit(id, false);
-    scheduler.work.notify_all();
+    let reads = lanes.submit(id, false);
+    scheduler.wake(reads);
 }
 
 /// Ends the queue whatever its reference count: what was not started never
@@ -2296,7 +2370,7 @@ mod tests {
     }
 
     /// Lanes without workers: what `start` picks, and when statuses land.
-    fn lanes(staging: u64) -> Lanes {
+    pub(super) fn lanes(staging: u64) -> Lanes {
         Lanes {
             lanes: HashMap::new(),
             next_id: 0,
@@ -2310,8 +2384,143 @@ mod tests {
             done: Default::default(),
             refused: 0,
             bcpack: Default::default(),
+            woken_idle: 0,
             since: None,
         }
+    }
+
+    #[test]
+    fn worker_count_follows_the_processors_and_the_switch() {
+        assert_eq!(worker_count(None, 16), 16);
+        assert_eq!(worker_count(None, 12), 12);
+        assert_eq!(worker_count(Some(0), 16), 1);
+        assert_eq!(worker_count(Some(6), 16), 6);
+        assert_eq!(worker_count(Some(500), 16), 64);
+    }
+
+    /// Submits `batches` times `per` reads (`make` gives read number `n`)
+    /// to lane 0 of `scheduler`, the workers woken all or few, and waits
+    /// for each batch to be done. The time it took, and the workers woken
+    /// that found nothing to start.
+    fn drive(
+        scheduler: &'static Scheduler,
+        few: bool,
+        batches: usize,
+        per: usize,
+        make: &dyn Fn(usize) -> Request,
+    ) -> (Duration, u64) {
+        {
+            let mut l = scheduler.lock();
+            l.lanes.entry(0).or_insert_with(|| Lane::new(0, 4096));
+            l.woken_idle = 0;
+        }
+        let began = Instant::now();
+        for b in 0..batches {
+            let mut l = scheduler.lock();
+            let lane = l.lanes.get_mut(&0).unwrap();
+            for k in 0..per {
+                lane.unsubmitted.push(Command::Read(Read { request: make(b * per + k), note: Note::default() }));
+            }
+            let reads = l.submit(0, false);
+            assert_eq!(reads, per);
+            scheduler.wake_as(reads, few);
+            while l.lanes.get(&0).is_some_and(|lane| !lane.reads.is_empty() || !lane.running.is_empty()) {
+                l = scheduler.finished.wait(l).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        let took = began.elapsed();
+        // (Those woken last have had a moment to look.)
+        std::thread::sleep(Duration::from_millis(20));
+        (took, std::mem::take(&mut scheduler.lock().woken_idle))
+    }
+
+    /// Woken one per read or all at once, the workers start every read and
+    /// write the same bytes: memory copies of 4 KiB, and zlib reads from a
+    /// file with a staging buffer that holds three of them (so that woken
+    /// workers find it full and wait for a finish). Fixed contents.
+    #[test]
+    fn few_wakes_start_every_read_as_all_wakes_do() {
+        const SIZE: usize = 4096;
+        const COUNT: usize = 600;
+        let source = pattern(SIZE * COUNT);
+        let chunks: Vec<Vec<u8>> = source.chunks(SIZE).map(compress_zlib).collect();
+        let offsets: Vec<usize> = chunks.iter().scan(0, |at, c| Some(std::mem::replace(at, *at + c.len()))).collect();
+        let (_dir, file) = file_with(&chunks.concat());
+        let most = chunks.iter().map(Vec::len).max().unwrap() as u64;
+        let mut outputs = Vec::new();
+        for (zlib, staging) in [(false, STAGING), (true, 3 * most)] {
+            let scheduler = Scheduler::for_test(16, staging);
+            for few in [false, true] {
+                let mut out = vec![0u8; SIZE * COUNT];
+                let at = out.as_mut_ptr() as usize;
+                let make = |n: usize| {
+                    let i = n % COUNT;
+                    let dest = (at + i * SIZE) as *mut c_void;
+                    if zlib {
+                        request(ZLIB, dest, SIZE, file, offsets[i] as u64, chunks[i].len())
+                    } else {
+                        request(MEMORY_SOURCE, dest, SIZE, source[i * SIZE..].as_ptr().cast(), 0, SIZE)
+                    }
+                };
+                for per in [1usize, 3, 7] {
+                    drive(scheduler, few, COUNT.div_ceil(per), per, &make);
+                }
+                assert!(out == source, "few {few}, zlib {zlib}");
+                outputs.push(out);
+            }
+        }
+        assert!(outputs.windows(2).all(|w| w[0] == w[1]));
+    }
+
+    /// The CPU time of the whole process so far, user and kernel.
+    fn process_cpu() -> Duration {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+        let mut t = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
+        // SAFETY: four out-parameters of ours.
+        unsafe { GetProcessTimes(GetCurrentProcess(), &mut t[0], &mut t[1], &mut t[2], &mut t[3]) };
+        let ticks = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime);
+        Duration::from_nanos((ticks(t[2]) + ticks(t[3])) * 100)
+    }
+
+    /// What a submit of a few reads costs with all 16 workers woken and
+    /// with one woken per read (a measurement; prints with `cargo test
+    /// --release -p victory-hle -- --nocapture few_wakes_cost_less`):
+    /// 2,000 submits of 1 and of 4 memory copies of 4 KiB, each waited for,
+    /// as the title's streaming thread submits small batches.
+    #[test]
+    fn few_wakes_cost_less() {
+        const SIZE: usize = 4096;
+        let source = pattern(SIZE * 4);
+        let mut out = vec![0u8; SIZE * 4];
+        let at = out.as_mut_ptr() as usize;
+        let make = |n: usize| {
+            let i = n % 4;
+            request(MEMORY_SOURCE, (at + i * SIZE) as *mut c_void, SIZE, source[i * SIZE..].as_ptr().cast(), 0, SIZE)
+        };
+        // (Enough that the process's CPU time, counted in 15.6 ms steps,
+        // means something.)
+        let batches = if cfg!(debug_assertions) { 200 } else { 20_000 };
+        let scheduler = Scheduler::for_test(16, STAGING);
+        for per in [1usize, 4] {
+            let mut said = Vec::new();
+            for few in [false, true] {
+                // (Once to settle the workers.)
+                drive(scheduler, few, 20, per, &make);
+                let cpu = process_cpu();
+                let (took, idle) = drive(scheduler, few, batches, per, &make);
+                let cpu = process_cpu() - cpu;
+                said.push(format!(
+                    "{}: {:.1} us a submit until done, {:.1} us of CPU (all threads), {:.1} workers woken for nothing",
+                    if few { "one woken per read" } else { "all 16 woken" },
+                    took.as_secs_f64() * 1e6 / batches as f64,
+                    cpu.as_secs_f64() * 1e6 / batches as f64,
+                    idle as f64 / batches as f64
+                ));
+            }
+            println!("{per} reads a submit: {}", said.join("; "));
+        }
+        assert_eq!(out, source);
     }
 
     fn read(lanes: &mut Lanes, id: u64, options: u64, size: u32) {
@@ -2333,7 +2542,9 @@ mod tests {
                 read(&mut l, id, 0, 4096);
             }
         }
-        (0..3).for_each(|id| l.submit(id, false));
+        (0..3).for_each(|id| {
+            l.submit(id, false);
+        });
         let mut started = [0u32; 3];
         for _ in 0..330 {
             let job = l.start().unwrap();

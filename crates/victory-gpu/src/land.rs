@@ -29,7 +29,7 @@
 //! [`crate::watch::landed_beside`] notes the blocks written afterwards, so
 //! that the next refresh takes them as before.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 /// The unit pieces are cut in (of title memory), and the guards' blocks.
@@ -54,6 +54,29 @@ fn threads() -> usize {
         let asked = std::env::var("VICTORY_LAND_THREADS").ok().and_then(|v| v.trim().parse().ok());
         asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() / 4).clamp(1, 4)).clamp(1, 16)
     })
+}
+
+/// Whether the helpers of the pools that the submitting thread and the
+/// relay wait for run above normal priority (`VICTORY_POOL_PRIORITY=1`; off
+/// by default: normal, as before).
+///
+/// `victory-submit` runs above normal. What it waits for at the end of a
+/// submission, the heaps' records (`victory-records`), and the title's bytes
+/// under flights' writes (`victory-under`), and what the relay waits for
+/// (`victory-land`), run at normal priority beside the title's threads, its
+/// eight list threads, and 16 DirectStorage workers, on 16 processors. A
+/// helper the scheduler leaves waiting keeps the whole batch waiting. The
+/// views' pool (`victory-views`) is what the title's list threads wait for:
+/// it stays as it is. For a game A/B run; untested in game.
+fn raised() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_PRIORITY").is_some_and(|v| v == "1"))
+}
+
+/// The priority the helpers of pool `name` are given, if any ([`raised`]).
+fn helper_priority(name: &str, raised: bool) -> Option<i32> {
+    use windows_sys::Win32::System::Threading::THREAD_PRIORITY_ABOVE_NORMAL;
+    (raised && matches!(name, "victory-records" | "victory-under" | "victory-land")).then_some(THREAD_PRIORITY_ABOVE_NORMAL)
 }
 
 /// Whether views of the title's pages are written through one of ours.
@@ -234,8 +257,18 @@ pub(crate) fn log(frames: f64) {
 }
 
 /// Threads kept for landing, and the work they are at.
+///
+/// The numbers of a batch are handed out by `next`, an atomic counter, not
+/// under `state`: the heaps' records come in some 1,500 jobs a frame, and a
+/// lock taken per job had every thread of the pool, and the caller, queue
+/// on it between jobs. The lock is taken once when a helper joins a batch
+/// and once when it leaves it. The numbers still go out in order, each
+/// once, as they did under the lock.
 struct Pool {
     state: Mutex<State>,
+    /// The next number of the batch under way. Set back to 0 under `state`
+    /// before a batch is given; past `count` once all are taken.
+    next: AtomicUsize,
     more: Condvar,
     idle: Condvar,
     /// One batch at a time.
@@ -246,9 +279,8 @@ struct Pool {
 struct State {
     /// What to do with each number below `count`.
     work: Option<Work>,
-    next: usize,
     count: usize,
-    /// Helpers inside a call.
+    /// Helpers inside the batch.
     running: usize,
     panicked: bool,
 }
@@ -266,8 +298,14 @@ impl Pool {
     }
 
     fn new(name: &'static str, threads: usize) -> &'static Pool {
+        Pool::new_at(name, threads, helper_priority(name, raised()))
+    }
+
+    /// [`Pool::new`], its helpers at `priority` if one is given.
+    fn new_at(name: &'static str, threads: usize, priority: Option<i32>) -> &'static Pool {
         let pool: &'static Pool = Box::leak(Box::new(Pool {
-            state: Mutex::new(State { work: None, next: 0, count: 0, running: 0, panicked: false }),
+            state: Mutex::new(State { work: None, count: 0, running: 0, panicked: false }),
+            next: AtomicUsize::new(0),
             more: Condvar::new(),
             idle: Condvar::new(),
             turn: Mutex::new(()),
@@ -276,6 +314,11 @@ impl Pool {
         for i in 1..threads {
             // (A helper that is not there is only missed.)
             let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || {
+                if let Some(priority) = priority {
+                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+                    // SAFETY: this thread's own priority.
+                    unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+                }
                 if name == "victory-land" {
                     crate::cores::keep_helper_on_fast_cores(name);
                 } else {
@@ -287,22 +330,35 @@ impl Pool {
         pool
     }
 
+    /// The next number below `count`, if one is left.
+    fn claim(&self, count: usize) -> Option<usize> {
+        // (Past `count` by at most the threads of the pool: each stops at
+        // the first number it is given past it.)
+        let i = self.next.fetch_add(1, Ordering::Relaxed);
+        (i < count).then_some(i)
+    }
+
     fn help(&self) {
         let mut state = self.state();
         loop {
-            let Some((work, i)) = take(&mut state) else {
+            let count = state.count;
+            let Some(work) = state.work.filter(|_| self.next.load(Ordering::Relaxed) < count) else {
                 state = self.more.wait(state).unwrap_or_else(|e| e.into_inner());
                 continue;
             };
             state.running += 1;
             drop(state);
-            let working = crate::timeline::span("a landing's job");
-            // SAFETY: counted in `running`, so `each` has not returned.
-            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
-            working.end();
+            let mut panicked = false;
+            while let Some(i) = self.claim(count) {
+                let working = crate::timeline::span("a landing's job");
+                // SAFETY: counted in `running`, so `each` has not returned.
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
+                working.end();
+                panicked |= ran.is_err();
+            }
             state = self.state();
             state.running -= 1;
-            state.panicked |= ran.is_err();
+            state.panicked |= panicked;
             if state.running == 0 {
                 self.idle.notify_all();
             }
@@ -322,7 +378,9 @@ impl Pool {
         // it does not before no helper is inside `f` and none can enter.
         let work = Work(unsafe { std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const (dyn Fn(usize) + Sync + 'static)>(f) });
         let mut state = self.state();
-        (state.work, state.next, state.count, state.panicked) = (Some(work), 0, count, false);
+        // (No helper is in a batch: the last `each` waited for them all.)
+        self.next.store(0, Ordering::Relaxed);
+        (state.work, state.count, state.panicked) = (Some(work), count, false);
         drop(state);
         if count > self.threads {
             self.more.notify_all();
@@ -330,13 +388,15 @@ impl Pool {
             (1..count).for_each(|_| self.more.notify_one());
         }
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            loop {
-                let Some((_, i)) = take(&mut self.state()) else { break };
+            while let Some(i) = self.claim(count) {
                 f(i);
             }
         }));
+        if ran.is_err() {
+            // After a panic here: nothing more is begun.
+            self.next.fetch_max(count, Ordering::Relaxed);
+        }
         let mut state = self.state();
-        // (After a panic here: nothing more is begun.)
         state.work = None;
         while state.running > 0 {
             state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
@@ -348,16 +408,6 @@ impl Pool {
         }
         assert!(!panicked, "a job of landing panicked");
     }
-}
-
-/// The next number of the batch, if there is one.
-fn take(state: &mut State) -> Option<(Work, usize)> {
-    let work = state.work?;
-    if state.next >= state.count {
-        return None;
-    }
-    state.next += 1;
-    Some((work, state.next - 1))
 }
 
 /// [`Pool::each`] on the threads kept for landing.

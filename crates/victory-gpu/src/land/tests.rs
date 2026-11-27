@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE};
 
 struct Random(u64);
@@ -80,6 +80,232 @@ fn a_panicking_job_reaches_the_caller() {
             n.fetch_add(i, Ordering::Relaxed);
         });
         assert_eq!(n.into_inner(), 190);
+    }
+}
+
+/// `VICTORY_POOL_PRIORITY=1` raises the helpers of the records', the under
+/// and the landing pools, not the views'; off, none; and a pool's helpers
+/// run at what they are given, the caller at its own.
+#[test]
+fn pool_helpers_run_at_the_priority_asked() {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+    for name in ["victory-records", "victory-under", "victory-land"] {
+        assert_eq!(helper_priority(name, true), Some(THREAD_PRIORITY_ABOVE_NORMAL));
+        assert_eq!(helper_priority(name, false), None);
+    }
+    assert_eq!(helper_priority("victory-views", true), None);
+    // SAFETY: plain queries of this thread.
+    let own = unsafe { GetThreadPriority(GetCurrentThread()) };
+    let caller = std::thread::current().id();
+    for (priority, helpers) in [(Some(THREAD_PRIORITY_ABOVE_NORMAL), THREAD_PRIORITY_ABOVE_NORMAL), (None, 0)] {
+        let pool = Pool::new_at("victory-records", 4, priority);
+        let seen = Mutex::new(Vec::new());
+        pool.each(64, &|_| {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            // SAFETY: as above.
+            let at = unsafe { GetThreadPriority(GetCurrentThread()) };
+            seen.lock().unwrap().push((std::thread::current().id() == caller, at));
+        });
+        let seen = seen.into_inner().unwrap();
+        assert!(seen.iter().any(|s| !s.0), "a helper ran");
+        assert!(seen.iter().all(|&(on_caller, at)| at == if on_caller { own } else { helpers }), "{seen:?}");
+    }
+}
+
+/// The pool as it was before its numbers were handed out by an atomic
+/// counter: every number taken under the pool's lock. Kept as the reference
+/// for the tests and the benchmark below.
+struct LockedPool {
+    state: Mutex<LockedState>,
+    more: Condvar,
+    idle: Condvar,
+    turn: Mutex<()>,
+    threads: usize,
+}
+
+struct LockedState {
+    work: Option<Work>,
+    next: usize,
+    count: usize,
+    running: usize,
+    panicked: bool,
+}
+
+impl LockedPool {
+    fn state(&self) -> MutexGuard<'_, LockedState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn new(threads: usize) -> &'static LockedPool {
+        let pool: &'static LockedPool = Box::leak(Box::new(LockedPool {
+            state: Mutex::new(LockedState { work: None, next: 0, count: 0, running: 0, panicked: false }),
+            more: Condvar::new(),
+            idle: Condvar::new(),
+            turn: Mutex::new(()),
+            threads,
+        }));
+        for _ in 1..threads {
+            std::thread::spawn(move || {
+                crate::cores::keep_helper_on_fast_cores("victory-land");
+                pool.help()
+            });
+        }
+        pool
+    }
+
+    fn take(state: &mut LockedState) -> Option<(Work, usize)> {
+        let work = state.work?;
+        if state.next >= state.count {
+            return None;
+        }
+        state.next += 1;
+        Some((work, state.next - 1))
+    }
+
+    fn help(&self) {
+        let mut state = self.state();
+        loop {
+            let Some((work, i)) = Self::take(&mut state) else {
+                state = self.more.wait(state).unwrap_or_else(|e| e.into_inner());
+                continue;
+            };
+            state.running += 1;
+            drop(state);
+            let working = crate::timeline::span("a landing's job");
+            // SAFETY: counted in `running`, so `each` has not returned.
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
+            working.end();
+            state = self.state();
+            state.running -= 1;
+            state.panicked |= ran.is_err();
+            if state.running == 0 {
+                self.idle.notify_all();
+            }
+        }
+    }
+
+    fn each(&self, count: usize, f: &(dyn Fn(usize) + Sync)) {
+        if count < 2 || self.threads < 2 {
+            (0..count).for_each(f);
+            return;
+        }
+        let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: as in `Pool::each`.
+        let work = Work(unsafe { std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const (dyn Fn(usize) + Sync + 'static)>(f) });
+        let mut state = self.state();
+        (state.work, state.next, state.count, state.panicked) = (Some(work), 0, count, false);
+        drop(state);
+        if count > self.threads {
+            self.more.notify_all();
+        } else {
+            (1..count).for_each(|_| self.more.notify_one());
+        }
+        loop {
+            let Some((_, i)) = Self::take(&mut self.state()) else { break };
+            f(i);
+        }
+        let mut state = self.state();
+        state.work = None;
+        while state.running > 0 {
+            state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        assert!(!state.panicked, "a job of landing panicked");
+    }
+}
+
+/// Some work for number `i` of a batch: about `spin` steps, its result.
+fn job_result(seed: u64, i: usize, spin: usize) -> u64 {
+    let mut x = seed ^ (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    for _ in 0..spin + i % 7 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+    }
+    std::hint::black_box(x)
+}
+
+/// The pool with its numbers handed out by the counter gives every number
+/// to exactly one call, and so the same results, batch for batch, as the
+/// pool that took each under its lock: fixed seeds, several thread counts,
+/// batches of every size from 0, one caller after the other and three at
+/// once.
+#[test]
+fn the_counted_pool_gives_what_the_locked_one_gave() {
+    let mut random = Random(0x5eed_1a4d);
+    for threads in [1usize, 2, 3, 6, 7] {
+        let (new, old) = (Pool::new("victory-land", threads), LockedPool::new(threads));
+        let run = |count: usize, seed: u64, each: &dyn Fn(usize, &(dyn Fn(usize) + Sync))| -> Vec<u64> {
+            let out: Vec<AtomicU64> = (0..count).map(|_| AtomicU64::new(0)).collect();
+            let calls: Vec<AtomicU32> = (0..count).map(|_| AtomicU32::new(0)).collect();
+            each(count, &|i| {
+                calls[i].fetch_add(1, Ordering::Relaxed);
+                out[i].store(job_result(seed, i, 16), Ordering::Relaxed);
+            });
+            assert!(calls.iter().all(|c| c.load(Ordering::Relaxed) == 1), "{threads} threads, {count}");
+            out.into_iter().map(AtomicU64::into_inner).collect()
+        };
+        for _ in 0..200 {
+            let (count, seed) = (random.next() % 300, random.next() as u64);
+            let a = run(count, seed, &|n, f| new.each(n, f));
+            let b = run(count, seed, &|n, f| old.each(n, f));
+            assert_eq!(a, b, "{threads} threads, {count} numbers");
+        }
+        let run = &run;
+        std::thread::scope(|s| {
+            for caller in 0..3u64 {
+                s.spawn(move || {
+                    for round in 0..100usize {
+                        let count = (round * 13 + caller as usize) % 120;
+                        let a = run(count, caller, &|n, f| new.each(n, f));
+                        let b: Vec<u64> = (0..count).map(|i| job_result(caller, i, 16)).collect();
+                        assert_eq!(a, b);
+                    }
+                });
+            }
+        });
+    }
+}
+
+/// What a batch costs with each pool (a measurement; prints with
+/// `cargo test --release -p victory-gpu --lib -- --nocapture land::tests::what_a_batch_costs`):
+/// 1,536 jobs, as many as a frame's heap records come in, of no work, about
+/// 1 us and about 10 us, on 4 and 6 threads (the view and record pools), and
+/// the time per job that is not the job's (the threads' time over the
+/// batch less the jobs', over the jobs). Results checked equal.
+#[test]
+fn what_a_batch_costs() {
+    const JOBS: usize = 1536;
+    let release = !cfg!(debug_assertions);
+    for threads in [4usize, 6] {
+        let (new, old) = (Pool::new("victory-land", threads), LockedPool::new(threads));
+        for spin in [0usize, 200, 2000] {
+            let measure = |each: &dyn Fn(usize, &(dyn Fn(usize) + Sync))| -> (f64, f64, u64) {
+                let mut best = (f64::MAX, f64::MAX);
+                let mut sum = 0u64;
+                for _ in 0..if release { 40 } else { 3 } {
+                    let busy = AtomicU64::new(0);
+                    let total = AtomicU64::new(0);
+                    let began = std::time::Instant::now();
+                    each(JOBS, &|i| {
+                        let t = std::time::Instant::now();
+                        total.fetch_add(job_result(7, i, spin), Ordering::Relaxed);
+                        busy.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    });
+                    let wall = began.elapsed().as_nanos() as f64;
+                    let lost = (wall * threads as f64 - busy.into_inner() as f64).max(0.0) / JOBS as f64;
+                    best = (best.0.min(wall / 1e3), best.1.min(lost));
+                    sum = total.into_inner();
+                }
+                (best.0, best.1, sum)
+            };
+            let (old_us, old_lost, old_sum) = measure(&|n, f| old.each(n, f));
+            let (new_us, new_lost, new_sum) = measure(&|n, f| new.each(n, f));
+            assert_eq!(old_sum, new_sum);
+            println!(
+                "{threads} threads, {JOBS} jobs of {spin} steps: a lock per job {old_us:.0} us a batch ({old_lost:.0} ns a job \
+                 not in jobs), the counter {new_us:.0} us ({new_lost:.0} ns)"
+            );
+        }
     }
 }
 
