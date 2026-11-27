@@ -2327,6 +2327,128 @@ fn let_go_unmapped(
 #[cfg(windows)]
 pub(crate) static SWEPT_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// Diagnostics (`VICTORY_TEXTURE_AUDIT=<MB>`, off): once a second, up to that
+/// many megabytes of title memory of the textures used in the last second
+/// are read again and compared with what their host copy was last filled
+/// from (`HostTexture::holds`). A texture that differs counts as stale. One
+/// that differs with the same bytes at two looks in a row is stale while
+/// the title left its memory alone: a change the layer did not see, and the
+/// card shows the old bytes. Nothing is changed; this only counts, so that
+/// stale textures (rainbow blocks, low levels) can be told from wrong ones.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn audit() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let mb = *MB.get_or_init(|| std::env::var("VICTORY_TEXTURE_AUDIT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    if mb == 0 {
+        return;
+    }
+    /// Per texture that differed at the last look: the bytes it held then,
+    /// and the frame it was first seen to differ in.
+    static SEEN: std::sync::Mutex<Option<std::collections::HashMap<usize, (crate::texture::Digest, u64)>>> =
+        std::sync::Mutex::new(None);
+    static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let began = std::time::Instant::now();
+    let frame = crate::frame::current();
+    let budget = mb << 20;
+    // Counts: looked at, their bytes, equal, differ, differ and partly
+    // mapped, differ and stable, of them with a staging buffer, no hash
+    // kept, oldest stable age in frames, stable bytes.
+    let mut c = [0u64; 10];
+    let mut said = 0;
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = seen.get_or_insert_with(Default::default);
+    let mut differing = std::collections::HashMap::new();
+    let all = textures();
+    let from = FROM.load(Relaxed);
+    let mut last = None;
+    for &at in all.range(from..).chain(all.range(..from)) {
+        if c[1] >= budget {
+            break;
+        }
+        last = Some(at);
+        // SAFETY: as in `let_go_idle`.
+        let r = unsafe { &*(at as *const Resource) };
+        if !fills(&r.desc) || crate::host::long_ago(r.host.used.load(Relaxed), 1000, 2) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        let host = match r.host.made.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some((host, _)) => host.clone(),
+            None => continue,
+        };
+        let Some((first, held)) = *host.holds.lock().unwrap_or_else(|e| e.into_inner()) else {
+            c[7] += 1;
+            continue;
+        };
+        let Some(layout) = texture_layout(&r.desc) else { continue };
+        let layout = &layout.planes[0].layout;
+        let size = layout.bytes_from(first) as usize;
+        let mut read = vec![0u8; size];
+        let there = crate::host::read_there(r.data().cast_const(), &mut read);
+        let now = crate::texture::digest(&read);
+        c[0] += 1;
+        c[1] += size as u64;
+        if now == held {
+            c[2] += 1;
+            continue;
+        }
+        c[3] += 1;
+        if there < size {
+            c[4] += 1;
+        }
+        let first_seen = match seen.get(&at) {
+            Some(&(was, since)) if was == now => {
+                c[5] += 1;
+                c[9] += size as u64;
+                if crate::texture::is_staged(at as This) {
+                    c[6] += 1;
+                }
+                c[8] = c[8].max(frame.saturating_sub(since));
+                if said < 12 {
+                    said += 1;
+                    tracing::info!(
+                        texture = format_args!("{at:#x}"),
+                        memory = format_args!("{:#x}", r.data() as usize),
+                        width = r.desc.width,
+                        height = r.desc.height,
+                        levels = r.desc.mip_levels,
+                        element_bytes = layout.desc.element_bytes,
+                        block = layout.desc.block,
+                        swizzle = ?layout.desc.swizzle,
+                        first,
+                        bytes = size,
+                        mapped = there,
+                        placed = r.host.placed.load(Relaxed),
+                        staged = crate::texture::is_staged(at as This),
+                        frames = frame.saturating_sub(since),
+                        "texture audit: a stale host copy, the title's memory unchanged since the last look"
+                    );
+                }
+                since
+            }
+            _ => frame,
+        };
+        differing.insert(at, (now, first_seen));
+    }
+    drop(all);
+    FROM.store(last.map_or(0, |at| at + 1), Relaxed);
+    *seen = differing;
+    tracing::info!(
+        "texture audit (VICTORY_TEXTURE_AUDIT): {} used host copies looked at ({} MB) in {} ms: {} as filled, {} differ from title memory now ({} of them partly mapped), {} stale with the title's memory unchanged since the last look ({} MB, {} with a staging buffer, the oldest {} frames); {} with no hash kept (not looked at)",
+        c[0],
+        c[1] >> 20,
+        began.elapsed().as_millis(),
+        c[2],
+        c[3],
+        c[4],
+        c[5],
+        c[9] >> 20,
+        c[6],
+        c[8],
+        c[7]
+    );
+}
+
 /// For the memory line: the host copies the sweep never lets go
 /// ([`let_go_idle`] takes only copies of textures the title fills that the
 /// host never copied into), by what would say they are dead weight. A
