@@ -1,14 +1,12 @@
 # runkis-nvidia
 
-A tuned build of the VIctory compatibility layer for **RTX 20-class NVIDIA cards and 6-core CPUs**. VIctory runs an
-Xbox Series title's own executable on Windows. This fork is based on
+A tuned build of the VIctory compatibility layer for **NVIDIA RTX cards**. VIctory runs an Xbox Series title's own
+executable on Windows: the title's x86-64 code runs natively, and the layer implements the console's APIs and
+translates its graphics work and shaders to host D3D12. This fork is based on
 [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA). It includes renderer ports from
 [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX), plus fixes taken from
 [louketa/foxhound](https://github.com/louketa/foxhound) and
-[Yaekai/victory-scarlett-3070](https://github.com/Yaekai/victory-scarlett-3070). Every change up to 2026-11-26 was
-measured on the PC below before it was kept. The changes of 2026-11-27 (fixes, CPU work, the launcher; see the end of
-this page) are tested with the project's tests and offline benchmarks but **not yet measured in the game**: the
-results below are from before them.
+[Yaekai/victory-scarlett-3070](https://github.com/Yaekai/victory-scarlett-3070).
 
 > **No game files are included.** You need your own copy of the title (Xbox Series build v1.0.2.1).
 > Not affiliated with or endorsed by the title's developer or publisher, nor by NVIDIA. GPL-3.0-or-later.
@@ -17,110 +15,97 @@ results below are from before them.
 
 | | |
 |---|---|
-| CPU | AMD Ryzen 5 5500X3D (6 cores / 12 threads) |
-| GPU | NVIDIA GeForce RTX 2070 SUPER 8 GB (Turing) |
-| RAM | 32 GB |
-| OS | Windows 11, hardware-accelerated GPU scheduling on, High performance power plan |
-| Profile | Series S, 960x540 internal (half scale), the title's own upscaler to 1080p |
+| CPU | AMD Ryzen 7 7800X3D (8 cores / 16 threads) |
+| GPU | NVIDIA GeForce RTX 4070 SUPER 12 GB |
+| RAM | 32 GB (31 GB usable) |
+| OS | Windows 11, Balanced power plan, no system tweaks |
+| Profile | Series S, 540p or 720p internal, the title's own upscaler, frames scaled to a 1440p window |
 
-## Results
+## Results (measured in game)
 
-**About 17–19 fps** in the opening scenes, and **up to about 26 fps** when little is on screen. 1 % lows are around
-7 fps. After loading, no freeze is longer than about 0.5 s.
+Measured on the PC above with an automated run: the title is started, scripted key presses take it through the
+menus into the first gameplay scene (the prison), and frames are read from the layer's own per-frame log between
+seconds 150 and 240. One run each, so treat differences under about 1 fps as noise.
 
-The game starts at roughly 4–9 fps on the build this one began from. The biggest steps:
+| Build | fps | 1 % low | frames over 100 ms |
+|---|---|---|---|
+| Defaults at commit 0458641 | 25.95 | 8.0 | 5 |
+| + descriptor-table cache and early heap-record rounds | 27.14 | 14.0 | 0 |
+| + the title's 30 fps lock lifted to 60 | **35.5** | 9.6 | 5 |
 
-| Change | Effect (measured) |
-|---|---|
-| VIctory-NVIDIA instead of the older build | 4–9 → ~9.6 fps, correct picture |
-| GPU crash diagnostics off (`VICTORY_D3D12_DRED=0`) | 2–4x less GPU time on Turing |
-| Memory compares on the card down to 64 KB (`VICTORY_CARD_BUFFERS_MIN_KB=64`) | about +10 % |
-| Renderer ports 1, 2, 6 from the 7900 XTX fork | CPU cost per graphics call 9.4 → 6.8 µs |
-| "Keep-awake" GPU job off (`VICTORY_CARD_AWAKE=0`) | 17.7 → 18.7 fps, half as many stutters (it hurts NVIDIA) |
-| Pipeline wait 0.5 s instead of 10 s | a slow new shader shows a moment later instead of freezing the picture for seconds |
-| Texture mip drop for textures 2048 px and larger | less pressure on 8 GB of VRAM; 1 % low 6 → 7.2 fps |
-| 6 memory-compare threads instead of 3, woken only when there is work | small CPU saving |
-| Big-compare thread split fix (from Yaekai) | a compare could wrap below zero and skip memory |
-| Render-target reserve 1.5 GB instead of 3 GB (`VICTORY_CARD_ROOM_FOR_TARGETS_MB=1536`) | twice the textures on the card (1.2 → 2.3 GB), far less texture churn, worst frame 0.7–1.2 s → 0.2 s |
-| Pool discard when free RAM is under 4 GB (from foxhound) | keeps a 32 GB PC from paging (one such PC ran at 4–5 fps with RAM full) |
-| Pipeline recording (`VICTORY_PIPELINE_BOOK=1`) | lets `-Warm` build every pipeline ahead of play |
+- Menus and loading screens now run at the 60 fps cap. Gameplay runs at about **25–35 fps**, heavier scenes lower.
+  The game keeps its speed at 60 fps (it steps its world by elapsed time).
+- **The GPU is not the limit**: it is busy 1–2 ms of a frame. The CPU work of the layer is.
+- A first play session without warm-up hitched mostly on pipelines built during play (244 of 264 frames over
+  100 ms). After **Warm up shaders** those are built ahead.
+
+Measured on a second PC (Ryzen 5 5500X3D, RTX 2070-class, same save, 2 runs each against 16.98 fps) and now on by
+default: fetches in four parts (`VICTORY_FETCH_PARTS=4`, +0.65 fps) and the pool settled once a second
+(`VICTORY_POOL_SETTLE=1`, +0.45 fps).
 
 ## Where the time goes
 
-A frame takes about 55 ms on this PC, and the CPU is the limit (about 86 % busy on average).
+At 540p a frame takes about 34 ms, with the GPU busy about 1–2 ms of it. The rest is the layer emulating the
+console's **shared memory**: on the Xbox the CPU and GPU see one memory, on a PC they don't.
 
-- **About 40 ms of CPU** goes to translating the title's graphics work. The largest parts are mirroring the
-  descriptor heap (about 11 ms), syncing draw tables (8–13 ms) and merging copied-back memory (6–9 ms).
-- **About 20 ms** goes to copying GPU-written memory back. The Xbox shares one memory between CPU and GPU, and a PC
-  has to emulate that.
-- **The GPU is about 95 % busy** by the layer's own count, so a weaker GPU also costs frames.
+| Part (per frame) | Time | What it is |
+|---|---|---|
+| Preparing | ~23 ms | finding what the title changed (write watch, compares), refreshing host copies, translating command lists |
+| Copying back | ~16 ms | bringing ~22 MB the GPU wrote back into title memory |
+| Waiting for heap records | ~3–5 ms | mirroring descriptors the title wrote (was 10–13 ms) |
 
-Frames with many draws (6,000–7,000+) are the stutters. The first frame of the game world takes about 4 s while
-thousands of buffer copies are made.
-
-## Tried and not kept
-
-| Tried | Result |
-|---|---|
-| `VICTORY_WC_NO_BACK` (no copy-back of write-combined memory) | +16 % on paper, but **black flashes** and about a quarter fewer draws |
-| Upstream with the cool_fox renderer, no DLSS | 13.8 fps (slower) |
-| foxhound as a whole (no half scale on this card) | 13.7 fps, but copy-back 12 ms instead of 22 |
-| New upstream on the foxhound base + DLSS | broken hair and missing letters in text on this PC; very slow on first start |
-| DoubleGhosty/cool_fox | crashed with these settings |
-| `VICTORY_SPANS_QUICK` + `VICTORY_SYNC_FINE` | no gain; longer draw-table waits |
-| `VICTORY_HEAP_SYNC_FIRST` | slower, worse 1 % lows |
-| Texture mip drop from 1024 px | removes VRAM overflow completely, but visibly blurrier |
-| Release build instead of diagnostics build | not faster |
-| Port 5, 480p, removing barriers, skipping hair physics | 0–2 %, not worth it |
-
-These figures come from an automated bench: a fixed save, scripted input, a 40 s warm-up, then 90 s measured, with
-frame pacing read from the layer's own per-frame log. Four identical runs vary by about ±0.4 fps, so smaller
-differences are noise.
+Two findings drive the current work:
+- **Copy-back is mostly unneeded**: of the pages copied back, the title's own code read 0.1 % first; the layer's
+  own threads read the rest. Landing them only on demand is in progress.
+- **The title's own stores cost write faults**: a census of the title's write faults (`VICTORY_FAULT_BOOK`)
+  found 144 a frame in the executable, led by a flag store that almost never changes anything.
+  `VICTORY_WRITE_SITES` patches such stores in memory at load (never on disk) so they look first.
 
 ## How to run it
 
-1. Build it, or use a prebuilt `victory.exe` placed at `target\diag\victory.exe`:
-   `cargo build --profile diag -p victory --features diagnostics`. This needs Rust and the Visual Studio Build Tools.
-2. **Drag `game_scarlett_master.exe` onto `PLAY.bat`**, or copy your game folder next to it and name it `game`.
-3. The first start is slow while shaders are translated and pipelines are built. Later starts are faster.
+1. Build `target\diag\victory.exe`: `cargo build --profile diag -p victory --features diagnostics`
+   (needs Rust and the Visual Studio Build Tools).
+2. Keep the game **outside this folder** (for example `C:\Games\Xbox.v1.0.2.1`). The layer refuses game files,
+   caches and saves inside the source tree.
+3. Start **`LAUNCHER.bat`** (needs the .NET 8 SDK the first time), choose `game_scarlett_master.exe`, press
+   **Warm up shaders** once, then **PLAY**. Or drag `game_scarlett_master.exe` onto `PLAY.bat`.
+4. After playing somewhere new, warm up again: pipelines are recorded while you play and built ahead next time.
 
-Or use the **launcher** (`LAUNCHER.bat`, see [launcher/README.md](launcher/README.md)): the same tuned settings,
-saved profiles, a pre-flight check of the build, folders, card, RAM and drivers, live FPS / frame times / 1 % lows /
-CPU / RAM / GPU / VRAM, the log with known problems explained, and the pipeline warm-up and shader translation as
-buttons.
+The launcher ([launcher/README.md](launcher/README.md)):
+- **Start as**: presets, including one worked out for your card, CPU and RAM. It remembers your choice.
+- **Warm up shaders** with progress in per cent and time left.
+- **Settings**: render height (480–720p on Series S), **upscale to the window (sharp)** for screens above 1080p,
+  picture fixes.
+- **Controls**: every Xbox / PS5 button can be bound to a key or mouse button. The mouse turns the camera, left
+  button fires, right aims.
+- Live fps, frame times, 1 % lows, CPU, RAM, GPU and VRAM, the log with known problems explained, and a benchmark
+  page for A/B runs.
 
-In a source checkout PLAY.bat now keeps caches and saves under `%LOCALAPPDATA%\victory`: the layer refuses folders
-inside the source tree, so before this a checkout's PLAY.bat stopped at start.
-
-Options for `scripts\play-nvidia.ps1` (`-PrintEnv` prints the resulting settings as JSON without starting anything;
-the launcher uses it):
-- `-Warm` builds every recorded pipeline into the driver cache before play. This needs about 23 GB free on C: for
-  all of them; `-WarmLimit n` builds fewer.
-- `-Precompile` translates every shader ahead of time.
-
-Needs: Windows 10/11 x64, an NVIDIA RTX card, 32 GB of RAM (the game uses about 20 GB), an SSD.
-
-**Getting 30 fps on screen (RTX 20):** real fps is CPU-bound at about 17–19, so use frame generation outside
-the game: Lossless Scaling with LSFG 3, adaptive mode, a 30 fps target, flow scale 50 %, WGC capture, max frame
-latency 1. Input still feels like the real rate. For a sharper picture at no fps cost, turn on NVIDIA Image
-Sharpening for `victory.exe` (0.5 sharpen, 0.17 film grain).
-
-**Bodies/textures flying through walls:** `-Quality` (`QUALITY=1` in the start script) fixes them by turning off
-`RELAY=2` and `CARD_STEPS=2`, at about −29 % fps.
-
-**Tips:** close the browser and video players while playing (a YouTube tab costs about 0.8 fps here). Keep the
-NVIDIA shader cache size at "Unlimited" or large. Frame generation (DLSS FG, Smooth Motion) needs an RTX 40/50; on
-RTX 20, an external tool such as Lossless Scaling can add generated frames.
+Needs: Windows 10/11 x64, an NVIDIA RTX card, **32 GB of RAM** (the layer's process commits about 25 GB, part of
+it card memory), an SSD with about 25 GB free for the driver's shader cache.
 
 ## Known issues
 
-- Ray-traced lighting is not computed (a stand-in light is used), so some rooms look too bright or too dark.
-- Textures can still appear late or briefly wrong while the title streams.
-- The first frame of the world freezes for about 4 s while it loads.
+- **1080p internal crashes at start on the Series S profile**: the title runs out of its own memory pool and
+  stops. 720p is the highest that runs. The Series X profile at 1080p runs at about 13 fps and fills 32 GB of RAM.
+- **RAM use is high**: about 25 GB committed after a few minutes. Close other large programs while playing.
+- **Bright haze** when facing the sun or bright windows: the title's ray-traced light is not computed on NVIDIA
+  yet, so a stand-in light is used. In the launcher, tick "Leave out … heat haze" and lower Air. The structure
+  builder that ray tracing needs now translates for 32-lane GPUs (52 of 52 programs) but has not been run in game.
+- **Speed-set glitches**: occasional stretched bodies, dark shadow wedges on walls, and things through walls.
+  The "Fewer glitches" preset removes them at about −29 % fps; targeted fixes (`VICTORY_CROSS_WAIT=2`,
+  `VICTORY_TEXTURE_RECHECK=1`) are not yet measured. See [docs/speed-mode-bugs.md](docs/speed-mode-bugs.md).
+- A phone screen can be black for a moment at the start of a cutscene; glass blur can show over a character
+  standing in front of glass. Under investigation.
+- Textures can appear late or briefly wrong while the title streams.
 
-What changed on 2026-11-27 (audit and translator fixes, CPU hot paths, memory work, the launcher with presets,
-warm-up and a benchmark page), the switches worth trying in a game run, and what still needs one:
-[docs/changes-2026-11-27.md](docs/changes-2026-11-27.md). Where the submitting thread's time goes:
-[docs/submit-thread.md](docs/submit-thread.md).
+## More
 
-The upstream README with full background and credits is in [UPSTREAM-README.md](UPSTREAM-README.md).
+- What changed on 2026-11-27, every switch with what was measured, and what still needs a game run:
+  [docs/changes-2026-11-27.md](docs/changes-2026-11-27.md).
+- Where the submitting thread's time goes: [docs/submit-thread.md](docs/submit-thread.md); copy-back:
+  [docs/copy-back.md](docs/copy-back.md); heap records: [docs/heap-records.md](docs/heap-records.md).
+- For AI coding agents working on this repository: [CLAUDE.md](CLAUDE.md).
+- Earlier measurements on an RTX 2070 SUPER / Ryzen 5 5500X3D (17–19 fps at 540p) and the changes that got there
+  are in the git history of this file; the upstream README with full background and credits is in
+  [UPSTREAM-README.md](UPSTREAM-README.md).
