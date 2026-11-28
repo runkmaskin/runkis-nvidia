@@ -266,6 +266,29 @@ pub fn group_sync() -> u8 {
     })
 }
 
+/// Fewer meetings of the two host waves a console wave64 program runs as on a host of
+/// 32-lane waves (`VICTORY_FEWER_MEETINGS`, a set of bits; 0, the default: none of these):
+/// - 1: no group barrier before an LDS read that follows another LDS read of the same block
+///   with no other LDS access between (reads in a row cannot see different data in either
+///   host wave; the barrier before the first of them orders them after every earlier write);
+/// - 2: the halves' exchanges take two sets of slots in turn, so an exchange needs no second
+///   barrier after its reads: the next exchange writes the other set, and the one after that
+///   comes after the next exchange's barrier, which neither half passes before the other has
+///   read. The second barrier is put off to the next barrier of any kind, or to the end of the
+///   block.
+///
+/// Part of the translation: the shader cache keys on it.
+pub fn fewer_meetings() -> u32 {
+    #[cfg(test)]
+    if let Some(bits) = lower::TEST_FEWER_MEETINGS.get() {
+        return bits;
+    }
+    static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        std::env::var("VICTORY_FEWER_MEETINGS").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0) & 3
+    })
+}
+
 /// Whether buffer atomics of the ray-tracing structure builder stand between
 /// two fences (`VICTORY_BVH_FENCES=0`: they do not). Part of the
 /// translation: the shader cache keys on it.

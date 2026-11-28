@@ -340,6 +340,20 @@ struct Lower<'a> {
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
     exchange: Option<(u32, bool, Vec<bool>)>,
+    /// [`super::fewer_meetings`] for this program.
+    fewer: u32,
+    /// With `exchange` and `fewer & 2`: the console waves of a group (the second set of
+    /// exchange slots lies `2 * ex_waves` dwords past the first), the set the next exchange
+    /// takes, the set of the last exchange whose second barrier was put off (none once any
+    /// barrier came after it), and whether the barrier may be put off here (not in a block's
+    /// exit, where the block's end is already past).
+    ex_waves: u32,
+    ex_parity: bool,
+    ex_pending: Option<bool>,
+    ex_defer_ok: bool,
+    /// With `split_lds` and `fewer & 1`: the last LDS access of IR block `.0`: whether it was a
+    /// read, and whether it is ordered after every earlier write by a meeting.
+    lds_prev: Option<(usize, bool, bool)>,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -1507,6 +1521,8 @@ pub(super) fn host_max_wave() -> u32 {
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// A test's `VICTORY_FEWER_MEETINGS`, for its thread only ([`super::fewer_meetings`]).
+    pub(super) static TEST_FEWER_MEETINGS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -1846,7 +1862,9 @@ impl<'a> Lower<'a> {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                // (two sets of them with `fewer_meetings` bit 2)
+                                let sets = if super::fewer_meetings() & 2 != 0 { 2 } else { 1 };
+                                s.lds_dwords += 2 * sets * group.div_ceil(64);
                             }
                         }
                     }
@@ -2074,6 +2092,15 @@ impl<'a> Lower<'a> {
                 _ => Default::default(),
             },
             exchange,
+            fewer: super::fewer_meetings(),
+            ex_waves: match x.native.io {
+                StageIo::Cs(cs) => cs.threads.iter().product::<u32>().div_ceil(64),
+                _ => 1,
+            },
+            ex_parity: false,
+            ex_pending: None,
+            ex_defer_ok: true,
+            lds_prev: None,
             clane: None,
             pair: None,
             halves,
@@ -2803,6 +2830,8 @@ impl<'a> Lower<'a> {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
                     }
+                    // (whatever the section held, no read after it relies on a read before it)
+                    self.lds_prev = None;
                     i = end;
                     continue;
                 }
@@ -2812,8 +2841,18 @@ impl<'a> Lower<'a> {
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].1) {
                 self.lds_meeting();
             }
+            // An exchange's second barrier put off (`fewer_meetings` bit 2) comes before the
+            // block's exit at the latest: every thread that ran the exchange is here.
+            if self.ex_pending.is_some() {
+                let c = self.cur;
+                self.group_sync(c);
+            }
+            self.lds_prev = None;
             self.tail[b] = Some(self.cur);
-            self.exit(b)?;
+            self.ex_defer_ok = false;
+            let exit = self.exit(b);
+            self.ex_defer_ok = true;
+            exit?;
         }
         self.fill_phis()?;
         let user_data = self.user_reads.values().copied().collect();
@@ -4745,6 +4784,10 @@ impl<'a> Lower<'a> {
 
     /// A group barrier with an LDS fence in `block`.
     fn group_sync(&mut self, block: usize) {
+        // (a barrier where the lowering stands is the second barrier an exchange put off)
+        if block == self.cur {
+            self.ex_pending = None;
+        }
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -4780,8 +4823,12 @@ impl<'a> Lower<'a> {
             }
             return Ok(self.exchange_pairs(&[mine])[0]);
         }
+        // Two sets of slots taken in turn (`fewer_meetings` bit 2), where the lowering stands:
+        // the second barrier is put off ([`Self::ex_pending`]).
+        let set = if at == self.cur { self.exchange_set() } else { None };
         // the pair of dwords of this thread's console wave: its half's, then both
         let pair = self.exchange_pair(slot);
+        let pair = self.in_set(pair, set);
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
@@ -4796,9 +4843,52 @@ impl<'a> Lower<'a> {
         let p1 = self.s.m.element(at, lds, k1);
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
-        // the slots are written again only after every thread read them
-        self.group_sync(at);
+        if set.is_some() {
+            self.exchanged(set);
+        } else {
+            // the slots are written again only after every thread read them
+            self.group_sync(at);
+        }
         Ok((lo, hi))
+    }
+
+    /// With `fewer_meetings` bit 2, for an exchange where the lowering stands (outside a
+    /// block's exit): the set of slots it takes (`true`: the second), after a barrier if the
+    /// last exchange took the same set and no barrier came since. `None`: the one set, with
+    /// both barriers.
+    fn exchange_set(&mut self) -> Option<bool> {
+        if self.fewer & 2 == 0 || !self.ex_defer_ok {
+            return None;
+        }
+        let set = self.ex_parity;
+        if self.ex_pending == Some(set) {
+            let c = self.cur;
+            self.group_sync(c);
+        }
+        Some(set)
+    }
+
+    /// `first`, the first dword of this console wave's slots in the first set, moved to `set`.
+    fn in_set(&mut self, first: V, set: Option<bool>) -> V {
+        if set != Some(true) {
+            return first;
+        }
+        let c = self.cur;
+        let second = self.s.m.i32(2 * self.ex_waves);
+        self.s.m.bin(c, Bin::Add, first, second)
+    }
+
+    /// The exchange in `set` has read its slots: with a set, the second barrier is put off
+    /// (the next exchange takes the other set, and this one's is written again only after a
+    /// barrier that comes after both halves' reads here); without, it is made now.
+    fn exchanged(&mut self, set: Option<bool>) {
+        match set {
+            Some(set) => {
+                self.ex_pending = Some(set);
+                self.ex_parity = !set;
+            }
+            None => self.meet(),
+        }
     }
 
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
@@ -6121,9 +6211,12 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
+        let lds_access = matches!(inst.fields, Fields::Ds { .. }) && !(name.starts_with("ds_swizzle") || name.contains("permute"));
+        // (a plain read: neither a write nor an atomic, nor a counter of the wave's)
+        let lds_read = lds_access && name.starts_with("ds_read");
+        let mut met = false;
         if self.split_lds
-            && matches!(inst.fields, Fields::Ds { .. })
-            && !(name.starts_with("ds_swizzle") || name.contains("permute"))
+            && lds_access
             && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
             && !self.lds_unordered.contains(&(b, i))
         {
@@ -6131,11 +6224,19 @@ impl<'a> Lower<'a> {
                 // (in a loop the host waves take each on its own: a fence, no wait)
                 let (fence, void) = (self.s.m.i32(8), self.s.t.void);
                 self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+            } else if self.fewer & 1 != 0 && lds_read && self.lds_prev == Some((b, true, true)) {
+                // A read right after a read the host waves met before (`fewer_meetings` bit 1):
+                // nothing was written since that meeting, by either half.
+                met = true;
             } else {
                 // the two host waves of a console wave meet before each LDS access: what the
                 // other half wrote is visible, and what it still reads is not overwritten
                 self.meet();
+                met = true;
             }
+        }
+        if lds_access {
+            self.lds_prev = Some((b, lds_read, met));
         }
         // The structure builder's threads take turns through atomics (a tree
         // built from its leaves up): what one wrote before its atomic is
@@ -6170,6 +6271,10 @@ impl<'a> Lower<'a> {
                 let void = self.s.t.void;
                 self.s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                // (a barrier that waits is the second barrier an exchange put off)
+                if waits {
+                    self.ex_pending = None;
+                }
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
@@ -9569,7 +9674,9 @@ impl<'a> Lower<'a> {
                     let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
                     // (console waves meeting on their own: a buffer of the next meeting, which
                     // needs no second meeting before it is written again)
+                    let set = if self.pairs.is_some() { None } else { self.exchange_set() };
                     let k = if self.pairs.is_some() { self.exchange_dword() } else { self.exchange_pair(slot) };
+                    let k = self.in_set(k, set);
                     let at = self.begin_guarded(Some(is));
                     let lds = self.s.lds();
                     let ptr = self.s.m.element(self.cur, lds, k);
@@ -9580,7 +9687,7 @@ impl<'a> Lower<'a> {
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
                     if self.pairs.is_none() {
-                        self.meet();
+                        self.exchanged(set);
                     }
                     return int(self, r);
                 }

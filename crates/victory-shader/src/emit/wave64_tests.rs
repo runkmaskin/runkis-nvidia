@@ -1010,3 +1010,178 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
     }
     eprintln!("ran on the hardware device: 64 of 64 console threads, each once");
 }
+
+/// `VICTORY_FEWER_MEETINGS` ([`super::fewer_meetings`]): the same program, translated with
+/// every meeting and with fewer, gives the console's values on the card. One console wave of
+/// 64 threads run as two host waves; in a loop of s1 rounds (one at least) each lane writes
+/// its value to LDS and reads two others (lane t ^ 63, in the other half, and t ^ 1: two reads
+/// in a row), then reads lane 63's value (`v_readlane_b32`, the halves exchange) and, in every
+/// round but the second, lane 5's (a uniform branch between two exchanges). After the loop
+/// lane 40's value once more (an exchange outside the loop) is added. Run in a thread of its
+/// own: a translation whose halves wait for each other forever fails the test after 30 s
+/// instead of holding the card.
+#[test]
+fn fewer_meetings_give_the_consoles_values_with_exchanges_in_loops_and_branches() {
+    let mut w: Vec<u32> = vec![
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0: this lane's LDS dword
+        0x3A06_00BF, // v_xor_b32 v3, 63, v0
+        0x3406_0682, // v_lshlrev_b32 v3, 2, v3: lane t ^ 63's (the other half)
+        0x3A14_0081, // v_xor_b32 v10, 1, v0
+        0x3414_1482, // v_lshlrev_b32 v10, 2, v10: lane t ^ 1's
+        0x4A04_0000, // v_add_nc_u32 v2, s0, v0: the value starts at s0 + t
+        0xBE86_0380, // s_mov_b32 s6, 0: rounds done
+    ];
+    let top = w.len();
+    w.extend_from_slice(&[
+        0xD834_0000,
+        0x0000_0201, // ds_write_b32 v1, v2
+        0xD8D8_0000,
+        0x0400_0003, // ds_read_b32 v4, v3
+        0xD8D8_0000,
+        0x0500_000A, // ds_read_b32 v5, v10
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x4A04_0504, // v_add_nc_u32 v2, v4, v2
+        0x4A04_0505, // v_add_nc_u32 v2, v5, v2
+        0x360C_0481, // v_and_b32 v6, 1, v2
+        0x7D8A_0C80, // v_cmp_ne_u32 vcc, 0, v6: the odd values' lanes
+        0xD765_0007,
+        0x0001_006A, // v_mbcnt_lo_u32_b32 v7, vcc_lo, 0
+        0xD766_0007,
+        0x0002_0E6B, // v_mbcnt_hi_u32_b32 v7, vcc_hi, v7: odd lanes below this one
+        0x4A04_0507, // v_add_nc_u32 v2, v7, v2
+        0xD760_0007,
+        0x0001_7F02, // v_readlane_b32 s7, v2, 63
+        0xD760_000F,
+        0x0001_0102, // v_readlane_b32 s15, v2, 0: a second exchange in a row
+        0xBE8D_0380, // s_mov_b32 s13, 0
+        0xBF06_8106, // s_cmp_eq_u32 s6, 1
+        0xBF85_0002, // s_cbranch_scc1 past the next read
+        0xD760_000D,
+        0x0001_0B02, // v_readlane_b32 s13, v2, 5
+        0x4A04_0407, // v_add_nc_u32 v2, s7, v2
+        0x4A04_040F, // v_add_nc_u32 v2, s15, v2
+        0x3A04_040D, // v_xor_b32 v2, s13, v2
+        0x8006_8106, // s_add_u32 s6, s6, 1
+        0xBF0A_0106, // s_cmp_lt_u32 s6, s1
+    ]);
+    let back = w.len();
+    w.push(0xBF85_0000 | (top as i32 - (back as i32 + 1)) as u16 as u32); // s_cbranch_scc1 top
+    w.extend_from_slice(&[
+        0xD760_000E,
+        0x0001_5102, // v_readlane_b32 s14, v2, 40
+        0x4A04_040E, // v_add_nc_u32 v2, s14, v2
+        0xE070_1000,
+        0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+    ]);
+    let mut native = native_of(&w, true, 64);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    // the console: the 64 lanes in step
+    let console = |s0: u32, s1: u32| {
+        let mut v: Vec<u32> = (0..64u32).map(|t| s0.wrapping_add(t)).collect();
+        let mut round = 0u32;
+        loop {
+            let lds = v.clone();
+            for t in 0..64 {
+                v[t] = v[t].wrapping_add(lds[t ^ 63]).wrapping_add(lds[t ^ 1]);
+            }
+            let odd: Vec<bool> = v.iter().map(|x| x & 1 == 1).collect();
+            for t in 0..64 {
+                v[t] = v[t].wrapping_add(odd[..t].iter().filter(|&&o| o).count() as u32);
+            }
+            let (s7, s15) = (v[63], v[0]);
+            let s9 = if round == 1 { 0 } else { v[5] };
+            for x in &mut v {
+                *x = s15.wrapping_add(s7.wrapping_add(*x)) ^ s9;
+            }
+            round += 1;
+            if round >= s1 {
+                break;
+            }
+        }
+        let s11 = v[40];
+        v.iter().map(|x| x.wrapping_add(s11)).collect::<Vec<u32>>()
+    };
+    // (the census counts the written modules' instructions only when asked)
+    // SAFETY: a variable only this crate's census reads, set before any test thread reads it.
+    unsafe { std::env::set_var("VICTORY_SHADER_CENSUS", "") };
+    let barrier = super::bitcode::census::KINDS.iter().position(|k| *k == "barrier").expect("a barrier count");
+    let mut counts = Vec::new();
+    let shaders: Vec<(u32, HostShader)> = [0u32, 1, 2, 3]
+        .into_iter()
+        .map(|bits| {
+            let was = lower::TEST_FEWER_MEETINGS.replace(Some(bits));
+            let (wave, _) = lowered_with_wave(&native, &p, &HashSet::new());
+            // (counted: the census below reads the module's instructions)
+            let shader = lowered_counted(&native, &p, &HashSet::new(), 32, true).expect("lower");
+            counts.push((bits, super::bitcode::census::take(&shader.dxil).map(|c| c.counts[barrier])));
+            lower::TEST_FEWER_MEETINGS.set(was);
+            assert_eq!(wave, Some(32), "two host waves of 32 (bits {bits})");
+            if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+                let mut copy = shader.dxil.clone();
+                v.validate(&mut copy).unwrap_or_else(|e| panic!("DXIL validation failed (bits {bits}): {e}"));
+            }
+            (bits, shader)
+        })
+        .collect();
+    eprintln!("barriers in the program by bits: {counts:?}");
+    // (the census is off when another test of the process read the switch first)
+    if let (Some(all), Some(fewer)) = (counts[0].1, counts[3].1) {
+        assert!(fewer < all, "fewer meetings make fewer barriers: {counts:?}");
+    }
+    // The card for this test alone from here (the 30 s are its own), then in a thread.
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let (done, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok(host) = Host::new(false) else {
+            let _ = done.send(Err("no SM 6.6 hardware device; not run".to_owned()));
+            return;
+        };
+        let mut ran = Vec::new();
+        for (bits, shader) in &shaders {
+            let (root, pso) = match host.compute_pipeline(shader) {
+                Ok(x) => x,
+                Err(e) => {
+                    let _ = done.send(Err(format!("the hardware device does not take this program: {e}; not run")));
+                    return;
+                }
+            };
+            for (s0, s1) in [(0u32, 1u32), (12_345, 3), (0xDEAD_BEEF, 7), (7, 2)] {
+                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    if u.root == RootType::Constants {
+                        ud[u.index as usize] = [s0, s1].get(u.dword as usize).copied().unwrap_or(0);
+                    }
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &[View::RawUav(64)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("dispatch failed (bits {bits}): {e}"));
+                ran.push((*bits, s0, s1, out[0][..64].to_vec()));
+            }
+        }
+        let _ = done.send(Ok(ran));
+    });
+    let ran = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(Ok(ran)) => ran,
+        Ok(Err(why)) => {
+            eprintln!("{why}");
+            return;
+        }
+        Err(_) => panic!("the program did not finish in 30 s: its host waves wait for each other"),
+    };
+    for (bits, s0, s1, got) in &ran {
+        assert_eq!(got, &console(*s0, *s1), "bits {bits}, s0 {s0:#x}, s1 {s1}");
+    }
+    eprintln!("ran on the hardware device: {} runs, every set of bits gives the console's values", ran.len());
+}
