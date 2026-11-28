@@ -441,6 +441,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         // Said, with the numbers it was decided by: run 193 made 31 copies
         // of 95 and no line named the others. The first 64, then every
         // 32nd.
+        left_in_pc(LEFT_BUFFER_ROOM, size);
         let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
         let bytes = CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed) + size;
         if n <= 64 || n.is_multiple_of(32) {
@@ -462,6 +463,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        left_in_pc(LEFT_BUFFER_CAP, size);
         return None;
     }
     // (one made ahead, if it is of that size and one is in store: `crate::ahead`)
@@ -519,6 +521,43 @@ fn default_window_card_mb(local_vram_budget: Option<u64>) -> u64 {
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).
 static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Title memory whose copy stayed in the PC's memory though it was to go to
+/// the card's, since the start: a count and bytes each, by why. Its shaders'
+/// reads cross the bus: on this card's 12 GB, before the limits followed
+/// the budget, the heaviest compute passes took 20-40 ms for it.
+static LEFT_IN_PC: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// A title buffer: the copies' bytes were at [`card_limits`]' most.
+const LEFT_BUFFER_CAP: usize = 0;
+/// A title buffer: the card had no room.
+const LEFT_BUFFER_ROOM: usize = 1;
+/// A window: windows' bytes were at [`window_card_most`].
+const LEFT_WINDOW_CAP: usize = 2;
+/// A window: four fifths of the card's budget were in use.
+const LEFT_WINDOW_ROOM: usize = 3;
+
+fn left_in_pc(why: usize, bytes: u64) {
+    LEFT_IN_PC[2 * why].fetch_add(1, Ordering::Relaxed);
+    LEFT_IN_PC[2 * why + 1].fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// For the log: [`LEFT_IN_PC`] as words, and the limits.
+pub(crate) fn left_in_pc_line() -> String {
+    let get = |i: usize| LEFT_IN_PC[i].load(Ordering::Relaxed);
+    let part = |why: usize| format!("{} ({} MB)", get(2 * why), get(2 * why + 1) >> 20);
+    format!(
+        "title memory left in the PC's memory since the start, its shaders' reads crossing the bus: buffers {} at the most \
+         for them ({} MB, VICTORY_CARD_BUFFERS_MB) and {} for want of room; windows {} at the most for them ({} MB, \
+         VICTORY_CARD_WINDOWS_MB) and {} with four fifths of the card in use; windows on the card now {} MB",
+        part(LEFT_BUFFER_CAP),
+        card_limits().1 >> 20,
+        part(LEFT_BUFFER_ROOM),
+        part(LEFT_WINDOW_CAP),
+        window_card_most() >> 20,
+        part(LEFT_WINDOW_ROOM),
+        WINDOW_CARD_BYTES.load(Ordering::Relaxed) >> 20,
+    )
+}
 
 /// A buffer in the card's memory for a window of `size` bytes, if it is to
 /// be there ([`window_card_most`]).
@@ -605,10 +644,12 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
     {
+        left_in_pc(LEFT_WINDOW_ROOM, size);
         return None;
     }
     if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        left_in_pc(LEFT_WINDOW_CAP, size);
         return None;
     }
     let buffer = host.uav_buffer(size);
