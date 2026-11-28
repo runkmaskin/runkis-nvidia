@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Runkis.Launcher.Core/Runkis.Launcher.Core.csproj" />
+    <Project Path="src/Runkis.Launcher/Runkis.Launcher.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Runkis.Launcher.Tests/Runkis.Launcher.Tests.csproj" />
+  </Folder>
+</Solution>
