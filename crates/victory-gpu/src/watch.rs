@@ -2413,9 +2413,10 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
+#[cfg_attr(feature = "diagnostics", track_caller)]
 pub fn writing(at: usize, len: usize) {
     #[cfg(feature = "diagnostics")]
-    crate::census::disarm(at, len);
+    crate::census::disarm(at, len, std::panic::Location::caller());
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
@@ -2442,9 +2443,10 @@ pub struct KernelWrite(usize, usize);
 /// dropped, at the end of that call. One that did would make the kernel's
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
+#[cfg_attr(feature = "diagnostics", track_caller)]
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
     #[cfg(feature = "diagnostics")]
-    crate::census::disarm(at, len);
+    crate::census::kernel_read(at, len, std::panic::Location::caller());
     // The kernel's write does not fault into the handler.
     materialize(at, len);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
@@ -2472,6 +2474,8 @@ impl Drop for KernelWrite {
         if self.0 == self.1 {
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        crate::census::kernel_read_done(self.0 * BLOCK, self.1 * BLOCK);
         let mut g = guards();
         if let Some(i) = g.kernel.iter().position(|&r| r == (self.0, self.1)) {
             g.kernel.swap_remove(i);
