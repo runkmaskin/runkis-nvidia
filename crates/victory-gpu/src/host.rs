@@ -1920,6 +1920,20 @@ fn record_twin_copy(
         let given = plane_back() && plane_copyable(&unsafe { depth.GetDesc() }, &unsafe { plane.texture.GetDesc() });
         if !given {
             crate::resource::PLANES[1].fetch_add(1, Ordering::Relaxed);
+            if plane_back() {
+                // SAFETY: live textures.
+                let (of, twin_desc) = unsafe { (depth.GetDesc(), plane.texture.GetDesc()) };
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    tracing::info!(
+                        depth = of.Format.0,
+                        twin = twin_desc.Format.0,
+                        width = of.Width,
+                        height = of.Height,
+                        "a depth plane not given to its twin: no copy between these formats (VICTORY_PLANE_BACK)"
+                    );
+                });
+            }
         }
     }
     let Some(through) = &twin.through else {
