@@ -137,7 +137,7 @@ pub extern "system" fn XMemVirtualAlloc(
         // The GPU side copies only the pages the title wrote since its last
         // copy (`victory_gpu`, decision 0007); placeholders cannot be
         // watched (their physical-page views are copied whole).
-        if kind & MEM_RESERVE_PLACEHOLDER == 0 {
+        if kind & MEM_RESERVE_PLACEHOLDER == 0 && watch_wanted(asked, kind, flags, unwatched_cpu_memory()) {
             kind |= MEM_WRITE_WATCH;
         }
     }
@@ -196,6 +196,68 @@ pub extern "system" fn XMemVirtualAlloc(
     }
     note_protection(asked, kind, flags, at as usize, size);
     at
+}
+
+/// The console's GPU access bits: read-only 0x1000, read-write 0x2000,
+/// execute 0x4000, execute-read 0x8000, execute-read-write 0x10000. Without
+/// any of them (0x800 says so outright) the GPU does not reach the memory;
+/// coherent 0x20000 and uncached 0x40000 say how it reaches it, not whether.
+///
+/// (GPU read-only, 0x1000, could spare the copy-back of shader writes, but
+/// the game never asks for it (logs play-1128-0227: 0x4, 0x1, 0x801, 0x2004,
+/// 0x2404, 0x22004, 0x42404), and it is not provable per copy: the
+/// protection of later commits and `VirtualProtect`s is not kept here, and a
+/// write the console's GPU would fault on is one the host card makes.)
+const GPU_ACCESS: u32 = 0x1_f000;
+
+/// Whether reservations the GPU cannot reach go without write watching
+/// (`VICTORY_UNWATCHED_CPU_MEMORY=1`; off by default).
+///
+/// Write watching is there for one reader: the GPU side's host copies of
+/// title memory (`victory_gpu::watch`), which ask the kernel which pages the
+/// title wrote since a copy took them. Those copies exist only of memory a
+/// GPU command names (buffers, textures, descriptor heaps, command and
+/// indirect memory), and the console's GPU only names memory it may read.
+/// The game commits 33 MB so (protection 0x4, flags 0x181: no GPU bit, not
+/// of the graphics type), next to 2.6 GB of watched GPU memory (logs
+/// play-1128-0227).
+///
+/// No result changes if a title hands such memory to the GPU anyway, or
+/// makes it GPU-readable later (a `VirtualProtect`, which cannot add write
+/// watching after the fact): `victory_gpu::watch::writes` has no answer
+/// there (the kernel refuses the asking, and the guards take views only),
+/// so a copy's refresh takes the range whole and a busy range counts as
+/// stale. It is dearer then, never staler; the frame line's "askings
+/// refused" and copystat's whole copies say whether that happens.
+///
+/// What it saves where nobody asks: the kernel's dirty bitmap of the range
+/// (a bit per 4 KiB page) and its bookkeeping; no asking is made of memory
+/// no copy covers, so the frame's askings stay as they were.
+fn unwatched_cpu_memory() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        let on = std::env::var("VICTORY_UNWATCHED_CPU_MEMORY").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!("memory the GPU cannot reach is not write-watched (VICTORY_UNWATCHED_CPU_MEMORY=1)");
+        }
+        on
+    });
+    *ON
+}
+
+/// Whether a reservation of `XMemVirtualAlloc` (`protect` as the title asked,
+/// `kind` and `flags` as given to the host) is write-watched. With `skip_cpu`
+/// ([`unwatched_cpu_memory`]) not when all of these hold:
+/// - it is committed in the same call: the protection asked is that of its
+///   pages (a bare reservation's says nothing of the commits to come, which
+///   may well be GPU memory);
+/// - that protection has no GPU access bit ([`GPU_ACCESS`]);
+/// - its XMem flags are not of memory both processors reach ([`GRAPHICS`]).
+///
+/// Two signs, not one: the game asks for some memory of the graphics type
+/// with no GPU bit (0x801, flags 0x3: a placeholder, not watched anyway),
+/// and either alone would be a guess.
+fn watch_wanted(protect: u32, kind: u32, flags: u64, skip_cpu: bool) -> bool {
+    !(skip_cpu && kind & MEM_COMMIT != 0 && protect & GPU_ACCESS == 0 && flags & GRAPHICS != GRAPHICS)
 }
 
 /// What the title asks its memory to be (the console's protection, with the
@@ -2753,11 +2815,31 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     // as they did), not the placeholder the host has.
     materialize_for(address as usize, size, Touch::TitleCall);
     // Splitting and joining placeholders changes nothing they show.
+    // A decommit goes the release's way on the GPU side, rightly: the pages
+    // read zero when committed again, so what was noted of them (guarded,
+    // clean, absent) is no longer true, and the protection they come back
+    // with is the new commit's (write-combined or not). The work is a range
+    // lookup in the guards; only a whole-allocation call (size 0) asks the
+    // host for the allocation's end. What forgetting cost is
+    // `VICTORY_WC_FREE_SPLIT` (`victory_gpu::shadow`).
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         victory_gpu::title_memory_freed(address as usize, size);
+        note_free(kind, address as usize, size);
     }
     // SAFETY: the title's own arguments.
     unsafe { VirtualFree(address, size, kind) }
+}
+
+/// The title's decommits and releases (`kind`), said for the 1st, 2nd, 4th..
+/// time of each, with the bytes named so far (0: a whole allocation).
+fn note_free(kind: u32, at: usize, size: usize) {
+    static SEEN: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    let (what, i) = if kind & MEM_RELEASE != 0 { ("releases", 0) } else { ("decommits", 2) };
+    let n = SEEN[i].fetch_add(1, Ordering::Relaxed) + 1;
+    let bytes = SEEN[i + 1].fetch_add(size as u64, Ordering::Relaxed) + size as u64;
+    if n.is_power_of_two() {
+        tracing::info!("the title frees memory: {what} {n} times, {} MB named, last {at:#x}+{size:#x}", bytes >> 20);
+    }
 }
 
 /// The title's own `VirtualQuery`, while views are kept in the books alone
@@ -2836,6 +2918,39 @@ mod tests {
         let p = XMemAlloc(4096, ALLOC_32BIT);
         assert!(!p.is_null() && (p as usize) < 1 << 32);
         XMemFree(p, ALLOC_32BIT);
+    }
+
+    /// `VICTORY_UNWATCHED_CPU_MEMORY`: off, every reservation is watched as
+    /// before; on, only memory committed in the call, with no GPU bit and
+    /// not of the graphics type, goes without. The cases are the game's
+    /// (logs play-1128-0227), and the sign each rule stands on.
+    #[test]
+    fn only_committed_cpu_memory_goes_unwatched() {
+        const COMMITTED: u32 = MEM_RESERVE | MEM_COMMIT;
+        let cases = [
+            // The game's CPU-only commit, 33 MB.
+            (0x4, COMMITTED, 0x181, false),
+            // Its GPU heaps: read-write coherent, write-combined, plain.
+            (0x22004, COMMITTED, 0x183, true),
+            (0x2404, COMMITTED, 0x283, true),
+            (0x2004, COMMITTED, 0x283, true),
+            // GPU read-only and execute bits are GPU access too.
+            (0x1004, COMMITTED, 0x181, true),
+            (0x4002, COMMITTED, 0x181, true),
+            (0x10004, COMMITTED, 0x181, true),
+            // No GPU bit, but of the graphics type: kept.
+            (0x804, COMMITTED, 0x3, true),
+            (0x4, COMMITTED, 0x183, true),
+            // GPU no-access and CPU-only: not watched.
+            (0x804, COMMITTED, 0x181, false),
+            // A bare reservation: its commits may be GPU memory.
+            (0x4, MEM_RESERVE, 0x181, true),
+            (PAGE_NOACCESS, MEM_RESERVE, 0x1, true),
+        ];
+        for (protect, kind, flags, watched) in cases {
+            assert!(watch_wanted(protect, kind, flags, false), "off: {protect:#x} {kind:#x} {flags:#x}");
+            assert_eq!(watch_wanted(protect, kind, flags, true), watched, "on: {protect:#x} {kind:#x} {flags:#x}");
+        }
     }
 
     #[test]
