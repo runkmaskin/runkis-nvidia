@@ -91,3 +91,26 @@ All figures below are **offline** (this PC, 7800X3D) unless marked; nothing here
 
 The no-switch ports (AVX2 runs, list-thread and submit-thread fixes) are in both arms of every A/B: compare plain
 main (b98bf65) against this branch with no switch for them.
+
+## Game A/B (2026-11-28, 7800X3D / RTX 4070 SUPER, Series S profile 1440 DLSS Quality, city save, seconds 150-240)
+
+Release builds of b98bf65 (M) and 54e5ecd (X and the switches). One discarded warm-up run per build, then two
+interleaved rounds; scripted Enter presses, so the window lies in the same cutscene each time.
+
+| Run | fps | 1 % low | >100 ms | preparing | copies | GPU |
+|---|---|---|---|---|---|---|
+| M1 / M2 main | 18.73 / 19.33 | 10.9 / 10.9 | 2 / 1 | 25.9 / 27.9 | 10.1 / 10.7 | 16.1 / 11.7 |
+| X1 / X2 branch, no switch | 19.15 / 14.70 | 12.0 / 8.2 | 1 / 169 | 24.9 / 22.5 | 9.5 / 7.5 | 16.3 / 33.3 |
+| F `FETCH_PARTS=4` | 19.14 / 14.75 | 11.6 / 7.9 | 0 / 104 | 26.4 / 24.6 | 9.6 / 8.5 | 14.6 / 29.6 |
+| T `TABLE_CACHE=1` | 14.70 / 15.55 | 7.9 / 9.0 | 158 / 28 | 23.4 / 25.9 | 8.2 / 9.0 | 31.9 / 26.5 |
+| H `HEAP_ROUNDS_EARLY=1` | 14.93 / 14.58 | 7.8 / 7.6 | 91 / 122 | 24.0 / 24.7 | 8.2 / 8.7 | 30.5 / 30.5 |
+| V `COPY_VECTOR=1` | 14.85 / 15.13 | 8.0 / 8.3 | 97 / 55 | 24.9 / 25.0 | 8.9 / 8.8 | 28.6 / 28.2 |
+| A all four | 15.96 / 14.62 | 9.2 / 8.1 | 25 / 122 | 23.7 / 24.2 | 8.0 / 8.3 | 25.9 / 31.3 |
+
+Not a measurement of the switches: the runs fall into two groups by the cutscene's camera, not by switch. At the
+same second X2 shows a wide shot over the water (GPU 30 ms, ~14.7 fps) where M2 shows the deck (GPU 12 ms, ~19 fps);
+the plain branch (X2) is in the slow group too. Within the fast group the branch matched main (19.15 against
+18.73-19.33), with copies 9.5 ms against 10.1-10.7; within the slow group no switch stood out. The screenshots at the
+same seconds show the same picture with every switch (no missing or stale textures seen). Nothing is turned on by
+default from this. A repeat needs a spot outside the cutscene (free roam, a still camera), where the frame is the
+CPU's and not the GPU's.
