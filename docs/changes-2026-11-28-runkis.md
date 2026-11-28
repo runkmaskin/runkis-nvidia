@@ -175,6 +175,42 @@ out. Interleaved, same spot:
 +17 % (three interleaved pairs) and almost no frames over 100 ms. What it costs the picture: the water has no light of its own depth (darker,
 bluer; at night on the balcony barely visible). Left as the player's choice (F1, WATER LIGHT), not the default.
 
-Candidate translations, not done yet: an exchange between the two host waves needs its second barrier only so that
-the slots are not written again before both halves have read them; alternating two sets of slots per exchange (both
-halves exchange equally often) would make it one barrier, about half of these programs' barriers.
+### Fewer meetings of the two host waves (`VICTORY_FEWER_MEETINGS`, off by default)
+
+`crates/victory-shader/src/emit/lower.rs`, a set of bits:
+
+- **1**: no group barrier before an LDS read that follows another LDS read of the same block, the first of them
+  ordered by a meeting: nothing was written since, by either half.
+- **2**: the halves' exchanges (lane reads, masks as numbers, sums over the wave) take two sets of slots in turn.
+  An exchange's second barrier only kept its slots from being written again before both halves had read them;
+  the next exchange now writes the other set, and the one after it comes after the next exchange's barrier,
+  which neither half passes before the other has read. The second barrier is put off to the next barrier of any
+  kind, or to the end of the block (where every thread that made the exchange still is).
+- **4**: two values exchanged together (a first-lane read: whether each half has a lane, and its value; a 64-bit
+  sum) go through one meeting, in four slots a console wave.
+
+Static barrier counts of the heaviest programs:
+
+| program | 0 (as before) | 3 | 7 |
+|---|---|---|---|
+| `water_shading:CS_TransmissionVolumetrics_Tiled_LocalLights` | 163 | 106 | 83 |
+| `water_shading:CS_TransmissionVolumetrics_Tiled` | 147 | 91 | 69 |
+| `vfx_proj_decal_vbuffer:CS_ProjDecalReduceClassification_Scalarized` | 148 | 108 | 79 |
+| `cascadeshadows_rendering:CS_ShadowRenderTiledCascadesAlphaCB` | 91 | 70 | 58 |
+
+Tested on the RTX 4070 SUPER: `fewer_meetings_give_the_consoles_values_with_exchanges_in_loops_and_branches`
+(`wave64_tests.rs`) runs one console wave as two host waves with LDS reads in a row, exchanges in a row, in a loop
+and behind a uniform branch, a mask read as a number and a first-lane read under a partial EXEC, for bits 0, 1, 2,
+3, 4 and 7 and five sets of root constants, against the console's values (in a thread that fails the test after
+30 s rather than hold the card). The whole translator suite passes with the switch off, at 3 and at 7.
+
+In the game (same balcony at night, Series S DLSS Quality, the same build with the switch at 0 and at 7, three
+interleaved pairs, release build):
+
+| | fps | 1 % low | median frame | the title's lists |
+|---|---|---|---|---|
+| `VICTORY_FEWER_MEETINGS=0` | 17.6 / 17.2 / 17.3 | 11.0 / 11.3 / 10.9 | 60.0 / 61.8 / 60.4 ms | 41.5 / 39.5 / 39.6 ms |
+| `VICTORY_FEWER_MEETINGS=7` | 17.2 / 16.9 / 17.6 | 11.2 / 11.3 / 10.6 | 61.5 / 62.2 / 57.3 ms | 40.3 / 40.8 / 39.4 ms |
+
+No difference beyond the noise, and the same picture at the same spot. Half the barriers of the heaviest programs
+are not where their time goes, so the switch stays off.
