@@ -1049,6 +1049,11 @@ fn fewer_meetings_give_the_consoles_values_with_exchanges_in_loops_and_branches(
         0xD766_0007,
         0x0002_0E6B, // v_mbcnt_hi_u32_b32 v7, vcc_hi, v7: odd lanes below this one
         0x4A04_0507, // v_add_nc_u32 v2, v7, v2
+        0xBE92_047E, // s_mov_b64 s[18:19], exec
+        0x7DA2_0002, // v_cmpx_lt_u32 exec, s2, v0: the lanes past s2
+        0x7E20_0502, // v_readfirstlane_b32 s16, v2: the first of them (lane 0 if none)
+        0xBEFE_0412, // s_mov_b64 exec, s[18:19]
+        0x4A04_0410, // v_add_nc_u32 v2, s16, v2
         0xD760_0007,
         0x0001_7F02, // v_readlane_b32 s7, v2, 63
         0xD760_000F,
@@ -1079,7 +1084,7 @@ fn fewer_meetings_give_the_consoles_values_with_exchanges_in_loops_and_branches(
     }
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     // the console: the 64 lanes in step
-    let console = |s0: u32, s1: u32| {
+    let console = |s0: u32, s1: u32, s2: u32| {
         let mut v: Vec<u32> = (0..64u32).map(|t| s0.wrapping_add(t)).collect();
         let mut round = 0u32;
         loop {
@@ -1090,6 +1095,10 @@ fn fewer_meetings_give_the_consoles_values_with_exchanges_in_loops_and_branches(
             let odd: Vec<bool> = v.iter().map(|x| x & 1 == 1).collect();
             for t in 0..64 {
                 v[t] = v[t].wrapping_add(odd[..t].iter().filter(|&&o| o).count() as u32);
+            }
+            let s16 = if s2 < 63 { v[s2 as usize + 1] } else { v[0] };
+            for x in &mut v {
+                *x = x.wrapping_add(s16);
             }
             let (s7, s15) = (v[63], v[0]);
             let s9 = if round == 1 { 0 } else { v[5] };
@@ -1109,7 +1118,7 @@ fn fewer_meetings_give_the_consoles_values_with_exchanges_in_loops_and_branches(
     unsafe { std::env::set_var("VICTORY_SHADER_CENSUS", "") };
     let barrier = super::bitcode::census::KINDS.iter().position(|k| *k == "barrier").expect("a barrier count");
     let mut counts = Vec::new();
-    let shaders: Vec<(u32, HostShader)> = [0u32, 1, 2, 3]
+    let shaders: Vec<(u32, HostShader)> = [0u32, 1, 2, 3, 4, 7]
         .into_iter()
         .map(|bits| {
             let was = lower::TEST_FEWER_MEETINGS.replace(Some(bits));
@@ -1128,7 +1137,7 @@ fn fewer_meetings_give_the_consoles_values_with_exchanges_in_loops_and_branches(
         .collect();
     eprintln!("barriers in the program by bits: {counts:?}");
     // (the census is off when another test of the process read the switch first)
-    if let (Some(all), Some(fewer)) = (counts[0].1, counts[3].1) {
+    if let (Some(all), Some(fewer)) = (counts[0].1, counts[5].1) {
         assert!(fewer < all, "fewer meetings make fewer barriers: {counts:?}");
     }
     // The card for this test alone from here (the 30 s are its own), then in a thread.
@@ -1148,11 +1157,11 @@ fn fewer_meetings_give_the_consoles_values_with_exchanges_in_loops_and_branches(
                     return;
                 }
             };
-            for (s0, s1) in [(0u32, 1u32), (12_345, 3), (0xDEAD_BEEF, 7), (7, 2)] {
+            for (s0, s1, s2) in [(0u32, 1u32, 3u32), (12_345, 3, 40), (0xDEAD_BEEF, 7, 63), (7, 2, 30), (99, 4, 31)] {
                 let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
                 for u in &shader.user_data {
                     if u.root == RootType::Constants {
-                        ud[u.index as usize] = [s0, s1].get(u.dword as usize).copied().unwrap_or(0);
+                        ud[u.index as usize] = [s0, s1, s2].get(u.dword as usize).copied().unwrap_or(0);
                     }
                 }
                 let out = host
@@ -1167,7 +1176,7 @@ fn fewer_meetings_give_the_consoles_values_with_exchanges_in_loops_and_branches(
                         },
                     )
                     .unwrap_or_else(|e| panic!("dispatch failed (bits {bits}): {e}"));
-                ran.push((*bits, s0, s1, out[0][..64].to_vec()));
+                ran.push((*bits, s0, s1, s2, out[0][..64].to_vec()));
             }
         }
         let _ = done.send(Ok(ran));
@@ -1180,8 +1189,8 @@ fn fewer_meetings_give_the_consoles_values_with_exchanges_in_loops_and_branches(
         }
         Err(_) => panic!("the program did not finish in 30 s: its host waves wait for each other"),
     };
-    for (bits, s0, s1, got) in &ran {
-        assert_eq!(got, &console(*s0, *s1), "bits {bits}, s0 {s0:#x}, s1 {s1}");
+    for (bits, s0, s1, s2, got) in &ran {
+        assert_eq!(got, &console(*s0, *s1, *s2), "bits {bits}, s0 {s0:#x}, s1 {s1}, s2 {s2}");
     }
     eprintln!("ran on the hardware device: {} runs, every set of bits gives the console's values", ran.len());
 }

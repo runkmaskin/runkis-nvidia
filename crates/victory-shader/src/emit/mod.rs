@@ -276,6 +276,8 @@ pub fn group_sync() -> u8 {
 ///   comes after the next exchange's barrier, which neither half passes before the other has
 ///   read. The second barrier is put off to the next barrier of any kind, or to the end of the
 ///   block.
+/// - 4: two values the halves exchange together (a first-lane read: whether a half has a
+///   lane, and its value; a 64-bit sum) go through one meeting, not two.
 ///
 /// Part of the translation: the shader cache keys on it.
 pub fn fewer_meetings() -> u32 {
@@ -285,7 +287,7 @@ pub fn fewer_meetings() -> u32 {
     }
     static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *BITS.get_or_init(|| {
-        std::env::var("VICTORY_FEWER_MEETINGS").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0) & 3
+        std::env::var("VICTORY_FEWER_MEETINGS").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0) & 7
     })
 }
 

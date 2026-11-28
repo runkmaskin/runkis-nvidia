@@ -351,6 +351,11 @@ struct Lower<'a> {
     ex_parity: bool,
     ex_pending: Option<bool>,
     ex_defer_ok: bool,
+    /// With `fewer & 4`: the first dword of the slots for two values exchanged in one meeting
+    /// (four a console wave: the first value's lower and upper half, then the second's), and this thread's
+    /// console wave's first (made in the entry block).
+    ex2: Option<u32>,
+    ex2_pair: Option<V>,
     /// With `split_lds` and `fewer & 1`: the last LDS access of IR block `.0`: whether it was a
     /// read, and whether it is ordered after every earlier write by a meeting.
     lds_prev: Option<(usize, bool, bool)>,
@@ -1760,6 +1765,8 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        // with `exchange` and `fewer_meetings` bit 4: the first dword of the two-value slots
+        let mut ex2: Option<u32> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         // console lanes in a group of several host waves: the LDS dword of `wave_base`'s counter
@@ -1865,6 +1872,12 @@ impl<'a> Lower<'a> {
                                 // (two sets of them with `fewer_meetings` bit 2)
                                 let sets = if super::fewer_meetings() & 2 != 0 { 2 } else { 1 };
                                 s.lds_dwords += 2 * sets * group.div_ceil(64);
+                                // (and four dwords a console wave for two values exchanged in
+                                // one meeting with bit 4)
+                                if super::fewer_meetings() & 4 != 0 && group > 32 {
+                                    ex2 = Some(s.lds_dwords);
+                                    s.lds_dwords += 4 * sets * group.div_ceil(64);
+                                }
                             }
                         }
                     }
@@ -2100,6 +2113,8 @@ impl<'a> Lower<'a> {
             ex_parity: false,
             ex_pending: None,
             ex_defer_ok: true,
+            ex2,
+            ex2_pair: None,
             lds_prev: None,
             clane: None,
             pair: None,
@@ -2600,8 +2615,7 @@ impl<'a> Lower<'a> {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
             }
-            let (lo0, lo1) = self.exchange_halves(self.cur, r_lo)?;
-            let (hi0, hi1) = self.exchange_halves(self.cur, r_hi)?;
+            let ((lo0, lo1), (hi0, hi1)) = self.exchange_halves2(self.cur, r_lo, r_hi)?;
             let c = self.cur;
             let d0 = self
                 .s
@@ -4866,6 +4880,67 @@ impl<'a> Lower<'a> {
             self.group_sync(c);
         }
         Some(set)
+    }
+
+    /// [`Self::exchange_halves`] of two values, `a` then `b`; in one meeting with
+    /// `fewer_meetings` bit 4 (two meetings without).
+    fn exchange_halves2(&mut self, at: usize, a: V, b: V) -> Result<((V, V), (V, V)), Why> {
+        let merged = self.fewer & 4 != 0
+            && !self.local
+            && self.pairs.is_none()
+            && self.exchange.as_ref().is_some_and(|e| !e.1);
+        let Some(slot) = self.ex2.filter(|_| merged) else {
+            // (as the callers did: the second where the first left the lowering)
+            let x = self.exchange_halves(at, a)?;
+            let c = self.cur;
+            return Ok((x, self.exchange_halves(c, b)?));
+        };
+        let set = if at == self.cur { self.exchange_set() } else { None };
+        let base = match self.ex2_pair {
+            Some(v) => v,
+            None => {
+                let e = self.s.entry;
+                let thread = self.console_thread();
+                let (six, two) = (self.s.m.i32(6), self.s.m.i32(2));
+                let wave = self.s.m.bin(e, Bin::LShr, thread, six);
+                let four = self.s.m.bin(e, Bin::Shl, wave, two);
+                let first = self.s.m.i32(slot);
+                let v = self.s.m.bin(e, Bin::Add, first, four);
+                self.ex2_pair = Some(v);
+                v
+            }
+        };
+        let base = if set == Some(true) {
+            let second = self.s.m.i32(4 * self.ex_waves);
+            self.s.m.bin(at, Bin::Add, base, second)
+        } else {
+            base
+        };
+        let cl = self.console_lane();
+        let (five, two, three) = (self.s.m.i32(5), self.s.m.i32(2), self.s.m.i32(3));
+        let half = self.s.m.bin(at, Bin::LShr, cl, five);
+        let lds = self.s.lds();
+        let ia = self.s.m.bin(at, Bin::Add, base, half);
+        let pa = self.s.m.element(at, lds, ia);
+        self.s.m.store(at, pa, a);
+        let ib = self.s.m.bin(at, Bin::Add, ia, two);
+        let pb = self.s.m.element(at, lds, ib);
+        self.s.m.store(at, pb, b);
+        self.group_sync(at);
+        let one = self.s.m.i32(1);
+        let k1 = self.s.m.bin(at, Bin::Add, base, one);
+        let k2 = self.s.m.bin(at, Bin::Add, base, two);
+        let k3 = self.s.m.bin(at, Bin::Add, base, three);
+        let [a0, a1, b0, b1] = [base, k1, k2, k3].map(|k| {
+            let p = self.s.m.element(at, lds, k);
+            self.s.m.load(at, p)
+        });
+        if set.is_some() {
+            self.exchanged(set);
+        } else {
+            self.group_sync(at);
+        }
+        Ok(((a0, a1), (b0, b1)))
     }
 
     /// `first`, the first dword of this console wave's slots in the first set, moved to `set`.
@@ -9774,9 +9849,7 @@ impl<'a> Lower<'a> {
                             let both = self.exchange_pairs(&[has, mine]);
                             (both[0], both[1])
                         } else {
-                            let has = self.exchange_halves(c, has)?;
-                            let c = self.cur;
-                            (has, self.exchange_halves(c, mine)?)
+                            self.exchange_halves2(c, has, mine)?
                         };
                         let c = self.cur;
                         let z = self.s.m.i32(0);
