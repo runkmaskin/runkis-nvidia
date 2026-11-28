@@ -306,6 +306,9 @@ struct Region {
     landed: u64,
     touched: [u64; 2],
     ours_touched: u64,
+    /// A committed buffer's copy (with pages of its own or not), as far as
+    /// [`landed`] saw.
+    committed: Option<bool>,
 }
 
 #[derive(Clone, Default)]
@@ -557,7 +560,7 @@ impl State {
             return id;
         }
         let id = self.regions.len();
-        self.regions.push(Region { start, len, kind, refreshes: 0, copied: 0, first: 0, stores: 0, landed: 0, touched: [0; 2], ours_touched: 0 });
+        self.regions.push(Region { start, len, kind, refreshes: 0, copied: 0, first: 0, stores: 0, landed: 0, touched: [0; 2], ours_touched: 0, committed: None });
         self.ids.insert((start, len), id);
         self.by_start.entry(start).or_default().push(id);
         id
@@ -794,18 +797,48 @@ pub(crate) fn refreshed(start: usize, len: usize, from: usize, to: usize, copied
     }
 }
 
-/// What shaders wrote in `[from, to)` of the host copy of
-/// `[start, start + len)` landed in title memory (`written` bytes changed,
-/// `crate::host`): during a sample, the whole pages of it in host memory
-/// (above 1 TiB: committed resources' blocks of the host heap) of a copy
-/// of 64 KiB or more are made no-access, so that the CPU's first read or
-/// write of them before the next landing is noted, by site
-/// ([`faulted`]). Whether the title reads what the card wrote decides
-/// whether it must come back at all.
-pub(crate) fn landed(start: usize, len: usize, from: usize, to: usize, written: usize) {
-    if !ACTIVE.load(Relaxed) || start >> 40 == 0 && !cfg!(test) || len < 64 << 10 {
+/// The title's committed buffers of 64 KiB or more alive now: start, then
+/// end and whether they have write-watched pages of their own
+/// (`VICTORY_COMMITTED_WATCH`). Told by `crate::resource` as they are made
+/// and let go; what [`landed`] looks at.
+static BUFFERS: Mutex<BTreeMap<usize, (usize, bool)>> = Mutex::new(BTreeMap::new());
+
+/// A committed buffer's memory `[at, at + len)` was made (`made`) or let
+/// go; `own`: pages of its own.
+pub(crate) fn committed(at: usize, len: usize, own: bool, made: bool) {
+    if len < 64 << 10 {
         return;
     }
+    let mut buffers = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+    if made {
+        buffers.insert(at, (at + len, own));
+    } else {
+        buffers.remove(&at);
+    }
+}
+
+/// The committed buffer that holds all of `[start, start + len)`: its
+/// start, length and whether it has pages of its own.
+fn committed_buffer(start: usize, len: usize) -> Option<(usize, usize, bool)> {
+    let buffers = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+    buffers.range(..=start).next_back().filter(|(_, (e, _))| *e >= start + len).map(|(&a, &(e, own))| (a, e - a, own))
+}
+
+/// What shaders wrote in `[from, to)` of the host copy of
+/// `[start, start + len)` landed in title memory (`written` bytes changed,
+/// `crate::host`): during a sample, if the copy is of a committed buffer
+/// of 64 KiB or more ([`committed`]: wherever its memory lies, the host
+/// heap's blocks or pages of its own), the whole pages of it are made
+/// no-access, so that the CPU's first read or write of them before the
+/// next landing is noted, by site ([`faulted`]). Whether the title reads
+/// what the card wrote decides whether it must come back at all.
+pub(crate) fn landed(start: usize, len: usize, from: usize, to: usize, written: usize) {
+    if !ACTIVE.load(Relaxed) || len < 64 << 10 {
+        return;
+    }
+    let Some((_, _, own)) = committed_buffer(start, len) else {
+        return;
+    };
     #[cfg(test)]
     if !AS_TITLE.get() {
         return;
@@ -817,8 +850,9 @@ pub(crate) fn landed(start: usize, len: usize, from: usize, to: usize, written: 
     };
     let id = match s.ids.get(&(start, len)) {
         Some(&id) => id,
-        None => s.region(start, len, Kind::Whole),
+        None => s.region(start, len, if own { Kind::Watched } else { Kind::Whole }),
     };
+    s.regions[id].committed = Some(own);
     if s.frame_arm_us >= s.arm_us || s.kernel.full() {
         s.totals.over_budget += 1;
         return;
@@ -1384,26 +1418,43 @@ fn report(s: &State, ms: f64, name: &dyn Fn(usize) -> String) -> String {
     }
     let _ = writeln!(
         out,
-        "\nwhat shaders wrote, landed: per frame {:.0} pages of host memory (copies of 64 KiB or more above 1 TiB) made no-access until touched; \
+        "\nwhat shaders wrote, landed: per frame {:.0} pages of committed buffers of 64 KiB or more made no-access until touched; \
          the CPU's first reads {:.1}, first writes {:.1} (by any code for the title); ours {:.1} (a refresh copying the copy whole, a landing)",
         per(t.landed_pages),
         per(t.landed_touches[0]),
         per(t.landed_touches[1]),
         per(s.regions.iter().map(|r| r.ours_touched).sum())
     );
+    {
+        let buffers = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut big: Vec<(usize, usize, bool)> = buffers.iter().map(|(&a, &(e, own))| (a, e - a, own)).collect();
+        big.sort_unstable_by_key(|b| std::cmp::Reverse(b.1));
+        let _ = writeln!(
+            out,
+            "  committed buffers of 64 KiB or more alive at the end: {} ({} with pages of their own, VICTORY_COMMITTED_WATCH); the largest: {}",
+            big.len(),
+            big.iter().filter(|b| b.2).count(),
+            big.iter()
+                .take(6)
+                .map(|&(a, l, own)| format!("{a:#x}+{l:#x}{}", if own { " (own pages)" } else { "" }))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     let _ = writeln!(out, "  landed pages/frame  reads/frame  writes/frame  ours/frame  copy");
     let mut landed: Vec<&Region> = s.regions.iter().filter(|r| r.landed > 0).collect();
     landed.sort_unstable_by_key(|r| std::cmp::Reverse(r.landed));
     for r in landed.iter().take(40) {
         let _ = writeln!(
             out,
-            "  {:18.0}  {:11.2}  {:12.2}  {:10.1}  {:#x}+{:#x}",
+            "  {:18.0}  {:11.2}  {:12.2}  {:10.1}  {:#x}+{:#x}{}",
             per(r.landed),
             per(r.touched[0]),
             per(r.touched[1]),
             per(r.ours_touched),
             r.start,
-            r.len
+            r.len,
+            if r.committed == Some(true) { " (committed, own pages)" } else { " (committed)" }
         );
     }
     let mut touches: Vec<_> = s.touches.iter().collect();
@@ -1553,6 +1604,10 @@ mod tests {
         unsafe { ((at + 3 * PAGE) as *mut u64).write(0x1234) };
         assert!(begin(Limits { stores: 1, arm_us: u64::MAX / 4, stall_ms: 60_000 }, 0));
         AS_TITLE.set(true);
+        // Not a committed buffer: left alone.
+        landed(at, size, at + 100, at + 20 * PAGE, 0);
+        assert_eq!(protection_at(at + 3 * PAGE), PAGE_READWRITE);
+        committed(at, size, false, true);
         landed(at, size, at + 100, at + 20 * PAGE, 0);
         // The first page holds the range in part: left alone.
         assert_eq!(protection_at(at), PAGE_READWRITE);
@@ -1578,8 +1633,36 @@ mod tests {
         }
         let text = report(&s, ms, &|a| format!("{a:#x}"));
         assert!(text.contains("what shaders wrote, landed"), "{text}");
+        committed(at, size, false, false);
         // SAFETY: the test's own memory.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// With `VICTORY_COMMITTED_WATCH` a committed buffer has pages of its
+    /// own, wherever they lie (above 1 TiB too): what lands in it is looked
+    /// at all the same (run census-091255 found none, the copies being
+    /// looked for by their address), and named as such in the report.
+    #[test]
+    fn a_committed_buffer_with_pages_of_its_own_is_looked_at() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let size = 1 << 20;
+        let memory = crate::resource::Memory::committed_for_test(size);
+        let at = memory.address() as usize;
+        assert!(begin(Limits { stores: 1, arm_us: u64::MAX / 4, stall_ms: 60_000 }, 0));
+        AS_TITLE.set(true);
+        landed(at, size, at, at + size, 0);
+        assert_eq!(protection_at(at + 5 * PAGE), PAGE_NOACCESS);
+        // SAFETY: the buffer's own memory: the read faults and goes on.
+        assert_eq!(unsafe { ((at + 5 * PAGE) as *const u64).read_volatile() }, 0);
+        AS_TITLE.set(false);
+        let (s, ms) = end().unwrap();
+        assert_eq!(s.totals.landed_pages, (size / PAGE) as u64);
+        assert_eq!(s.totals.landed_touches, [1, 0]);
+        let text = report(&s, ms, &|a| format!("{a:#x}"));
+        assert!(text.contains(&format!("{at:#x}+{size:#x} (committed, own pages)")), "{text}");
+        assert!(text.contains("(own pages)"), "{text}");
+        drop(memory);
+        assert!(committed_buffer(at, size).is_none(), "let go with its memory");
     }
 
     /// With no time for it in the frame, nothing is made read-only.

@@ -1124,19 +1124,9 @@ impl Memory {
         // The host heap's block (the title's allocator did not place it):
         // pages of its own that the write watch can tell of, instead.
         if buffer && committed_watched() && ptr.as_ptr() as usize >> 40 != 0 && layout.size() >= 64 << 10 && layout.align() <= 64 << 10 {
-            if let Some(pages) = watched_pages(layout.size()) {
+            if let Some(memory) = Memory::own_pages(layout, heap_kind) {
                 free(ptr.as_ptr().cast(), attributes);
-                let all = WATCHED_COMMITTED.fetch_add(layout.size() as u64, std::sync::atomic::Ordering::Relaxed) + layout.size() as u64;
-                if layout.size() >= 4 << 20 {
-                    tracing::info!(
-                        at = ?pages,
-                        mb = layout.size() >> 20,
-                        heap = heap_kind,
-                        all_mb = all >> 20,
-                        "a committed buffer in write-watched pages of its own (VICTORY_COMMITTED_WATCH)"
-                    );
-                }
-                return Ok(Memory { ptr: pages, layout, attributes: None, pages: true });
+                return Ok(memory);
             }
         }
         // SAFETY: the allocator handed out `size` bytes.
@@ -1147,6 +1137,33 @@ impl Memory {
             attributes: Some(attributes),
             pages: false,
         })
+    }
+
+    /// A committed buffer's memory in write-watched pages of its own
+    /// ([`committed_watched`]).
+    fn own_pages(layout: Layout, heap_kind: u32) -> Option<Memory> {
+        let pages = watched_pages(layout.size())?;
+        let all = WATCHED_COMMITTED.fetch_add(layout.size() as u64, std::sync::atomic::Ordering::Relaxed) + layout.size() as u64;
+        if layout.size() >= 4 << 20 {
+            tracing::info!(
+                at = ?pages,
+                mb = layout.size() >> 20,
+                heap = heap_kind,
+                all_mb = all >> 20,
+                "a committed buffer in write-watched pages of its own (VICTORY_COMMITTED_WATCH)"
+            );
+        }
+        Some(Memory { ptr: pages, layout, attributes: None, pages: true })
+    }
+
+    /// A committed buffer of `size` bytes as `create_committed` makes one
+    /// with `VICTORY_COMMITTED_WATCH` on: pages of its own, told to the
+    /// census.
+    #[cfg(all(test, feature = "diagnostics"))]
+    pub(crate) fn committed_for_test(size: usize) -> Memory {
+        let memory = Memory::own_pages(Layout::from_size_align(size, 256).unwrap(), 2).unwrap();
+        crate::census::committed(memory.address() as usize, size, memory.pages, true);
+        memory
     }
 
     /// `size` zeroed bytes aligned to `alignment` (a power of two).
@@ -1188,6 +1205,9 @@ pub(crate) static WATCHED_COMMITTED: std::sync::atomic::AtomicU64 = std::sync::a
 
 impl Drop for Memory {
     fn drop(&mut self) {
+        // (The census's books of committed buffers: gone, if it was one.)
+        #[cfg(feature = "diagnostics")]
+        crate::census::committed(self.ptr.as_ptr() as usize, self.layout.size(), self.pages, false);
         if self.pages {
             use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
             let at = self.ptr.as_ptr() as usize;
@@ -3381,6 +3401,12 @@ pub(crate) extern "system" fn create_committed(
         Ok(memory) => memory,
         Err(hr) => return hr,
     };
+    // Diagnostics: the census looks at what lands in committed buffers
+    // (`crate::census::landed`), wherever their memory lies.
+    #[cfg(feature = "diagnostics")]
+    if desc.dimension == BUFFER {
+        crate::census::committed(memory.address() as usize, memory.layout.size(), memory.pages, true);
+    }
     hand_out_resource(
         desc,
         heap,
