@@ -112,6 +112,7 @@ public sealed class PlanBuilder(RepoLayout repo)
         // This fork's switches on upstream's base (both off unless the profile asks).
         if (p.FenceSleep) o["VICTORY_FENCE_SLEEP"] = "1";
         if (!p.WaterLight) o["VICTORY_WATER_LIGHT"] = "0";
+        if (p.TextureDiet) { o["VICTORY_TEXTURE_UNMAPPED"] = "1"; o["VICTORY_TEXTURE_RAM"] = "1"; }
         if (p.TitlePool is > 0 and <= 16) Int("VICTORY_TITLE_POOL", p.TitlePool);
         Int("VICTORY_TITLE_PRIORITY_CAP", p.TitlePriorityCap);
         // Upstream's own switches the launcher has settings for.

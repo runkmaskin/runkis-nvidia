@@ -72,6 +72,11 @@ public sealed class LaunchProfile
     /// </summary>
     public bool WaterLight { get; set; } = true;
     /// <summary>
+    /// Texture memory diet: sets VICTORY_TEXTURE_UNMAPPED=1 and VICTORY_TEXTURE_RAM=1. Measured in the prison intro
+    /// (RTX 4070 SUPER): host textures 5,982 -> 2,677 MB, private memory 23.4 -> 21.9 GB, fps 21.8 -> 22.4.
+    /// </summary>
+    public bool TextureDiet { get; set; }
+    /// <summary>
     /// VICTORY_TITLE_POOL (victory-loader title_pool.rs): the title's Series S pools this many times larger (0: as they are).
     /// Series S above 768 lines (DLAA, 1080 lines) needs 2.
     /// </summary>
