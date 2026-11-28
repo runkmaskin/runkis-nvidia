@@ -4475,6 +4475,8 @@ impl Shadow {
                     use crate::copystat::{C, add};
                     add(C::Checked, (to - from) as u64);
                     add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+                    let kind = if guarded { crate::census::Kind::Guarded } else { crate::census::Kind::Watched };
+                    crate::census::refreshed(self.start as usize, self.len as usize, from, to, copied, kind);
                 }
                 return copied;
             }
@@ -4486,7 +4488,10 @@ impl Shadow {
         let started = std::time::Instant::now();
         self.copy(from, to);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
+        {
+            crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
+            crate::census::refreshed(self.start as usize, self.len as usize, from, to, to - from, crate::census::Kind::Whole);
+        }
         to - from
     }
 

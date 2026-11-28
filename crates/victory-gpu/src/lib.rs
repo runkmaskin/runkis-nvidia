@@ -26,6 +26,8 @@ mod carded;
 mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
+mod census;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;

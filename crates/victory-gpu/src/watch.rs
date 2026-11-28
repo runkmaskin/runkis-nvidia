@@ -2414,6 +2414,8 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    crate::census::disarm(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
@@ -2441,6 +2443,8 @@ pub struct KernelWrite(usize, usize);
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    #[cfg(feature = "diagnostics")]
+    crate::census::disarm(at, len);
     // The kernel's write does not fault into the handler.
     materialize(at, len);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
@@ -2818,6 +2822,8 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    crate::census::forget(at, len);
     crate::texback::remapped(at, len);
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
 }
@@ -2828,6 +2834,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    crate::census::forget(at, len);
     crate::texback::remapped(at, len);
     let mut g = title_memory_changed(at, len);
     if CHANGING.get().0 && len != 0 {
@@ -2852,6 +2860,8 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    crate::census::forget(at, len);
     crate::shadow::write_combined_freed(at, len);
     let mut g = guards();
     let first = at / BLOCK;
@@ -3115,6 +3125,8 @@ pub(crate) fn install() {
                 {
                     crate::copystat::add(crate::copystat::C::GuardFaults, 1);
                     crate::faultbook::note(crate::faultbook::What::Site, r.ExceptionAddress as usize, block, 0);
+                    // SAFETY: the context the system passes.
+                    crate::census::guard_fault(unsafe { &*context }, at);
                 }
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
@@ -3165,6 +3177,8 @@ pub(crate) fn install() {
                     FAULTS[2].fetch_add(held, std::sync::atomic::Ordering::Relaxed);
                     crate::faultbook::note(crate::faultbook::What::Fault, block, opened << 32 | ns, held);
                     crate::faultbook::note(crate::faultbook::What::Site, r.ExceptionAddress as usize, block, 0);
+                    // SAFETY: the context the system passes.
+                    crate::census::guard_fault(unsafe { &*context }, at);
                 }
                 return EXCEPTION_CONTINUE_EXECUTION;
             }

@@ -4175,11 +4175,15 @@ impl RelayBack {
             }
         }
         land::spent(land::stat::BACK, merging);
-        for ((_, from, to), written) in self.work.iter().zip(written) {
+        for ((shadow, from, to), written) in self.work.iter().zip(written) {
             COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::compared(*from, to - from, written as usize);
-            let _ = (from, to);
+            {
+                crate::copystat::compared(*from, to - from, written as usize);
+                let (start, len) = shadow.span();
+                crate::census::landed_by(crate::census::path::RELAY_PC, start as usize, len as usize, *from, *to, written as usize);
+            }
+            let _ = (shadow, from, to);
         }
     }
 }
@@ -4545,7 +4549,11 @@ fn hand_back(back: &[Declared]) {
             let written = shadow.copy_back_with(*from, to - from, Some(found));
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::compared(*from, to - from, written);
+            {
+                crate::copystat::compared(*from, to - from, written);
+                let (start, len) = shadow.span();
+                crate::census::landed_by(crate::census::path::PC_FOUND, start as usize, len as usize, *from, *to, written);
+            }
         }
         for (shadow, declared) in back {
             shadow.copy_back_done(declared);
@@ -4577,7 +4585,11 @@ fn hand_back(back: &[Declared]) {
             let written = shadow.copy_back(from, to - from);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::compared(from, to - from, written);
+            {
+                crate::copystat::compared(from, to - from, written);
+                let (start, len) = shadow.span();
+                crate::census::landed_by(crate::census::path::PC, start as usize, len as usize, from, to, written);
+            }
         }
         shadow.copy_back_done(declared);
     }
@@ -5480,6 +5492,13 @@ impl Host {
         }
         land::spent(land::stat::CARD, merging);
         COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
+        // Diagnostics: whether the CPU touches what came back before the
+        // next landing (`crate::census::landed`).
+        #[cfg(feature = "diagnostics")]
+        for (shadow, lo, hi, _) in &pieces {
+            let (start, len) = shadow.span();
+            crate::census::landed_by(crate::census::path::RELAY_CARD, start as usize, len as usize, start as usize + lo, start as usize + hi, hi - lo);
+        }
         if let Some(f) = fetch.as_mut() {
             if let Some(check) = &check {
                 check.done(&mut f.suspects);
@@ -5926,7 +5945,11 @@ impl Host {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             let (from, to) = r.declared;
             #[cfg(feature = "diagnostics")]
-            crate::copystat::compared(from, to - from, written);
+            {
+                crate::copystat::compared(from, to - from, written);
+                let (start, len) = r.shadow.span();
+                crate::census::landed_by(crate::census::path::CARD, start as usize, len as usize, from, to, written);
+            }
             let _ = (from, to);
         }
     }

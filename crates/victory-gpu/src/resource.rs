@@ -1018,6 +1018,38 @@ pub(crate) struct Memory {
     /// Set when the memory came from the title's allocator, with these
     /// allocation attributes (it goes back there).
     attributes: Option<u64>,
+    /// Pages of their own, write-watched ([`watched_pages`]): given back
+    /// with `VirtualFree`.
+    pages: bool,
+}
+
+/// Whether committed buffers that would get memory of the host's heap get
+/// write-watched pages of their own instead (`VICTORY_COMMITTED_WATCH=1`;
+/// off by default).
+///
+/// The runtime's allocator behind the title's committed resources hands out
+/// blocks of the host heap (above 2^40), which the write watch cannot ask
+/// about and no guard covers: their host copies are copied whole at every
+/// refresh. Run census-075138: a committed buffer of 20 MB at
+/// 0x238b2350000, refreshed twice a frame, was 42 of the 62 MB a frame
+/// refreshed (2.4 ms a frame of copying), with nothing known of what
+/// changed. In pages of its own with write watching, a refresh copies only
+/// the pages written since. Memory the title's own allocator placed (below
+/// 2^40) is left as it is.
+fn committed_watched() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMMITTED_WATCH").is_some_and(|v| v == "1"))
+}
+
+/// `size` zeroed bytes in write-watched pages of their own (64 KiB aligned).
+fn watched_pages(size: usize) -> Option<NonNull<u8>> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    // SAFETY: a fresh allocation; the pages come zeroed.
+    let at = unsafe {
+        VirtualAlloc(std::ptr::null(), size.next_multiple_of(64 << 10), MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+    };
+    NonNull::new(at.cast())
 }
 
 pub type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
@@ -1080,8 +1112,8 @@ fn resource_attributes(info: AllocationInfo, heap_kind: u32) -> u64 {
 impl Memory {
     /// A committed resource's memory: from the title's allocator if the
     /// runtime named one, else our own; zeroed either way.
-    fn for_resource(info: AllocationInfo, heap_kind: u32) -> Result<Memory, HRESULT> {
-        let Some(&(alloc, _)) = ALLOCATOR.get() else {
+    fn for_resource(info: AllocationInfo, heap_kind: u32, buffer: bool) -> Result<Memory, HRESULT> {
+        let Some(&(alloc, free)) = ALLOCATOR.get() else {
             return Memory::new(info);
         };
         let layout = Layout::from_size_align(info.size as usize, info.alignment as usize)
@@ -1089,13 +1121,49 @@ impl Memory {
         let attributes = resource_attributes(info, heap_kind);
         let ptr =
             NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
+        // The host heap's block (the title's allocator did not place it):
+        // pages of its own that the write watch can tell of, instead.
+        if buffer && committed_watched() && ptr.as_ptr() as usize >> 40 != 0 && layout.size() >= 64 << 10 && layout.align() <= 64 << 10 {
+            if let Some(memory) = Memory::own_pages(layout, heap_kind) {
+                free(ptr.as_ptr().cast(), attributes);
+                return Ok(memory);
+            }
+        }
         // SAFETY: the allocator handed out `size` bytes.
         unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
         Ok(Memory {
             ptr,
             layout,
             attributes: Some(attributes),
+            pages: false,
         })
+    }
+
+    /// A committed buffer's memory in write-watched pages of its own
+    /// ([`committed_watched`]).
+    fn own_pages(layout: Layout, heap_kind: u32) -> Option<Memory> {
+        let pages = watched_pages(layout.size())?;
+        let all = WATCHED_COMMITTED.fetch_add(layout.size() as u64, std::sync::atomic::Ordering::Relaxed) + layout.size() as u64;
+        if layout.size() >= 4 << 20 {
+            tracing::info!(
+                at = ?pages,
+                mb = layout.size() >> 20,
+                heap = heap_kind,
+                all_mb = all >> 20,
+                "a committed buffer in write-watched pages of its own (VICTORY_COMMITTED_WATCH)"
+            );
+        }
+        Some(Memory { ptr: pages, layout, attributes: None, pages: true })
+    }
+
+    /// A committed buffer of `size` bytes as `create_committed` makes one
+    /// with `VICTORY_COMMITTED_WATCH` on: pages of its own, told to the
+    /// census.
+    #[cfg(all(test, feature = "diagnostics"))]
+    pub(crate) fn committed_for_test(size: usize) -> Memory {
+        let memory = Memory::own_pages(Layout::from_size_align(size, 256).unwrap(), 2).unwrap();
+        crate::census::committed(memory.address() as usize, size, memory.pages, true);
+        memory
     }
 
     /// `size` zeroed bytes aligned to `alignment` (a power of two).
@@ -1126,12 +1194,29 @@ impl Memory {
             ptr,
             layout,
             attributes: None,
+            pages: false,
         })
     }
 }
 
+/// Bytes of committed buffers given write-watched pages of their own
+/// (`VICTORY_COMMITTED_WATCH`), since the start.
+pub(crate) static WATCHED_COMMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Drop for Memory {
     fn drop(&mut self) {
+        // (The census's books of committed buffers: gone, if it was one.)
+        #[cfg(feature = "diagnostics")]
+        crate::census::committed(self.ptr.as_ptr() as usize, self.layout.size(), self.pages, false);
+        if self.pages {
+            use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+            let at = self.ptr.as_ptr() as usize;
+            // SAFETY: the pages of `watched_pages`, whole.
+            unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+            // What was known of the pages goes with them.
+            crate::watch::title_memory_freed(at, self.layout.size().next_multiple_of(64 << 10));
+            return;
+        }
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
             // SAFETY: allocated in `new` with this layout.
@@ -3480,10 +3565,16 @@ pub(crate) extern "system" fn create_committed(
         heap = heap.kind,
         "committed resource"
     );
-    let memory = match Memory::for_resource(info, heap.kind) {
+    let memory = match Memory::for_resource(info, heap.kind, desc.dimension == BUFFER) {
         Ok(memory) => memory,
         Err(hr) => return hr,
     };
+    // Diagnostics: the census looks at what lands in committed buffers
+    // (`crate::census::landed`), wherever their memory lies.
+    #[cfg(feature = "diagnostics")]
+    if desc.dimension == BUFFER {
+        crate::census::committed(memory.address() as usize, memory.layout.size(), memory.pages, true);
+    }
     hand_out_resource(
         desc,
         heap,
@@ -3994,6 +4085,29 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// A committed buffer's own pages (`VICTORY_COMMITTED_WATCH`): the
+    /// write watch tells which were written, so a refresh need not copy
+    /// the buffer whole; and they are given back whole.
+    #[test]
+    fn committed_pages_of_their_own_tell_their_writes() {
+        const BLOCK: usize = crate::watch::PAGE;
+        let size = 20 * BLOCK + 0x2200;
+        let at = watched_pages(size).unwrap();
+        let start = at.as_ptr() as usize;
+        assert_eq!(start % BLOCK, 0);
+        let end = start + size.next_multiple_of(BLOCK);
+        // Taken once: whatever was written since the allocation.
+        assert!(crate::watch::writes(start, end, false).is_some());
+        // SAFETY: inside the pages just made.
+        unsafe { at.as_ptr().add(3 * BLOCK + 100).write_volatile(7) };
+        let (_, written) = crate::watch::writes(start, end, false).expect("write-watched");
+        let blocks: Vec<usize> = written.iter().map(|&(p, _)| p).collect();
+        assert!(blocks.contains(&(start / BLOCK + 3)), "{blocks:?}");
+        assert!(blocks.len() < 20, "not all of it: {blocks:?}");
+        let memory = Memory { ptr: at, layout: Layout::from_size_align(size, 256).unwrap(), attributes: None, pages: true };
+        drop(memory);
+    }
 
     // Slot eviction's tests: memory stack by skornuta (skornuta/victory-memory-stack 57fb136,
     // GPL-3.0).

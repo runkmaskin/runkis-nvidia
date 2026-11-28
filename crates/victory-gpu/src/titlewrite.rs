@@ -269,8 +269,22 @@ fn learn(rip: usize, same: bool, can_look: bool) {
     });
 }
 
+/// Diagnostics (`crate::census`): how many bytes the store at the context's
+/// instruction writes, if it is one of those [`store`] knows.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn store_size(context: &windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> Option<usize> {
+    let rip = context.Rip as usize;
+    let mut code = [0u8; 15];
+    let left = 4096 - rip % 4096;
+    let there = crate::host::read_into(rip as *const u8, &mut code) || {
+        let n = left.min(15);
+        n < 15 && crate::host::read_into(rip as *const u8, &mut code[..n])
+    };
+    there.then(|| decode::store(&code, context)).flatten().map(|s| s.size)
+}
+
 /// The file name of the image `address` is in, and where in it.
-fn place(address: usize) -> Option<(String, usize)> {
+pub(crate) fn place(address: usize) -> Option<(String, usize)> {
     use windows_sys::Win32::System::LibraryLoader::{
         GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW, GetModuleHandleExW,
     };
