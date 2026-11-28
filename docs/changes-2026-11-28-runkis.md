@@ -98,4 +98,25 @@ What the layer itself gives the card per frame, from the code and the user's log
 | Keeping the card awake (`VICTORY_CARD_AWAKE=1`) | one group of 64 threads, 2 ms at a time, on a compute queue of its own | little work; with hardware scheduling off it may cost the drawing queue turns (the old base measured +1 fps without it on an RTX 2070 SUPER) |
 | DLSS to 1440p | one upscaling | about 1-1.5 ms |
 
-The rest is the title's own lists. Measurements of each switch follow.
+The rest is the title's own lists.
+
+### Measured (city at night, standing; last 90 s of a 240 s run; release build with `VICTORY_CARD_PARTS=1`)
+
+| Series S, to 1440p | fps | 1 % low | the title's lists | compares | sends and hashes | all lists |
+|---|---|---|---|---|---|---|
+| DLSS Quality (two runs) | 15.1 / 13.8 | 7.0 / 8.4 | 44.1 / 55.3 ms | 6.7 / 6.4 | 2.7 / 2.1 | 54.5 / 64.7 |
+| DLSS Performance | 14.6 | 2.8 | 39.9 | 6.7 | 2.4 | 49.8 |
+| DLSS Ultra Performance | 15.7 | 7.7 | 43.6 | 7.2 | 2.0 | 53.6 |
+| DLSS off (the title's upscaler, 720 lines) | 13.2 | 5.1 | 48.7 | 7.1 | 3.6 | 60.4 |
+
+- The card's time does not follow the picture's size: Ultra Performance draws a ninth of Quality's pixels and is
+  1-2 fps faster at most. Our own passes are about 10 ms of 55; the title's lists are the rest.
+- The card is 95-98 % busy by `nvidia-smi` at its full clock (2,820 MHz) but draws 85-105 W of its 220 W: it waits
+  for memory, not for its units.
+- The new line says why: 600-820 of the title's windows, 2.5-3.5 GB, stayed in the PC's memory because windows on
+  the card stop at 1,010 MB on this card (`default_window_card_mb`: 9 % of the budget, at most 1 GB). Every draw
+  that reads vertices, indices or constants from them crosses the bus.
+- A Series X run (DLSS Quality) hung the card after 106 s in the world (the log, the frames and `nvidia-smi`
+  stopped together); not looked into further, and no Series X runs since.
+- The first runs of a build at a new path compile pipelines for minutes (draws dropped, flat untextured surfaces):
+  the driver keeps pipelines by program path. `victory warm --used` with the same program made 4,114 in 4 minutes.
