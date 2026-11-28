@@ -39,6 +39,59 @@ std::arch::global_asm!(
     "mov rsi, r10",
     "mov rdi, r11",
     "ret",
+    ".globl victory_safe_copy_v",
+    ".globl victory_safe_copy_v_at",
+    ".globl victory_safe_copy_v_after",
+    ".globl victory_safe_copy_v_failed",
+    // As victory_safe_copy; under 8 KiB in blocks of 32 bytes (128 a turn),
+    // the rest of fewer than 32 bytes and longer copies by `rep movsb`.
+    "victory_safe_copy_v:",
+    "mov r10, rsi",
+    "mov r11, rdi",
+    "mov rdi, rcx",
+    "mov rsi, rdx",
+    "mov rcx, r8",
+    "victory_safe_copy_v_at:",
+    "cmp rcx, 8192",
+    "jae 3f",
+    "2:",
+    "cmp rcx, 128",
+    "jb 4f",
+    "vmovdqu ymm0, ymmword ptr [rsi]",
+    "vmovdqu ymm1, ymmword ptr [rsi + 32]",
+    "vmovdqu ymm2, ymmword ptr [rsi + 64]",
+    "vmovdqu ymm3, ymmword ptr [rsi + 96]",
+    "vmovdqu ymmword ptr [rdi], ymm0",
+    "vmovdqu ymmword ptr [rdi + 32], ymm1",
+    "vmovdqu ymmword ptr [rdi + 64], ymm2",
+    "vmovdqu ymmword ptr [rdi + 96], ymm3",
+    "add rsi, 128",
+    "add rdi, 128",
+    "sub rcx, 128",
+    "jmp 2b",
+    "4:",
+    "cmp rcx, 32",
+    "jb 3f",
+    "vmovdqu ymm0, ymmword ptr [rsi]",
+    "vmovdqu ymmword ptr [rdi], ymm0",
+    "add rsi, 32",
+    "add rdi, 32",
+    "sub rcx, 32",
+    "jmp 4b",
+    "3:",
+    "rep movsb",
+    "victory_safe_copy_v_after:",
+    "vzeroupper",
+    "mov eax, 1",
+    "mov rsi, r10",
+    "mov rdi, r11",
+    "ret",
+    "victory_safe_copy_v_failed:",
+    "vzeroupper",
+    "xor eax, eax",
+    "mov rsi, r10",
+    "mov rdi, r11",
+    "ret",
     ".globl victory_safe_put",
     ".globl victory_safe_put_at",
     ".globl victory_safe_put_after",
@@ -178,6 +231,10 @@ unsafe extern "system" {
     fn victory_safe_copy_at();
     fn victory_safe_copy_after();
     fn victory_safe_copy_failed();
+    fn victory_safe_copy_v(dst: *mut u8, src: *const u8, len: usize) -> u32;
+    fn victory_safe_copy_v_at();
+    fn victory_safe_copy_v_after();
+    fn victory_safe_copy_v_failed();
     fn victory_safe_put(dst: *mut u8, was: *const u8, now: *const u8, blocks: usize) -> u32;
     fn victory_safe_put_at();
     fn victory_safe_put_after();
@@ -396,8 +453,44 @@ pub(crate) fn on() -> bool {
 /// Of the two ranges, what is not title memory must be valid, and no Rust
 /// reference may cover the destination. [`on`] must have been asked.
 pub(crate) unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    if vector() {
+        // SAFETY: as below.
+        return unsafe { victory_safe_copy_v(dst, src, len) != 0 };
+    }
     // SAFETY: a fault on either side leaves through the failing exit
     // ([`failing_exit`]); the rest is the caller's.
+    unsafe { victory_safe_copy(dst, src, len) != 0 }
+}
+
+/// Whether [`copy`] moves copies under 8 KiB in blocks of 32 bytes
+/// (`VICTORY_COPY_VECTOR=1`; off by default: one `rep movsb`, as before).
+/// The same bytes are copied, and a fault fails the copy as before; only the
+/// speed differs. On the 7800X3D (`copy_costs`, offline) `rep movsb` took
+/// 0.37 us for 4 KiB into a buffer the card reads against 0.13 us for a
+/// plain copy: its start-up, paid by every short piece of a refresh. From
+/// 64 KiB on the two were alike.
+pub(crate) fn vector() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_VECTOR").is_some_and(|v| v == "1") && std::arch::is_x86_feature_detected!("avx"))
+}
+
+/// [`copy`] by blocks, whatever the switch says (tests and benchmarks).
+///
+/// # Safety
+/// As [`copy`]'s.
+#[cfg(test)]
+unsafe fn copy_vector(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    // SAFETY: the caller's; faults leave through the failing exit.
+    unsafe { victory_safe_copy_v(dst, src, len) != 0 }
+}
+
+/// [`copy`] by `rep movsb`, whatever the switch says (tests and benchmarks).
+///
+/// # Safety
+/// As [`copy`]'s.
+#[cfg(test)]
+unsafe fn copy_movsb(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    // SAFETY: the caller's; faults leave through the failing exit.
     unsafe { victory_safe_copy(dst, src, len) != 0 }
 }
 
@@ -407,6 +500,10 @@ pub(crate) fn failing_exit(at: usize) -> Option<usize> {
     let (from, to) = (victory_safe_copy_at as *const () as usize, victory_safe_copy_after as *const () as usize);
     if (from..to).contains(&at) {
         return Some(victory_safe_copy_failed as *const () as usize);
+    }
+    let (from, to) = (victory_safe_copy_v_at as *const () as usize, victory_safe_copy_v_after as *const () as usize);
+    if (from..to).contains(&at) {
+        return Some(victory_safe_copy_v_failed as *const () as usize);
     }
     let (from, to) = (victory_safe_put_at as *const () as usize, victory_safe_put_after as *const () as usize);
     if (from..to).contains(&at) {
@@ -468,6 +565,101 @@ mod tests {
                     assert!(to[..da].iter().chain(&to[da + len..]).all(|&x| x == 0xEE));
                 }
             }
+        }
+    }
+
+    /// The copy by blocks against `rep movsb` (the reference): the same
+    /// bytes at every length around the block and turn sizes and the 8 KiB
+    /// line, at every alignment, nothing outside written; a missing or
+    /// read-only page anywhere in the copy fails it on both, and the bytes
+    /// before the page are in.
+    #[test]
+    fn the_copy_by_blocks_is_the_copy_by_movsb() {
+        assert!(on());
+        let (a, b, c) = (Pages::new(5 << 12), Pages::new(5 << 12), Pages::new(5 << 12));
+        a.fill();
+        let lens = [0usize, 1, 31, 32, 33, 127, 128, 129, 160, 4095, 4096, 4097, 8191, 8192, 8193, 12_000];
+        for len in lens {
+            for (da, sa) in [(0usize, 0usize), (1, 0), (0, 3), (5, 2), (31, 17)] {
+                // SAFETY: inside the allocations (5 pages, at most 12,031 bytes in).
+                unsafe {
+                    std::ptr::write_bytes(b.0, 0xEE, b.1);
+                    std::ptr::write_bytes(c.0, 0xEE, c.1);
+                    assert!(copy_vector(b.0.add(da), a.0.add(sa), len));
+                    assert!(copy_movsb(c.0.add(da), a.0.add(sa), len));
+                    assert_eq!(std::slice::from_raw_parts(b.0, b.1), std::slice::from_raw_parts(c.0, c.1), "{len} {da} {sa}");
+                }
+            }
+        }
+        let mut old = 0;
+        // SAFETY: pages of our allocations.
+        unsafe {
+            VirtualProtect(a.0.add(4096).cast(), 4096, PAGE_NOACCESS, &mut old);
+            for (from, len) in [(4000usize, 200usize), (4064, 64), (0, 8192), (100, 5000), (4095, 2)] {
+                std::ptr::write_bytes(b.0, 0xEE, b.1);
+                assert!(!copy_vector(b.0, a.0.add(from), len), "{from} {len}");
+                let before = 4096 - from;
+                // What came before the page in the last whole block is in.
+                let whole = before / 128 * 128;
+                let to = std::slice::from_raw_parts(b.0, whole);
+                let src = std::slice::from_raw_parts(a.0.add(from), whole);
+                assert_eq!(to, src);
+            }
+            VirtualProtect(a.0.add(4096).cast(), 4096, PAGE_READWRITE, &mut old);
+            VirtualProtect(b.0.add(4096).cast(), 4096, PAGE_READONLY, &mut old);
+            assert!(!copy_vector(b.0.add(4000), a.0, 200));
+            assert!(copy_vector(b.0, a.0, 4096));
+            VirtualProtect(b.0.add(4096).cast(), 4096, PAGE_READWRITE, &mut old);
+        }
+        // Many faults, on several threads at once.
+        let at = a.0 as usize;
+        // SAFETY: a page of our allocation.
+        unsafe { VirtualFree(a.0.add(8192).cast(), 4096, MEM_DECOMMIT) };
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(move || {
+                    let mut to = [0u8; 256];
+                    for _ in 0..500 {
+                        // SAFETY: a decommitted page and our own buffer.
+                        assert!(!unsafe { copy_vector(to.as_mut_ptr(), (at + 8192 - 64) as *const u8, 256) });
+                    }
+                });
+            }
+        });
+    }
+
+    /// The copy by blocks and `rep movsb`, by length (ignored: a measurement;
+    /// `cargo test --release -p victory-gpu --lib -- --ignored --nocapture
+    /// copy_by_blocks_costs`): scattered pieces of 128 MiB into a buffer the
+    /// card reads, best of 5.
+    #[test]
+    #[ignore]
+    fn copy_by_blocks_costs() {
+        assert!(on());
+        let Some(host) = crate::host::host() else { return };
+        const N: usize = 128 << 20;
+        let from = Pages::new(N);
+        from.fill();
+        let (_buffer, shared) = host.shared_buffer(N as u64).expect("a shared buffer");
+        for piece in [64usize, 256, 1 << 10, 4 << 10, 8 << 10, 16 << 10, 64 << 10] {
+            let count = (N / piece).min(8192);
+            let at = |i: usize| (i * 7919 % (N / piece)) * piece;
+            let time = |f: &dyn Fn(usize) -> bool| {
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    let t = std::time::Instant::now();
+                    for i in 0..count {
+                        assert!(f(at(i)));
+                    }
+                    best = best.min(t.elapsed().as_secs_f64());
+                }
+                best * 1e6 / count as f64
+            };
+            // SAFETY: inside the buffers.
+            let movsb = time(&|o| unsafe { copy_movsb(shared.add(o), from.0.add(o), piece) });
+            // SAFETY: as above.
+            let blocks = time(&|o| unsafe { copy_vector(shared.add(o), from.0.add(o), piece) });
+            println!("{piece:>6} bytes: rep movsb {movsb:.3} us, by blocks {blocks:.3} us");
         }
     }
 
