@@ -391,6 +391,11 @@
                 </Grid>
                 <Grid Style="{StaticResource Row}">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                  <StackPanel><TextBlock Text="Texture memory diet"/><TextBlock Style="{StaticResource Hint}" Text="VICTORY_TEXTURE_UNMAPPED + VICTORY_TEXTURE_RAM: textures in system memory 6.0 to 2.7 GB in the prison intro at the same fps (RTX 4070 SUPER)."/></StackPanel>
+                  <CheckBox Grid.Column="1" IsChecked="{Binding Profile.TextureDiet}" VerticalAlignment="Center"/>
+                </Grid>
+                <Grid Style="{StaticResource Row}">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
                   <StackPanel><TextBlock Text="Game thread priority cap"/><TextBlock Style="{StaticResource Hint}" Text="VICTORY_TITLE_PRIORITY_CAP: the game runs 13 worker threads at the highest priority, which can make the desktop lag while it plays. Not measured in game on this base yet."/></StackPanel>
                   <ComboBox Grid.Column="1" ItemsSource="{Binding PriorityCapChoices}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Profile.TitlePriorityCap}" Width="320" HorizontalAlignment="Left" VerticalAlignment="Center"/>
                 </Grid>
