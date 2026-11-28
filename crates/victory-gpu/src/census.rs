@@ -94,19 +94,22 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// The bitmap of the pages made read-only (0: not made yet).
 static BITS: AtomicUsize = AtomicUsize::new(0);
 
+/// Two bitmaps: the pages read-only now, then the pages ever made so
+/// (never cleared: a fault that was raised while a page was read-only may
+/// be looked at after it is read-write again).
 fn bits() -> Option<&'static [AtomicU64]> {
     let at = BITS.load(Relaxed);
-    // SAFETY: once made, the bitmap is never let go; atomics of zeroed pages.
-    (at != 0).then(|| unsafe { std::slice::from_raw_parts(at as *const AtomicU64, PAGES / 64) })
+    // SAFETY: once made, the bitmaps are never let go; atomics of zeroed pages.
+    (at != 0).then(|| unsafe { std::slice::from_raw_parts(at as *const AtomicU64, 3 * PAGES / 64) })
 }
 
 fn make_bits() -> bool {
     if BITS.load(Relaxed) != 0 {
         return true;
     }
-    // SAFETY: fresh zeroed memory of ours, 32 MiB of commit (pages are only
+    // SAFETY: fresh zeroed memory of ours, 96 MiB of commit (pages are only
     // taken where they are touched).
-    let at = unsafe { VirtualAlloc(std::ptr::null(), PAGES / 8, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+    let at = unsafe { VirtualAlloc(std::ptr::null(), 3 * PAGES / 8, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
     !at.is_null() && BITS.compare_exchange(0, at as usize, Relaxed, Relaxed).is_ok()
 }
 
@@ -114,14 +117,62 @@ fn armed(page: usize) -> bool {
     page < PAGES && bits().is_some_and(|b| b[page / 64].load(Relaxed) >> (page % 64) & 1 != 0)
 }
 
+/// The third bitmap: pages read-only again after a counted store (the trap
+/// flag's, `VICTORY_WRITE_CENSUS_STORES` above 1), not since a refresh.
+fn trapped(page: usize) -> bool {
+    page < PAGES && bits().is_some_and(|b| b[2 * PAGES / 64 + page / 64].load(Relaxed) >> (page % 64) & 1 != 0)
+}
+
+fn mark_trapped(page: usize, on: bool) {
+    if let Some(b) = bits() {
+        let word = &b[2 * PAGES / 64 + page / 64];
+        if on {
+            word.fetch_or(1 << (page % 64), Relaxed);
+        } else {
+            word.fetch_and(!(1 << (page % 64)), Relaxed);
+        }
+    }
+}
+
+/// A refresh took `[first, last)`: none of its pages is trapped any more
+/// (its next store is a first one), 64 at a time.
+fn untrap(first: usize, last: usize) {
+    let Some(b) = bits() else {
+        return;
+    };
+    let mut page = first;
+    while page < last {
+        let n = (64 - page % 64).min(last - page);
+        let mask = if n == 64 { !0u64 } else { ((1u64 << n) - 1) << (page % 64) };
+        b[2 * PAGES / 64 + page / 64].fetch_and(!mask, Relaxed);
+        page += n;
+    }
+}
+
+/// Whether the census ever made the page read-only.
+fn ever(page: usize) -> bool {
+    page < PAGES && bits().is_some_and(|b| b[PAGES / 64 + page / 64].load(Relaxed) >> (page % 64) & 1 != 0)
+}
+
+/// The order that keeps the handler right: a page's bit is set BEFORE it is
+/// made read-only and cleared AFTER it is read-write again, so a page that
+/// is read-only by our hand always has its bit. (The other order let a
+/// store fault on a read-only page whose bit was already or not yet clear,
+/// and the fault went on to the title, which died: run census-075138.)
 fn mark(page: usize, on: bool) {
     if let Some(b) = bits() {
         if on {
             b[page / 64].fetch_or(1 << (page % 64), Relaxed);
+            b[PAGES / 64 + page / 64].fetch_or(1 << (page % 64), Relaxed);
         } else {
             b[page / 64].fetch_and(!(1 << (page % 64)), Relaxed);
         }
     }
+}
+
+/// Whether the page at `at` can be written now.
+fn writable_now(at: usize) -> bool {
+    query(at).is_some_and(|i| i.State == MEM_COMMIT && i.Protect & 0xff == PAGE_READWRITE && i.Protect & PAGE_GUARD == 0)
 }
 
 /// What the switches ask.
@@ -521,10 +572,10 @@ fn open_pages(s: &State, first: usize, last: usize) -> u64 {
         let at = page * PAGE;
         let run_end = s.plain.range(..=at).next_back().filter(|(_, (e, _))| *e > at).map_or(page + 1, |(_, &(e, _))| e / PAGE);
         let end = next(page, last.min(run_end), false);
+        protect(at, (end - page) * PAGE, protection(s, at));
         for p in page..end {
             mark(p, false);
         }
-        protect(at, (end - page) * PAGE, protection(s, at));
         opened += (end - page) as u64;
         page = next(end, last, true);
     }
@@ -593,13 +644,15 @@ fn arm(s: &mut State, from: usize, to: usize) {
                 }
                 let end = next(page, last, true);
                 if !s.kernel.meets(page * PAGE, end * PAGE) {
+                    for q in page..end {
+                        mark(q, true);
+                    }
                     if protect(page * PAGE, (end - page) * PAGE, read_only(p)) {
-                        for q in page..end {
-                            mark(q, true);
-                            s.traps.remove(&q);
-                        }
                         s.totals.armed_pages += (end - page) as u64;
                     } else {
+                        for q in page..end {
+                            mark(q, false);
+                        }
                         s.totals.refused += 1;
                     }
                 }
@@ -649,6 +702,7 @@ pub(crate) fn refreshed(start: usize, len: usize, from: usize, to: usize, copied
     s.regions[id].refreshes += 1;
     s.regions[id].copied += copied as u64;
     if kind == Kind::Watched && from < to {
+        untrap(from / PAGE, to.div_ceil(PAGE).min(PAGES));
         arm(s, from, to);
     }
 }
@@ -731,19 +785,26 @@ pub(crate) fn guard_fault(context: &CONTEXT, at: usize) {
 /// A write fault at `at`: if it is a page of the census, noted and opened.
 fn written(context: &mut CONTEXT, at: usize) -> bool {
     let page = at / PAGE;
-    if !armed(page) {
+    if !ever(page) {
         return false;
     }
+    // Every protection the census changes is changed under this lock: only
+    // under it are the bit and the protection known to agree. (Looked at
+    // before it, a page could be opened and made read-only again between
+    // the look and the answer: run census-075138's lost fault.)
     let mut guard = state();
     let Some(s) = guard.as_mut() else {
-        return false;
+        // (The sample ended meanwhile: its pages are read-write again.)
+        return writable_now(at);
     };
     if !armed(page) {
         // Opened meanwhile by another thread: the store is made again.
-        return query(at).is_some_and(|i| i.Protect & 0xff == PAGE_READWRITE);
+        return writable_now(at);
     }
     let block = at / BLOCK;
-    let traps = s.traps.get(&page).copied().unwrap_or(0);
+    // Stores counted since the page was copied: none unless the trap flag
+    // made it read-only again since.
+    let traps = if trapped(page) { s.traps.get(&page).copied().unwrap_or(0) } else { 0 };
     let who = s.attribute(context);
     if who.2 == Via::Ours && who.1 == 0 {
         // Ours alone (what shaders wrote, landed): not a store of the
@@ -754,11 +815,12 @@ fn written(context: &mut CONTEXT, at: usize) -> bool {
         return true;
     }
     s.note(context, who, at, traps == 0, Kind::Watched);
-    mark(page, false);
     protect(page * PAGE, PAGE, protection(s, page * PAGE));
+    mark(page, false);
     if s.traps.contains_key(&page) || s.traps.len() < TRAPS {
-        *s.traps.entry(page).or_default() += 1;
+        s.traps.insert(page, traps + 1);
     }
+    mark_trapped(page, false);
     if traps + 1 < s.stores && ACTIVE.load(Relaxed) {
         let generation = s.generation;
         PENDING.with(|p| {
@@ -776,6 +838,8 @@ fn written(context: &mut CONTEXT, at: usize) -> bool {
 /// The trap behind a store [`written`] let through: its pages are
 /// read-only again. `false` if this thread had none.
 fn stepped(context: &mut CONTEXT) -> bool {
+    #[cfg(test)]
+    STEPS.fetch_add(1, Relaxed);
     let (pages, n) = PENDING.get();
     if n == 0 {
         return false;
@@ -794,8 +858,11 @@ fn stepped(context: &mut CONTEXT) -> bool {
         if s.kernel.meets(at, at + PAGE) {
             continue;
         }
-        if protect(at, PAGE, read_only(protection(s, at))) {
-            mark(page, true);
+        mark(page, true);
+        mark_trapped(page, true);
+        if !protect(at, PAGE, read_only(protection(s, at))) {
+            mark(page, false);
+            mark_trapped(page, false);
         }
     }
     true
@@ -944,6 +1011,8 @@ fn finish(why: &'static str) {
     });
 }
 
+#[cfg(test)]
+static STEPS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static ENDED: Mutex<Option<(&'static str, u64)>> = Mutex::new(None);
 
@@ -1169,17 +1238,97 @@ mod tests {
     /// The tests that take samples, one at a time (a sample is the process's).
     static ONE: Mutex<()> = Mutex::new(());
 
-    /// Fresh read-write memory below 1 TiB, or `None`.
+    /// Fresh read-write memory below 1 TiB (where console addresses lie and
+    /// the census looks; the host's own allocations lie above).
     fn memory(size: usize) -> Option<usize> {
-        // SAFETY: a fresh allocation of the test's.
-        let at = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as usize;
-        assert_ne!(at, 0);
-        if at / PAGE + size / PAGE >= PAGES {
-            // SAFETY: as above.
-            unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
-            return None;
+        static NEXT: AtomicUsize = AtomicUsize::new(0x40_0000_0000);
+        for _ in 0..4096 {
+            let want = NEXT.fetch_add(1 << 30, Relaxed);
+            if want + size >= PAGES * PAGE {
+                break;
+            }
+            // SAFETY: a fresh allocation of the test's, where nothing is.
+            let at = unsafe { VirtualAlloc(want as *const _, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as usize;
+            if at != 0 {
+                return Some(at);
+            }
         }
-        Some(at)
+        panic!("no memory below 1 TiB for the test");
+    }
+
+    /// A thread storing all the time into pages that another makes
+    /// read-only, opens and ends samples over: every store is done and none
+    /// reaches past the handler (a fault passed on ends the test process, as
+    /// it ended the title in run census-075138).
+    #[test]
+    fn stores_racing_the_protections_all_go_through() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let size = 16 * PAGE;
+        let at = memory(size).unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(Relaxed) {
+                    for page in 0..16 {
+                        // SAFETY: the test's own memory.
+                        unsafe { ((at + page * PAGE + (n as usize % 512) * 8) as *mut u64).write_volatile(n) };
+                    }
+                    n += 1;
+                }
+                n
+            })
+        };
+        AS_TITLE.set(true);
+        for round in 0..200 {
+            assert!(begin(Limits { stores: 1 + round % 3, arm_us: u64::MAX / 4, stall_ms: 60_000 }, 0));
+            for _ in 0..20 {
+                refreshed(at, size, at, at + size, 0, Kind::Watched);
+                let s = state();
+                if let Some(s) = s.as_ref() {
+                    open_pages(s, at / PAGE, (at + size) / PAGE);
+                }
+            }
+            refreshed(at, size, at, at + size, 0, Kind::Watched);
+            end().unwrap();
+        }
+        AS_TITLE.set(false);
+        stop.store(true, Relaxed);
+        assert!(writer.join().unwrap() > 0);
+        for page in 0..16 {
+            assert_eq!(protection_at(at + page * PAGE), PAGE_READWRITE, "page {page}");
+        }
+        // SAFETY: the test's own memory.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// The handler's answer to a fault that it sees only after the page was
+    /// opened again (the window of run census-075138): the store is made
+    /// again, not passed on. A page the census never had is passed on.
+    #[test]
+    fn a_fault_seen_after_its_page_opened_is_made_again() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let size = 4 * PAGE;
+        let at = memory(size).unwrap();
+        let other = memory(size).unwrap();
+        assert!(begin(Limits { stores: 1, arm_us: u64::MAX / 4, stall_ms: 60_000 }, 0));
+        AS_TITLE.set(true);
+        refreshed(at, size, at, at + size, 0, Kind::Watched);
+        assert!(armed(at / PAGE + 1));
+        open_pages(state().as_ref().unwrap(), at / PAGE, (at + size) / PAGE);
+        assert!(!armed(at / PAGE + 1) && ever(at / PAGE + 1));
+        // SAFETY: a zeroed context, as the handler gets one.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        assert!(written(&mut context, at + PAGE + 8), "made again");
+        assert!(!written(&mut context, other + 8), "not the census's");
+        AS_TITLE.set(false);
+        end().unwrap();
+        // SAFETY: the test's own memory.
+        unsafe {
+            VirtualFree(at as *mut _, 0, MEM_RELEASE);
+            VirtualFree(other as *mut _, 0, MEM_RELEASE);
+        }
     }
 
     /// With no time for it in the frame, nothing is made read-only.
@@ -1187,7 +1336,7 @@ mod tests {
     fn arming_keeps_to_its_time() {
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         let size = 8 * PAGE;
-        let Some(at) = memory(size) else { return };
+        let at = memory(size).unwrap();
         assert!(begin(Limits { stores: 1, arm_us: 0, stall_ms: 60_000 }, 0));
         AS_TITLE.set(true);
         refreshed(at, size, at, at + size, 0, Kind::Watched);
@@ -1207,7 +1356,7 @@ mod tests {
     fn a_sample_without_frames_ends_by_itself() {
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         let size = 8 * PAGE;
-        let Some(at) = memory(size) else { return };
+        let at = memory(size).unwrap();
         *ENDED.lock().unwrap() = None;
         assert!(begin(Limits { stores: 1, arm_us: u64::MAX / 4, stall_ms: 200 }, 0));
         AS_TITLE.set(true);
@@ -1243,13 +1392,7 @@ mod tests {
         // SAFETY: fresh memory of the test's, written by it alone.
         unsafe {
             let size = 16 * PAGE;
-            let at = VirtualAlloc(std::ptr::null(), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as usize;
-            assert_ne!(at, 0);
-            if at / PAGE >= PAGES {
-                // (Above 1 TiB: not memory the census looks at.)
-                VirtualFree(at as *mut _, 0, MEM_RELEASE);
-                return;
-            }
+            let at = memory(size).unwrap();
             assert!(begin(Limits { stores: 3, arm_us: u64::MAX / 4, stall_ms: 60_000 }, 0));
             AS_TITLE.set(true);
             refreshed(at, size, at, at + size, 123, Kind::Watched);
@@ -1265,13 +1408,17 @@ mod tests {
             }
             assert_eq!(p.add(2 * PAGE / 8).read_volatile(), 7);
             assert_eq!(p.add(5 * PAGE / 8 + 4).read_volatile(), 4);
-            assert_eq!(protection_at(at + 2 * PAGE), PAGE_READWRITE);
-            assert!(!armed(at / PAGE + 2) && armed(at / PAGE + 3));
+            // Page 2 is read-only again behind its one store (two more may be
+            // counted); page 5 was left open after its third.
+            assert_eq!(protection_at(at + 2 * PAGE) & 0xff, PAGE_READONLY);
+            assert!(armed(at / PAGE + 2) && trapped(at / PAGE + 2));
+            assert_eq!(protection_at(at + 5 * PAGE), PAGE_READWRITE);
+            assert!(!armed(at / PAGE + 5) && armed(at / PAGE + 3));
             {
                 let guard = state();
                 let s = guard.as_ref().unwrap();
                 assert_eq!(s.totals.first, 2);
-                assert_eq!(s.totals.stores, 4);
+                assert_eq!(s.totals.stores, 4, "steps {}", STEPS.load(Relaxed));
                 let site = s.sites.values().map(|x| x.bytes).sum::<u64>();
                 assert_eq!(site, 4 * 8);
                 assert_eq!(s.regions[0].copied, 123);
