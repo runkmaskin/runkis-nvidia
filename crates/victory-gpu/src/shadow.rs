@@ -320,8 +320,9 @@ pub(crate) fn card_room_kept() -> u64 {
     card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
-/// The copies in the card's memory.
-static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+/// The copies in the card's memory, each with its title range
+/// (`crate::carded`).
+static CARDED: crate::carded::Register<Shadow> = crate::carded::Register::new();
 
 /// The copies in the card's memory whose `touched` was set since
 /// [`card_dirty`] last took them (a copy may be on it twice). Before, each
@@ -333,17 +334,11 @@ static TOUCHED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 /// card's memory; the copies let go are dropped from the list once it has
 /// doubled since that was last done.
 fn carded(shadow: &Arc<Shadow>) {
-    static KEPT: AtomicUsize = AtomicUsize::new(0);
     let Some(card) = &shadow.card else {
         return;
     };
     let _ = card.me.set(Arc::downgrade(shadow));
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
-    carded.push(Arc::downgrade(shadow));
-    if carded.len() >= 2 * KEPT.load(Ordering::Relaxed).max(1024) {
-        carded.retain(|weak| weak.strong_count() > 0);
-        KEPT.store(carded.len(), Ordering::Relaxed);
-    }
+    CARDED.add(shadow, shadow.start as usize, (shadow.start + shadow.len) as usize);
 }
 
 /// Since the last frame line: bytes copied to card sides and the ranges
@@ -364,7 +359,7 @@ pub(crate) fn card_stats() -> [u64; 10] {
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    out[7] = CARDED.count() as u64;
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
@@ -825,7 +820,9 @@ pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
 /// CPU side held the same before or not. Left out is what shaders in the air
 /// may be writing (such a copy waits for them, or is done on the card).
 pub(crate) fn send_copied(dst: usize, len: usize) {
-    for shadow in carded_copies() {
+    // (Those the copy reaches, not all of them upgraded and looked at: one
+    // call for each of the title's buffer copies.)
+    for shadow in CARDED.live_in(dst, dst.saturating_add(len)) {
         let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
         let (from, to) = (dst.max(start), (dst + len).min(end));
         if from >= to {
@@ -841,7 +838,7 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
 
 /// The copies in the card's memory (diagnostics: `crate::host::upcheck`).
 pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade).collect()
+    CARDED.live()
 }
 
 /// Ranges in order, those that overlap or touch as one.

@@ -3557,30 +3557,78 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
 fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
-    use std::sync::Arc;
-    // Per copy, the span of what is refreshed (a flush brings that much
-    // up to date at most).
-    let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-    // Where each copy is in it, if shaders may be writing it (none begins to
-    // while this runs): a frame has 20,000 refreshes of some 4,500 copies.
-    let mut places: ByCopy<Option<usize>> = ByCopy::default();
-    for list in runs {
-        for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step {
-                let place = places.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| {
-                    shadow.writes_pending().then(|| {
-                        spans.push((shadow.clone(), *address, *address + *len));
-                        spans.len() - 1
-                    })
-                });
-                if let Some(i) = *place {
-                    let s = &mut spans[i];
-                    (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+    let spans = UNDER_PLACES.with_borrow_mut(|places| {
+        let mut under = Under::new(places);
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::Refresh(shadow, address, len) = step {
+                    under.step(shadow, *address, *len, |shadow| shadow.writes_pending());
                 }
             }
         }
-    }
+        under.spans
+    });
     stale_of(spans)
+}
+
+thread_local! {
+    /// [`Under`]'s table, kept from one call to the next with its room: it
+    /// grew from nothing to some 4,500 copies each time.
+    static UNDER_PLACES: std::cell::RefCell<ByCopy<Option<usize>>> = std::cell::RefCell::default();
+}
+
+/// [`stale_under_flights`]' gathering: per copy that shaders may be writing
+/// (none begins to while this runs), the span of what is refreshed of it (a
+/// flush brings that much up to date at most), in the order of each copy's
+/// first refresh. The table of where each copy is in it is looked up only,
+/// so its order reaches nothing; several refreshes of one copy on end are
+/// looked up once. (Ported from runkis-nvidia old-u0221 eafd20a.)
+struct Under<'a, S> {
+    spans: Vec<(std::sync::Arc<S>, usize, usize)>,
+    places: &'a mut ByCopy<Option<usize>>,
+    /// The last copy looked up and its place. (No copy is at address 0.)
+    last: (usize, Option<usize>),
+}
+
+impl<'a, S> Under<'a, S> {
+    fn new(places: &'a mut ByCopy<Option<usize>>) -> Under<'a, S> {
+        places.clear();
+        Under { spans: Vec::new(), places, last: (0, None) }
+    }
+
+    /// A refresh of `len` bytes at `address` of `shadow`; `pending` says
+    /// whether shaders may be writing it, asked once per copy.
+    fn step(&mut self, shadow: &std::sync::Arc<S>, address: usize, len: usize, pending: impl FnOnce(&S) -> bool) {
+        let key = std::sync::Arc::as_ptr(shadow) as *const () as usize;
+        let place = if key == self.last.0 {
+            self.last.1
+        } else {
+            let spans = &mut self.spans;
+            let place = *self.places.entry(key).or_insert_with(|| {
+                pending(shadow).then(|| {
+                    spans.push((shadow.clone(), address, address + len));
+                    spans.len() - 1
+                })
+            });
+            self.last = (key, place);
+            place
+        };
+        if let Some(i) = place {
+            let s = &mut self.spans[i];
+            (s.1, s.2) = (s.1.min(address), s.2.max(address + len));
+        }
+    }
+}
+
+/// Takes out of a flush's refreshes those of copies in place, which copy
+/// nothing and know it without asking anything (`Shadow::nothing_new`'s first
+/// answer): counted as known to copy nothing, as the threads would have.
+/// Their order, and the others', stays. (Ported from runkis-nvidia
+/// old-u0221 eafd20a.)
+fn drop_in_place(refreshes: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) {
+    let all = refreshes.len();
+    refreshes.retain(|r| !r.0.in_place());
+    FLUSHES[2].fetch_add((all - refreshes.len()) as u64, Ordering::Relaxed);
 }
 
 /// Of `spans` (a copy shaders may be writing, and the span of what a
@@ -9232,6 +9280,12 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
         }
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        if many {
+            // Copies in place copy nothing (`Shadow::nothing_new` says so
+            // first of all): not handed to the threads. (After the asking
+            // above, which they were part of.)
+            drop_in_place(&mut spans);
+        }
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
@@ -9393,10 +9447,15 @@ impl Batch {
             FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
             if light {
                 // A number to a free thread, not a job to each copy.
-                let refreshes = std::mem::take(&mut self.refreshes);
+                let mut refreshes = std::mem::take(&mut self.refreshes);
+                // (Decided on all of them, before those in place go.)
+                let looked = refreshes.len() > FEW;
+                if looked {
+                    drop_in_place(&mut refreshes);
+                }
                 crate::shadow::wide_each(refreshes.len(), move |i| {
                     let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
+                    if looked && shadow.nothing_new(*from, *to - *from) {
                         FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -12302,3 +12361,108 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+#[cfg(test)]
+mod under_tests {
+    use super::{ByCopy, Under};
+    use std::sync::Arc;
+
+    /// `stale_under_flights`' gathering as it was: a new table each time, every
+    /// refresh looked up.
+    fn old(steps: &[(Arc<u32>, usize, usize)], pending: impl Fn(&u32) -> bool) -> Vec<(Arc<u32>, usize, usize)> {
+        let mut spans: Vec<(Arc<u32>, usize, usize)> = Vec::new();
+        let mut places: ByCopy<Option<usize>> = ByCopy::default();
+        for (shadow, address, len) in steps {
+            let place = places.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| {
+                pending(shadow).then(|| {
+                    spans.push((shadow.clone(), *address, *address + *len));
+                    spans.len() - 1
+                })
+            });
+            if let Some(i) = *place {
+                let s = &mut spans[i];
+                (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+            }
+        }
+        spans
+    }
+
+    fn steps(seed: &mut u64, copies: &[Arc<u32>], n: usize) -> Vec<(Arc<u32>, usize, usize)> {
+        let mut next = |m: usize| {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (*seed >> 33) as usize % m
+        };
+        let mut out = Vec::with_capacity(n);
+        let mut at = 0;
+        for _ in 0..n {
+            // Most come several times on end, as a list's refreshes do.
+            if next(3) == 0 {
+                at = next(copies.len());
+            }
+            out.push((copies[at].clone(), next(1 << 20), 1 + next(4096)));
+        }
+        out
+    }
+
+    fn gather(places: &mut ByCopy<Option<usize>>, all: &[(Arc<u32>, usize, usize)], pending: impl Fn(&u32) -> bool) -> Vec<(Arc<u32>, usize, usize)> {
+        let mut under = Under::new(places);
+        for (shadow, address, len) in all {
+            under.step(shadow, *address, *len, &pending);
+        }
+        under.spans
+    }
+
+    /// Fixed-seed refreshes: the same spans, copy for copy, in the same order,
+    /// with the table kept from one submission to the next; `pending` asked
+    /// once per copy, as before.
+    #[test]
+    fn the_kept_table_gathers_what_a_new_one_did() {
+        let mut seed = 0x0dd5_eed5;
+        let mut places = ByCopy::default();
+        for round in 0..300 {
+            let copies: Vec<Arc<u32>> = (0..1 + round % 50).map(|i| Arc::new(i as u32)).collect();
+            let all = steps(&mut seed, &copies, round * 7 % 900);
+            let pending = |v: &u32| (v + round as u32).is_multiple_of(3);
+            let asked = std::cell::Cell::new(0usize);
+            let want = old(&all, pending);
+            let got = gather(&mut places, &all, |v| {
+                asked.set(asked.get() + 1);
+                pending(v)
+            });
+            assert_eq!(got.len(), want.len());
+            for (g, w) in got.iter().zip(&want) {
+                assert!(Arc::ptr_eq(&g.0, &w.0) && (g.1, g.2) == (w.1, w.2), "round {round}");
+            }
+            let distinct: std::collections::HashSet<usize> = all.iter().map(|s| Arc::as_ptr(&s.0) as usize).collect();
+            assert_eq!(asked.get(), distinct.len(), "round {round}");
+        }
+    }
+
+    /// The micro-benchmark (`cargo test --release -p victory-gpu --lib -- --ignored
+    /// --nocapture host::under_tests::what_gathering_costs`): 20,000 refreshes of
+    /// 4,500 copies, as in a frame.
+    #[test]
+    #[ignore]
+    fn what_gathering_costs() {
+        let rounds = 200;
+        let copies: Vec<Arc<u32>> = (0..4500).map(Arc::new).collect();
+        let mut seed = 99;
+        let all = steps(&mut seed, &copies, 20_000);
+        let pending = |v: &u32| v.is_multiple_of(5);
+        let (mut was, mut now) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let mut places = ByCopy::default();
+        for _ in 0..rounds {
+            let began = std::time::Instant::now();
+            let want = std::hint::black_box(old(&all, pending));
+            was += began.elapsed();
+            let began = std::time::Instant::now();
+            let got = std::hint::black_box(gather(&mut places, &all, pending));
+            now += began.elapsed();
+            assert_eq!(got.len(), want.len());
+        }
+        println!(
+            "20,000 refreshes of 4,500 copies gathered: a new table {:.0} us, the kept table {:.0} us",
+            was.as_micros() as f64 / rounds as f64,
+            now.as_micros() as f64 / rounds as f64
+        );
+    }
+}

@@ -21,6 +21,8 @@ mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
+mod carded;
+#[cfg(windows)]
 mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
