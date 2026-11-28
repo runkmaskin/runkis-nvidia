@@ -56,6 +56,10 @@ $settings = @{
     # down to a few: 768p, seconds 150-300, two runs each: staging 662 -> 353 MB, scratch 437 -> 320 MB, card's shared
     # memory 6.9 -> 6.6 GB, fps 21.7 -> 22.6 (noise)
     VICTORY_RAM_TRIM = '1'
+    # measured in game (768p, prison route, 2026-11-28): the title's end-of-frame fence wait blocks instead of spinning
+    # on a core; 21.70 -> 22.58 fps, 1 % low 9.8 -> 11.6 (one run against two). The title's loop still tests its own
+    # condition, so it exits at the same fence value.
+    VICTORY_FENCE_SLEEP = '1'
     # local: programs the shader validator refused (all their draws dropped) now validate: 41 with mixed interpolation
     # in a signature row, 3 alpha-clip materials with a level query on an array; game run: nothing new refused, same fps
     VICTORY_SIG_ROWS = '1'; VICTORY_LOD_ARRAY = '1'
