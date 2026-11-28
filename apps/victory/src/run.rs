@@ -330,6 +330,10 @@ pub fn run(
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
         unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
+        // VICTORY_FENCE_SLEEP=1 (off without it): the title's end-of-frame fence wait blocks
+        // instead of spinning on a core.
+        // SAFETY: as above.
+        unsafe { victory_loader::fence_wait::apply_asked(image.base(), &original_hash) };
         // VICTORY_TITLE_POOL (off without it): the title's Series S pools, which run out with a
         // scene above 768 lines, made larger.
         // SAFETY: as above.
