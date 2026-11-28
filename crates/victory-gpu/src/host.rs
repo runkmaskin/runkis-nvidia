@@ -4131,6 +4131,7 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    submit_pipe::log(frames);
     crate::port::log(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
@@ -4155,6 +4156,7 @@ mod panel;
 mod place;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
+mod submit_pipe;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
 mod torn;
@@ -5651,11 +5653,35 @@ impl Host {
     }
 
     fn send_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
+        self.send_late_or_cut(lists, order, parts, submit_pipe::on());
+    }
+
+    /// [`Host::send_late`]; with `may_cut` ([`submit_pipe`]) a submission of
+    /// parts that would wait for landings may come back cut instead: its
+    /// front parts go now, and the rest is sent behind them as parts of its
+    /// own (and may wait, or be cut again).
+    fn send_late_or_cut(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize], may_cut: bool) {
+        let mut cut = None;
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
-            self.submit(&runs, parts, true)
+            self.submit_or_cut(&runs, parts, true, may_cut.then_some(&mut cut))
         };
         let Some((mut submitted, sent)) = sent else {
+            if let Some(cut) = cut {
+                match split(lists, order, cut) {
+                    Ok([(lists, order), (more, behind)]) => {
+                        submit_pipe::cut_made(order.len());
+                        let first: Vec<usize> = parts.iter().copied().filter(|&p| p < cut).collect();
+                        let second: Vec<usize> = parts.iter().filter(|&&p| p > cut).map(|p| p - cut).collect();
+                        // The front waits for nothing; the rest as any parts.
+                        self.send_late_or_cut(lists, order, &first, false);
+                        self.execute_parts(more, behind, &second);
+                    }
+                    // A list named on both sides: whole, as before.
+                    Err((lists, order)) => self.send_late_or_cut(lists, order, parts, false),
+                }
+                return;
+            }
             // (Not reached: a submission sent ahead always comes back.)
             crate::list::recycle(lists, &order);
             return;
@@ -5952,6 +5978,20 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        self.submit_or_cut(runs, parts, late, None)
+    }
+
+    /// [`Host::submit`]. With `cut` ([`submit_pipe`]): where the submission
+    /// would wait for landings because it reads title memory flights may
+    /// write, and its front parts read none of it, nothing is prepared or
+    /// sent; `None` comes back, with `cut` the place in `runs` to cut at.
+    fn submit_or_cut<'a>(
+        &'a self,
+        runs: &[&HostList],
+        parts: &[usize],
+        late: bool,
+        cut: Option<&mut Option<usize>>,
+    ) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
@@ -5995,6 +6035,25 @@ impl Host {
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
+            // [`submit_pipe`]: the front parts go to the card now, and the
+            // card works on them while the rest waits.
+            if let Some(out) = cut
+                && why == WHY_READ
+            {
+                if let Some(at) = submit_pipe::cut(runs, parts) {
+                    if let Some(first) = first_heaps {
+                        // (As after a wait: the front begins its own round.)
+                        std::mem::forget(first);
+                    }
+                    submitting(0, 0);
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::submission_ends(called.elapsed().as_micros() as u64);
+                    working(was_working);
+                    *out = Some(at);
+                    return None;
+                }
+                submit_pipe::not_cut(parts);
+            }
             waited_for_flights = true;
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have

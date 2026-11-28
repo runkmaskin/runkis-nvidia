@@ -106,3 +106,58 @@ read 200-400 while no draw was dropped for it.
 - **Never made by design:** device methods 0x1c8 and 0x218 (not implemented, `device.rs`), at least 16,384 and
   2,048 calls a run. The title goes without those pipelines and draws nothing with them.
 - **Translator warnings in the logs:** only the two "does not translate" lines above.
+
+## The submitting thread and the card: what still serializes them (2026-11-28)
+
+What upstream already overlaps (the play settings, `apps/victory/src/play.rs`):
+
+- `VICTORY_RELAY=2` (with `VICTORY_LATE_WAIT` at stage 3): submissions are sent without a wait, a thread of its own
+  (`victory-relay`) lands them when the card has run them, and a submission that reads title memory a flight's
+  shaders may write waits only for the flights that declared that memory (`relay_wait`, `blocked_by`), not for
+  everything in the air. The present is a flight too.
+- `VICTORY_CARD_STEPS=2`: those reads (11,000 to 15,000 fills of constant buffers a frame in the city, out of the
+  title's ring in its 174 MB heap, which the skinning passes declare written as a whole) are done on the card in
+  front of the submission's lists, behind the flights, instead of waiting for them.
+- `VICTORY_UPLOAD_AHEAD=1`, `VICTORY_JOIN_PARTS=8` (up to eight of the title's submissions prepared as one),
+  `VICTORY_RELAY_COPY=1` (the relay's fetches on the copy queue).
+
+So the old base's ideas are mostly there in another form. `VICTORY_SUBMIT_PIPELINE` of the old fork was never
+code (`docs/per-draw-plan.md` there names it as stage 6, "only after stage 5"); `VICTORY_FETCH_IN_FLIGHT` cut the
+old base's card-done-to-told from 29.4 to 2.1 ms with no fps change. Here the relay waits 4 ms a frame for its
+fetches, and the title's own submissions are rarely held up by a landing (the card stood 0.8 ms a frame "while the
+title had not submitted"), so it was not ported.
+
+What still serializes them, from the logs of six city runs on this base (Series S 1440p DLSS Quality, RTX 4070
+SUPER, the frame lines' "settles" and "card's clock"):
+
+| Wait of the submitting thread | Per frame | What the card does meanwhile |
+|---|---|---|
+| "title memory read": a submission the card's steps refuse waits until the flights that declared what it reads have landed | 0.1 to 0.25 submissions, 4 to 14 ms | busy with the flights ahead, then **idle** during their landing and the preparing behind it |
+| "lists in the air": 256 host lists in the air (`VICTORY_LATE_WAIT_LISTS`) | 3 to 7 ms | busy: a frame's worth is queued |
+| title memory changed under shader writes, a memory value, a fence | 0 | - |
+
+The refusal is always the same one: "a copy at its place in a list writes what it reads, or reads or writes what
+it writes" (`card_steps::BEHIND_PLACED`). The card counts itself 86 to 93 % busy, idle "behind us" 4 to 8 ms a
+frame. So the frame is close to the card's own time (title lists 39 to 41 ms, ours about 10 more), and what the
+overlap can still win is those 4 to 8 ms.
+
+- **`VICTORY_SUBMIT_PIPELINE=1`** (`crates/victory-gpu/src/host/submit_pipe.rs`, off by default; needs the relay's
+  second stage). A submission of joined parts that would wait for landings is cut instead: the front parts that
+  read nothing in the air go to the card at once, as a submission of their own, and only the rest waits (and may be
+  cut again). The cut is where one of the title's submissions began, so each side is what the line sends without
+  joining; the rest is checked joinable behind the front again, and a front with a copy at its place is not cut.
+  So every CPU step reads the same bytes as with `VICTORY_JOIN_PARTS=1`, and as the joined submission does. Tests:
+  `host::submit_pipe::tests` (the choice of the cut; a fixed-seed model of title memory, flights and parts, 4,000
+  cases, where the bytes every part reads are the same cut, joined and unjoined). The frame line gets
+  "submissions cut ahead of their wait for landings per frame".
+- Upstream's own switches for the refusal itself, off there: `VICTORY_PLACED_READS=1` (fills behind such a copy read
+  where the copy reads) and `VICTORY_PLACED_ORDER=1` (the submission is cut behind the copy's list). To be measured
+  beside it.
+
+**Not measured in game yet.** The A/B (off, `VICTORY_SUBMIT_PIPELINE=1`, `VICTORY_PLACED_READS=1` with
+`VICTORY_PLACED_ORDER=1`, two interleaved rounds of 240 s after a discarded warm-up run, Series S 1440p DLSS Quality,
+the city save) was queued when the game queue was paused by the user, and was withdrawn before it ran. What to
+look at: fps and 1 % low from the frame log; the frame line's "title memory read" wait and "the card idle behind
+us"; "submissions cut ahead of their wait" (how often a cut happens at all: when the first part is the one that
+reads what is in the air, there is nothing to cut). Until then the switch stays off and is not in the launcher's
+presets.
