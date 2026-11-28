@@ -478,7 +478,7 @@ pub(crate) fn sync_heaps() {
         let mut parts: Vec<(usize, usize)> = Vec::new();
         for (range_from, range_end) in taken {
             if mirrored_count < heap.desc.count {
-                note_past_cap(start, step, slots_past_cap(range_from, range_end, start as usize, step, mirrored_count, heap.desc.count));
+                note_past_cap(slots_past_cap(range_from, range_end, start as usize, step, mirrored_count, heap.desc.count));
             }
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
@@ -813,43 +813,30 @@ fn slots_past_cap(range_from: usize, range_end: usize, heap_start: usize, step: 
     first.min(last)..last
 }
 
-/// View records the title wrote into slots of its heap past the host heap
-/// (NVIDIA caps a shader-visible heap at 1,000,000 views; the retail
-/// title's has 1,245,184, of which the host gives it 737,855 beside the
-/// dynamic slots). Such a slot is never made, and a shader index there reads
-/// one of the host's dynamic slots (only past the null slot is it clamped).
-/// Counted and told (`views past the host heap`) so a run says whether the
-/// title uses them at all; the records, the highest slot.
+/// Slots of the title's heap past the host heap (NVIDIA caps a
+/// shader-visible heap at 1,000,000 views; the retail title's has 1,245,184,
+/// of which the host gives it 737,855 beside the dynamic slots) in pages the
+/// title wrote, and the highest. Such a slot is never made: a draw's table
+/// there is made in the host's dynamic slots, and a shader index there that
+/// is not a table's reads one of those. In the city the title rewrites the
+/// whole range all the time (about 3 million slots a second over its pages,
+/// up to 1,245,182): its own ring of per-draw tables. Counted, not read (the
+/// records were 16 MB a sync), and told at each power of two.
 #[cfg(windows)]
 static PAST_CAP: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
-/// Counts the view records in `slots` of the heap at `heap_start`
-/// ([`PAST_CAP`]).
+/// Counts `slots` in [`PAST_CAP`].
 #[cfg(windows)]
-fn note_past_cap(heap_start: u64, step: u64, slots: std::ops::Range<u64>) {
+fn note_past_cap(slots: std::ops::Range<u64>) {
     use std::sync::atomic::Ordering::Relaxed;
     if slots.is_empty() {
         return;
     }
-    let mut bytes = vec![0u8; ((slots.end - slots.start) * step) as usize];
-    if !crate::host::read_into((heap_start + slots.start * step) as *const u8, &mut bytes) {
-        return;
-    }
-    let mut highest = None;
-    let views = bytes
-        .chunks_exact(step as usize)
-        .zip(slots.clone())
-        .filter(|(r, _)| r.first_chunk::<4>().is_some_and(|w| u32::from_le_bytes(*w) == VIEW_TAG))
-        .inspect(|&(_, i)| highest = Some(i))
-        .count() as u64;
-    if views == 0 {
-        return;
-    }
-    let before = PAST_CAP[0].fetch_add(views, Relaxed);
-    let top = highest.unwrap_or(0);
-    let was = PAST_CAP[1].fetch_max(top, Relaxed);
-    if (before + views).ilog2() != before.checked_ilog2().unwrap_or(u32::MAX) || top / 4096 > was / 4096 {
-        tracing::warn!(records = before + views, highest = top.max(was), "views past the host heap: the title wrote view records into slots its host heap has no room for");
+    let n = slots.end - slots.start;
+    let before = PAST_CAP[0].fetch_add(n, Relaxed);
+    let highest = PAST_CAP[1].fetch_max(slots.end - 1, Relaxed).max(slots.end - 1);
+    if (before + n).ilog2() != before.checked_ilog2().unwrap_or(u32::MAX) {
+        tracing::info!(slots = before + n, highest, "slots past the host heap written by the title (its per-draw tables; made in dynamic slots)");
     }
 }
 
