@@ -3633,10 +3633,39 @@ pub(crate) fn let_go_idle() {
 /// view. Every draw that reads such a slot through a table makes it again
 /// from the title's record, with a new window, as after any change. What
 /// can show: a draw recorded between the look at the window and the slot's
-/// unmaking reads zeros there once. Off: no slot is touched.
-fn unslot() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_WINDOW_UNSLOT"))
+/// unmaking reads zeros there once, and a slot that shaders only pick by
+/// index (no table read makes it again) reads zeros from then on; upstream's
+/// texture slot eviction (trustno1-coder/VIctory-NVIDIA 64d4931, from
+/// skornuta/victory-memory-stack) leaves such slots alone for that reason.
+/// `VICTORY_WINDOW_UNSLOT=gone` takes only windows whose title memory is no
+/// longer mapped where it was asked for (first and last byte), which the
+/// title cannot read any more. Off: no slot is touched.
+fn unslot() -> Option<Unslot> {
+    static MODE: std::sync::OnceLock<Option<Unslot>> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_WINDOW_UNSLOT").as_deref().map(str::trim) {
+        Ok("1") => Some(Unslot::Idle),
+        Ok("gone") => Some(Unslot::Gone),
+        _ => None,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Unslot {
+    /// Idle windows held by slots alone.
+    Idle,
+    /// Of those, the ones whose title memory is not mapped any more.
+    Gone,
+}
+
+/// Whether the title memory a window was asked for is mapped no more (its
+/// first and last byte asked for).
+fn asked_gone(s: &Shadow) -> bool {
+    let low = s.asked[0].load(Ordering::Relaxed);
+    let high = s.asked[1].load(Ordering::Relaxed);
+    if high <= low {
+        return false;
+    }
+    !crate::texture::committed(low as *const u8, 1) && !crate::texture::committed((high - 1) as *const u8, 1)
 }
 
 /// How long a window must have been idle before its slots are made null.
@@ -3650,21 +3679,24 @@ pub(crate) static UNSLOTTED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// The windows held by nothing but descriptor slots (or lists' views of
 /// them) that nothing asked for in [`UNSLOT_IDLE_MS`]: their host buffers
 /// (by address) and bytes.
-fn slot_only_idle() -> Vec<(usize, u64)> {
+/// With `gone`, only those whose title memory is mapped no more.
+fn slot_only_idle(gone: bool) -> Vec<(usize, u64)> {
     let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     map.values()
         .filter(|s| {
             Arc::strong_count(s) == 1
                 && crate::host::long_ago(s.used.load(Ordering::Relaxed), UNSLOT_IDLE_MS, UNSLOT_FRAMES)
                 && crate::host::references(&s.buffer) > 1
+                && (!gone || asked_gone(s))
         })
         .map(|s| (windows::core::Interface::as_raw(&s.buffer) as usize, s.len))
         .collect()
 }
 
-/// For the memory line: the bytes of the windows [`unslot`] would free.
-pub(crate) fn slot_only_idle_bytes() -> u64 {
-    slot_only_idle().iter().map(|w| w.1).sum()
+/// For the memory line: the bytes of the windows [`unslot`] would free, and
+/// of those whose title memory is mapped no more (`gone`).
+pub(crate) fn slot_only_idle_bytes() -> [u64; 2] {
+    [false, true].map(|gone| slot_only_idle(gone).iter().map(|w| w.1).sum())
 }
 
 /// With [`unslot`]: a thread that every few seconds makes null the title
@@ -3673,13 +3705,13 @@ pub(crate) fn slot_only_idle_bytes() -> u64 {
 /// the submitting thread has no time for.
 fn start_unslot() {
     static STARTED: std::sync::Once = std::sync::Once::new();
-    if !unslot() {
+    let Some(mode) = unslot() else {
         return;
-    }
+    };
     STARTED.call_once(|| {
-        let spawned = std::thread::Builder::new().name("victory window unslot".into()).spawn(|| loop {
+        let spawned = std::thread::Builder::new().name("victory window unslot".into()).spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(5));
-            let idle = slot_only_idle();
+            let idle = slot_only_idle(mode == Unslot::Gone);
             if idle.is_empty() {
                 continue;
             }

@@ -11194,7 +11194,7 @@ fn frame_log(presented: [u64; 2]) {
 }
 
 /// The highest value so far of each field of [`memory_line`].
-static MEMORY_PEAKS: [std::sync::atomic::AtomicU64; 24] = [const { std::sync::atomic::AtomicU64::new(0) }; 24];
+static MEMORY_PEAKS: [std::sync::atomic::AtomicU64; 25] = [const { std::sync::atomic::AtomicU64::new(0) }; 25];
 
 /// What holds memory, by who holds it, in one line with the frame-rate
 /// lines every five seconds, for a launcher to read: `memory by subsystem:`
@@ -11207,9 +11207,10 @@ fn memory_line(host: &Host) {
     let [windows, buffer_copies, card_copies] = crate::shadow::memory_counts();
     let [texture_blocks, staging_blocks] = crate::pool::memory();
     let kept = crate::pipeline::kept();
+    let [slot_idle, slot_gone] = crate::shadow::slot_only_idle_bytes();
     let video = host.video_memory().unwrap_or_default();
     let system = system_memory();
-    let fields: [(&str, u64); 24] = [
+    let fields: [(&str, u64); 25] = [
         ("private", private_bytes()),
         ("list_allocators", HELD_CALLS.load(Ordering::Relaxed) * CALL_BYTES),
         ("list_scratch", alive(2)),
@@ -11245,8 +11246,10 @@ fn memory_line(host: &Host) {
         ("staging_moved", crate::pool::STAGING_MOVED.load(Ordering::Relaxed)),
         // Windows that only descriptor slots hold and nothing asked for in
         // 20 s (what `VICTORY_WINDOW_UNSLOT=1` lets go), and the windows'
-        // bytes it made slots let go of since the start.
-        ("windows_slot_idle", crate::shadow::slot_only_idle_bytes()),
+        // bytes it made slots let go of since the start; of the first, those
+        // whose title memory is mapped no more (`VICTORY_WINDOW_UNSLOT=gone`).
+        ("windows_slot_idle", slot_idle),
+        ("windows_slot_gone", slot_gone),
         ("windows_unslotted", crate::shadow::UNSLOTTED[1].load(Ordering::Relaxed)),
     ];
     tracing::info!("{}", memory_text(&fields, &MEMORY_PEAKS));
