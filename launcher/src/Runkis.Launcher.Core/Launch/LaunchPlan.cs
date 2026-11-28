@@ -111,6 +111,7 @@ public sealed class PlanBuilder(RepoLayout repo)
         void Bool(string k, bool? v) { if (v is bool b) o[k] = b ? "1" : "0"; }
         // This fork's switches on upstream's base (both off unless the profile asks).
         if (p.FenceSleep) o["VICTORY_FENCE_SLEEP"] = "1";
+        if (!p.WaterLight) o["VICTORY_WATER_LIGHT"] = "0";
         if (p.TitlePool is > 0 and <= 16) Int("VICTORY_TITLE_POOL", p.TitlePool);
         Int("VICTORY_TITLE_PRIORITY_CAP", p.TitlePriorityCap);
         // Upstream's own switches the launcher has settings for.

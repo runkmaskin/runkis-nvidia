@@ -386,6 +386,11 @@
                 <TextBlock Text="This fork's switches (off by default)" Style="{StaticResource H2}"/>
                 <Grid Style="{StaticResource Row}">
                   <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                  <StackPanel><TextBlock Text="Water light"/><TextBlock Style="{StaticResource Hint}" Text="VICTORY_WATER_LIGHT: the water's own light pass, a quarter of the card's time in the city. Off measured 16.9 to 19.9 fps and almost no long frames (RTX 4070 SUPER, city at night); the water is darker and bluer."/></StackPanel>
+                  <CheckBox Grid.Column="1" IsChecked="{Binding Profile.WaterLight}" VerticalAlignment="Center"/>
+                </Grid>
+                <Grid Style="{StaticResource Row}">
+                  <Grid.ColumnDefinitions><ColumnDefinition Width="280"/><ColumnDefinition/></Grid.ColumnDefinitions>
                   <StackPanel><TextBlock Text="Game thread priority cap"/><TextBlock Style="{StaticResource Hint}" Text="VICTORY_TITLE_PRIORITY_CAP: the game runs 13 worker threads at the highest priority, which can make the desktop lag while it plays. Not measured in game on this base yet."/></StackPanel>
                   <ComboBox Grid.Column="1" ItemsSource="{Binding PriorityCapChoices}" DisplayMemberPath="Label" SelectedValuePath="Value" SelectedValue="{Binding Profile.TitlePriorityCap}" Width="320" HorizontalAlignment="Left" VerticalAlignment="Center"/>
                 </Grid>

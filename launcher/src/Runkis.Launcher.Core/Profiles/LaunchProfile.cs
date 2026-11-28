@@ -66,6 +66,12 @@ public sealed class LaunchProfile
     /// <summary>VICTORY_FENCE_SLEEP=1 (victory-loader fence_wait.rs): the title's frame fence wait blocks instead of spinning.</summary>
     public bool FenceSleep { get; set; }
     /// <summary>
+    /// The water's own light (upstream's VICTORY_WATER_LIGHT, on by default). false sets it to 0: measured in the city
+    /// at night (RTX 4070 SUPER, Series S DLSS Quality, 3 interleaved pairs) 16.9 -> 19.9 fps and almost no frames over
+    /// 100 ms; the water is darker and bluer.
+    /// </summary>
+    public bool WaterLight { get; set; } = true;
+    /// <summary>
     /// VICTORY_TITLE_POOL (victory-loader title_pool.rs): the title's Series S pools this many times larger (0: as they are).
     /// Series S above 768 lines (DLAA, 1080 lines) needs 2.
     /// </summary>
