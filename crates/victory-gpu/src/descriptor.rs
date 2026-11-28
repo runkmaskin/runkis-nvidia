@@ -477,6 +477,9 @@ pub(crate) fn sync_heaps() {
         spent[0] += since(began);
         let mut parts: Vec<(usize, usize)> = Vec::new();
         for (range_from, range_end) in taken {
+            if mirrored_count < heap.desc.count {
+                note_past_cap(start, step, slots_past_cap(range_from, range_end, start as usize, step, mirrored_count, heap.desc.count));
+            }
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 parts.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end)));
@@ -802,6 +805,54 @@ pub(crate) fn sync_line(frames: f64) {
 /// Title descriptor slots in a changed byte range that have host counterparts.
 /// `range_end` is exclusive.
 #[cfg(windows)]
+/// The slots of a written range at or past `mirrored_count` (of a heap of
+/// `count`): those a capped host heap has no counterpart for.
+fn slots_past_cap(range_from: usize, range_end: usize, heap_start: usize, step: u64, mirrored_count: u32, count: u32) -> std::ops::Range<u64> {
+    let first = ((range_from - heap_start) as u64 / step).max(u64::from(mirrored_count));
+    let last = ((range_end - heap_start) as u64).div_ceil(step).min(u64::from(count));
+    first.min(last)..last
+}
+
+/// View records the title wrote into slots of its heap past the host heap
+/// (NVIDIA caps a shader-visible heap at 1,000,000 views; the retail
+/// title's has 1,245,184, of which the host gives it 737,855 beside the
+/// dynamic slots). Such a slot is never made, and a shader index there reads
+/// one of the host's dynamic slots (only past the null slot is it clamped).
+/// Counted and told (`views past the host heap`) so a run says whether the
+/// title uses them at all; the records, the highest slot.
+#[cfg(windows)]
+static PAST_CAP: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Counts the view records in `slots` of the heap at `heap_start`
+/// ([`PAST_CAP`]).
+#[cfg(windows)]
+fn note_past_cap(heap_start: u64, step: u64, slots: std::ops::Range<u64>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if slots.is_empty() {
+        return;
+    }
+    let mut bytes = vec![0u8; ((slots.end - slots.start) * step) as usize];
+    if !crate::host::read_into((heap_start + slots.start * step) as *const u8, &mut bytes) {
+        return;
+    }
+    let mut highest = None;
+    let views = bytes
+        .chunks_exact(step as usize)
+        .zip(slots.clone())
+        .filter(|(r, _)| r.first_chunk::<4>().is_some_and(|w| u32::from_le_bytes(*w) == VIEW_TAG))
+        .inspect(|&(_, i)| highest = Some(i))
+        .count() as u64;
+    if views == 0 {
+        return;
+    }
+    let before = PAST_CAP[0].fetch_add(views, Relaxed);
+    let top = highest.unwrap_or(0);
+    let was = PAST_CAP[1].fetch_max(top, Relaxed);
+    if (before + views).ilog2() != before.checked_ilog2().unwrap_or(u32::MAX) || top / 4096 > was / 4096 {
+        tracing::warn!(records = before + views, highest = top.max(was), "views past the host heap: the title wrote view records into slots its host heap has no room for");
+    }
+}
+
 fn changed_slots(
     range_from: usize,
     range_end: usize,

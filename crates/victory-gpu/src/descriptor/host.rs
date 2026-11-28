@@ -1880,6 +1880,21 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// the last slot is the null slot every view index at or past it reads.
 const UNCAPPED_VIEWS: u32 = 1 << 21;
 
+/// The most views `fits` takes in one shader-visible heap between `low`
+/// (known to fit) and `high` (to try), to 4,096 views (heaps are made and
+/// dropped at once, about 20 tries).
+fn largest_fitting(low: u32, high: u32, fits: impl Fn(u32) -> bool) -> u32 {
+    if fits(high) {
+        return high;
+    }
+    let (mut lo, mut hi) = (low, high);
+    while hi - lo > 4096 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid) { lo = mid } else { hi = mid }
+    }
+    lo
+}
+
 /// Where the raw twins of the title's slots start in a heap that has them
 /// ([`raw_twins`]): past every slot a title's heap and the dynamic ones take.
 const RAW_TWINS: u32 = 1 << 21;
@@ -1933,6 +1948,10 @@ pub(crate) fn probe_view_limit() {
             RAW_TWINS
         } else if fits(UNCAPPED_VIEWS) {
             UNCAPPED_VIEWS
+        } else if fits(PORTABLE_VIEWS + 4096) {
+            // A host between the two: as many as it takes (an RTX 4070
+            // SUPER says and takes 1,000,000 exactly, and so stays there).
+            largest_fitting(PORTABLE_VIEWS, UNCAPPED_VIEWS, fits)
         } else {
             PORTABLE_VIEWS
         };
@@ -1965,17 +1984,25 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 /// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
 /// refused, with 2,639 indirect draws and dispatches).
 fn dynamic_slots(count: u32, null: u32) -> u32 {
-    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
-        std::env::var("VICTORY_DYNAMIC_SLOTS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DYNAMIC << 2)
-    });
+    static ASKED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let asked = *ASKED.get_or_init(|| std::env::var("VICTORY_DYNAMIC_SLOTS").ok().and_then(|v| v.trim().parse().ok()));
+    dynamic_slots_for(count, null, asked)
+}
+
+/// [`dynamic_slots`] with `VICTORY_DYNAMIC_SLOTS` as `asked`.
+///
+/// On a capped host (NVIDIA: 1,000,000 views, what the card says and the
+/// most it makes) the dynamic slots come out of the title's: of the retail
+/// title's 1,245,184 the host keeps 737,855, and every title slot past them
+/// is never made. There `VICTORY_DYNAMIC_SLOTS` is the trade: fewer dynamic
+/// slots, more of the title's (2^17: 868,927 of them; at least 2^16, at most
+/// half the heap). Unset, 2^18 as before (2^17 ran out in the opening
+/// cutscene on the old base).
+fn dynamic_slots_for(count: u32, null: u32, asked: Option<u32>) -> u32 {
     if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+        return asked.map_or(DYNAMIC, |n| n.clamp(1 << 16, (null / 2).max(1 << 16)));
     }
-    null.saturating_sub(count).min(most).max(DYNAMIC)
+    null.saturating_sub(count).min(asked.unwrap_or(DYNAMIC << 2)).max(DYNAMIC)
 }
 
 impl HostHeap {
@@ -5677,6 +5704,79 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What this PC's card takes in one shader-visible view heap, and what
+    /// it says it takes (`MaxViewDescriptorHeapSize`, OPTIONS19).
+    #[test]
+    fn largest_view_heap_on_this_card() {
+        let Some(host) = host() else { return };
+        let fits = |count: u32| {
+            // SAFETY: plain heap creation; the heap is released at once.
+            unsafe {
+                host.device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: count,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+            }
+            .is_ok()
+        };
+        let mut o19 = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the structure the feature names, of its size.
+        let said = unsafe {
+            host.device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, (&raw mut o19).cast(), size_of_val(&o19) as u32)
+        };
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: as above.
+        let _ = unsafe { host.device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, (&raw mut o).cast(), size_of_val(&o) as u32) };
+        let largest = largest_fitting(PORTABLE_VIEWS, 1 << 23, fits);
+        println!(
+            "binding tier {}, MaxViewDescriptorHeapSize {} ({said:?}), largest view heap made {largest}",
+            o.ResourceBindingTier.0, o19.MaxViewDescriptorHeapSize
+        );
+        if fits(PORTABLE_VIEWS) {
+            assert!(largest >= PORTABLE_VIEWS);
+        }
+    }
+
+    /// On a capped host the dynamic slots are 2^18 unless asked, and what is
+    /// asked is kept between 2^16 and half the heap; an uncapped host as before.
+    #[test]
+    fn dynamic_slots_trade_with_the_titles_on_a_capped_host() {
+        let null = PORTABLE_VIEWS - 1;
+        let title = 1_245_184;
+        assert_eq!(dynamic_slots_for(title, null, None), DYNAMIC);
+        assert_eq!(dynamic_slots_for(title, null, Some(1 << 17)), 1 << 17);
+        assert_eq!(dynamic_slots_for(title, null, Some(10)), 1 << 16);
+        assert_eq!(dynamic_slots_for(title, null, Some(u32::MAX)), null / 2);
+        // The title's slots that fit beside them (`HostHeap::new`).
+        assert_eq!(null - dynamic_slots_for(title, null, Some(1 << 17)), 868_927);
+        assert_eq!(null - dynamic_slots_for(title, null, None), 737_855);
+        // Uncapped (AMD, 2^21 views): as before.
+        let big = UNCAPPED_VIEWS - 1;
+        assert_eq!(dynamic_slots_for(title, big, None), (big - title).min(DYNAMIC << 2).max(DYNAMIC));
+        assert_eq!(dynamic_slots_for(title, big, Some(1 << 19)), 1 << 19);
+    }
+
+    #[test]
+    fn past_cap_slots_are_those_past_the_host_heap() {
+        // Records of 32 bytes; a heap of 1,245,184 of which 737,855 are made.
+        let (start, step) = (0x10_0000usize, 32u64);
+        let at = |slot: u64| start + (slot * step) as usize;
+        assert!(super::super::slots_past_cap(at(10), at(20), start, step, 737_855, 1_245_184).is_empty());
+        assert_eq!(super::super::slots_past_cap(at(737_850), at(737_860), start, step, 737_855, 1_245_184), 737_855..737_860);
+        assert_eq!(super::super::slots_past_cap(at(1_245_180), at(1_245_190), start, step, 737_855, 1_245_184), 1_245_180..1_245_184);
+    }
+
+    #[test]
+    fn the_largest_fitting_heap_is_found_to_a_page() {
+        for limit in [1_000_000u32, 1_048_576, 1_245_184 + 262_144, 1 << 21, 3_000_000] {
+            let got = largest_fitting(PORTABLE_VIEWS, 1 << 21, |n| n <= limit);
+            let want = limit.min(1 << 21);
+            assert!(got <= want && want - got <= 4096, "{limit}: {got}");
+        }
+    }
 
     fn rr(size: u64, offset: u64, len: u64) -> (Option<(u64, u32)>, Option<Cut>) {
         let (range, cut) = raw_range(size, offset, len);
