@@ -9595,6 +9595,52 @@ struct Presenter {
 /// line at the top of the picture (`menu.rs`).
 pub(crate) static METER_FPS_TENTHS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// One frame-log line: seconds since the log began, milliseconds since the frame before, and the
+/// draws between them.
+fn frame_line(seconds: f64, ms: f64, draws: u64) -> String {
+    format!("{seconds:.3} {ms:.2} {draws}")
+}
+
+/// `VICTORY_FRAME_LOG=<file>` (off without it): one line a presented frame, as [`frame_line`],
+/// for frame pacing and the 1 % low the five-second lines average away (the Runkis launcher's
+/// live tiles and benchmark read it). Ported from the runkis-nvidia fork (6fe8c3c,
+/// GPL-3.0-or-later).
+fn frame_log() {
+    use std::io::Write;
+    struct Log {
+        start: std::time::Instant,
+        last: std::time::Instant,
+        drawn: u64,
+        out: std::io::BufWriter<std::fs::File>,
+        n: u32,
+    }
+    static LOG: Mutex<Option<Option<Log>>> = Mutex::new(None);
+    let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
+    let log = log.get_or_insert_with(|| {
+        let path = std::env::var_os("VICTORY_FRAME_LOG").filter(|p| !p.is_empty())?;
+        let file = std::fs::File::create(path).ok()?;
+        let now = std::time::Instant::now();
+        Some(Log { start: now, last: now, drawn: crate::draw::drawn(), out: std::io::BufWriter::new(file), n: 0 })
+    });
+    let Some(log) = log else { return };
+    let now = std::time::Instant::now();
+    let drawn = crate::draw::drawn();
+    let line = frame_line((now - log.start).as_secs_f64(), (now - log.last).as_secs_f64() * 1000.0, drawn - log.drawn);
+    let _ = writeln!(log.out, "{line}");
+    (log.last, log.drawn) = (now, drawn);
+    log.n += 1;
+    if log.n.is_multiple_of(16) {
+        let _ = log.out.flush();
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn frame_log_lines_are_what_the_launcher_reads() {
+    assert_eq!(frame_line(12.3456, 33.333, 1234), "12.346 33.33 1234");
+    assert_eq!(frame_line(0.0, 0.0, 0), "0.000 0.00 0");
+}
+
 struct Meter {
     since: std::time::Instant,
     frames: u32,
@@ -9632,6 +9678,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        frame_log();
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;

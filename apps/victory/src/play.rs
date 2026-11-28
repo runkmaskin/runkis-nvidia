@@ -166,6 +166,11 @@ pub(crate) struct Play {
     /// F1 menu's "PRELOAD SHADERS" does): a while, maybe long.
     #[arg(long)]
     pub(crate) preload: bool,
+    /// Print the start's settings and the `run` it would do as one line of
+    /// JSON, and stop: nothing is asked, fetched, written or started (the
+    /// Runkis launcher builds its runs from this).
+    #[arg(long, hide = true)]
+    pub(crate) print_env: bool,
 }
 
 /// What a preload is, said before it begins.
@@ -792,20 +797,7 @@ pub(crate) struct Ready {
 pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     let program = std::env::current_exe().context("this program's own path")?;
     let here = program.parent().map(Path::to_path_buf).unwrap_or_default();
-    let exe = match &o.exe {
-        Some(exe) => exe.clone(),
-        None => [here.join(GAME), PathBuf::from(GAME)].into_iter().find(|p| p.is_file()).with_context(|| {
-            format!(
-                "no {GAME} beside this program ({}): put the program into your own dump's folder, \
-                 or name the title's executable (`victory play <path to {GAME}>`)",
-                here.display()
-            )
-        })?,
-    };
-    anyhow::ensure!(exe.is_file(), "no {}", exe.display());
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-    // (Windows' own long form `\\?\C:\...` back to the plain one.)
-    let exe = PathBuf::from(exe.to_string_lossy().trim_start_matches(r"\\?\").to_owned());
+    let exe = find_exe(o, &here)?;
 
     check_shader_model()?;
 
@@ -850,22 +842,7 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     {
         s.insert("VICTORY_MFG_UNLOCKER_DLL".to_owned(), dll.to_string_lossy().into_owned());
     }
-    // The first start of this victory.exe (no mark for its bytes yet): the game plays a little
-    // and starts again by itself (crates\victory-gpu\src\host\menu.rs, `warmup`), since a new
-    // exe's first run stays at about 14 fps. `--set VICTORY_WARMUP_RESTART=0`: not done.
-    if !s.contains_key("VICTORY_WARMUP_RESTART")
-        && let Some(mark) = warmup_mark(&home, &program)
-        && !mark.exists()
-    {
-        println!("First start of this version of victory.exe: the game restarts by itself {WARMUP_SECONDS} seconds after it");
-        println!("loads into the game (press A at the title screen), once (a new version's first run otherwise stays at about 14 fps).");
-        s.insert("VICTORY_WARMUP_RESTART".to_owned(), WARMUP_SECONDS.to_string());
-        s.insert("VICTORY_WARMUP_MARK".to_owned(), mark.to_string_lossy().into_owned());
-    }
-    // Where the menu saves, and how it starts the title again: with this start's options.
-    s.insert("VICTORY_MENU_FILE".to_owned(), menu_file.to_string_lossy().into_owned());
-    s.insert("VICTORY_MENU_PLAY".to_owned(), program.to_string_lossy().into_owned());
-    s.insert("VICTORY_MENU_ARGS".to_owned(), restart_args(o, &exe));
+    finish_settings(o, &mut s, &home, &program, &exe, true);
     let log = log_file(&home.join("logs"))?;
     let console = if series_s { "series-s" } else { "series-x" };
     let line: Vec<String> = s.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -894,6 +871,107 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
         }
     }
     Ok(Ready { exe, series_s })
+}
+
+/// The settings every start ends with: the first start's warm-up restart of a
+/// new victory.exe (`say`: told in this window), and where the menu saves and
+/// how it starts the title again.
+fn finish_settings(o: &Play, s: &mut BTreeMap<String, String>, home: &Path, program: &Path, exe: &Path, say: bool) {
+    // The first start of this victory.exe (no mark for its bytes yet): the game plays a little
+    // and starts again by itself (crates\victory-gpu\src\host\menu.rs, `warmup`), since a new
+    // exe's first run stays at about 14 fps. `--set VICTORY_WARMUP_RESTART=0`: not done.
+    if !s.contains_key("VICTORY_WARMUP_RESTART")
+        && let Some(mark) = warmup_mark(home, program)
+        && !mark.exists()
+    {
+        if say {
+            println!("First start of this version of victory.exe: the game restarts by itself {WARMUP_SECONDS} seconds after it");
+            println!("loads into the game (press A at the title screen), once (a new version's first run otherwise stays at about 14 fps).");
+        }
+        s.insert("VICTORY_WARMUP_RESTART".to_owned(), WARMUP_SECONDS.to_string());
+        s.insert("VICTORY_WARMUP_MARK".to_owned(), mark.to_string_lossy().into_owned());
+    }
+    // Where the menu saves, and how it starts the title again: with this start's options.
+    s.insert("VICTORY_MENU_FILE".to_owned(), home.join("victory-settings.txt").to_string_lossy().into_owned());
+    s.insert("VICTORY_MENU_PLAY".to_owned(), program.to_string_lossy().into_owned());
+    s.insert("VICTORY_MENU_ARGS".to_owned(), restart_args(o, exe));
+}
+
+/// A JSON string holding `text`.
+fn json_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if u32::from(c) < 0x20 => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// What `--print-env` prints: the program, the title, the `run` a start does
+/// and its settings, as one line of JSON.
+fn env_json(program: &Path, exe: &Path, series_s: bool, s: &BTreeMap<String, String>) -> String {
+    let console = if series_s { "series-s" } else { "series-x" };
+    let exe = exe.to_string_lossy();
+    let args = ["run", exe.as_ref(), "--console", console, "--execute"].map(json_string).join(",");
+    let settings: Vec<String> = s.iter().map(|(k, v)| format!("{}:{}", json_string(k), json_string(v))).collect();
+    format!(
+        "{{\"victory\":{},\"exe\":{},\"console\":{},\"args\":[{args}],\"settings\":{{{}}}}}",
+        json_string(&program.to_string_lossy()),
+        json_string(&exe),
+        json_string(console),
+        settings.join(",")
+    )
+}
+
+/// `victory play --print-env`: the settings [`prepare`] would put in place, without asking,
+/// fetching, writing or starting anything (NVIDIA's, AMD's and the mod's files are used where
+/// they are already).
+pub(crate) fn print_env(o: &Play) -> Result<()> {
+    let program = std::env::current_exe().context("this program's own path")?;
+    let here = program.parent().map(Path::to_path_buf).unwrap_or_default();
+    let exe = find_exe(o, &here)?;
+    let home = home()?;
+    let menu = parse_menu(&std::fs::read_to_string(home.join("victory-settings.txt")).unwrap_or_default());
+    let (mut s, series_s) = settings(o, &menu, streamline_dir(&here).as_deref());
+    if s.contains_key("VICTORY_FSR_FRAMEGEN")
+        && let Some(dir) = fidelityfx_dir(&here)
+    {
+        s.insert("VICTORY_FIDELITYFX_DIR".to_owned(), dir.to_string_lossy().into_owned());
+    }
+    if s.get("VICTORY_MFG_UNLOCKER").is_some_and(|v| v == "1")
+        && let Some(dll) = mfg_home().ok().map(|d| d.join(MFG_DLL)).filter(|d| d.is_file())
+    {
+        s.insert("VICTORY_MFG_UNLOCKER_DLL".to_owned(), dll.to_string_lossy().into_owned());
+    }
+    finish_settings(o, &mut s, &home, &program, &exe, false);
+    println!("{}", env_json(&program, &exe, series_s, &s));
+    Ok(())
+}
+
+/// The title's executable: the one named, else beside this program, else in the current folder.
+fn find_exe(o: &Play, here: &Path) -> Result<PathBuf> {
+    let exe = match &o.exe {
+        Some(exe) => exe.clone(),
+        None => [here.join(GAME), PathBuf::from(GAME)].into_iter().find(|p| p.is_file()).with_context(|| {
+            format!(
+                "no {GAME} beside this program ({}): put the program into your own dump's folder, \
+                 or name the title's executable (`victory play <path to {GAME}>`)",
+                here.display()
+            )
+        })?,
+    };
+    anyhow::ensure!(exe.is_file(), "no {}", exe.display());
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    // (Windows' own long form `\\?\C:\...` back to the plain one.)
+    let exe = PathBuf::from(exe.to_string_lossy().trim_start_matches(r"\\?\").to_owned());
+
+    Ok(exe)
 }
 
 /// A PowerShell word holding `text` as it is.
@@ -951,7 +1029,28 @@ mod tests {
             fps: 1000,
             more: Vec::new(),
             preload: false,
+            print_env: false,
         }
+    }
+
+    #[test]
+    fn printed_settings_are_json_and_end_as_a_start_does() {
+        assert_eq!(json_string("a\"b\\c\n"), r#""a\"b\\c\u000a""#);
+        let o = options();
+        let (mut s, series_s) = settings(&o, &[], Some(Path::new(r"C:\nv")));
+        let home = Path::new(r"C:\no such home");
+        let (program, exe) = (Path::new(r"C:\v\victory.exe"), Path::new(r"D:\G's\game_scarlett_master.exe"));
+        // A program whose bytes have no mark in that home: the warm-up restart is asked, as at a
+        // first start.
+        let this = std::env::current_exe().unwrap();
+        finish_settings(&o, &mut s, home, &this, exe, false);
+        assert_eq!(s.get("VICTORY_WARMUP_RESTART").map(String::as_str), Some("10"));
+        assert!(s.get("VICTORY_WARMUP_MARK").is_some_and(|m| m.starts_with(r"C:\no such home\warmed\")));
+        assert_eq!(s.get("VICTORY_MENU_ARGS"), Some(&restart_args(&o, exe)));
+        assert_eq!(s.get("VICTORY_MENU_FILE").map(String::as_str), Some(r"C:\no such home\victory-settings.txt"));
+        let line = env_json(program, exe, series_s, &s);
+        assert!(line.starts_with(r#"{"victory":"C:\\v\\victory.exe","exe":"D:\\G's\\game_scarlett_master.exe","console":"series-x","args":["run","D:\\G's\\game_scarlett_master.exe","--console","series-x","--execute"],"settings":{"#));
+        assert!(line.contains(r#""VICTORY_DLSS_MODE":"quality""#) && line.ends_with("}}") && !line.contains('\n'));
     }
 
     #[test]

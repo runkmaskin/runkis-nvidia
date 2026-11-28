@@ -412,6 +412,9 @@ fn main() -> Result<()> {
     // before anything else is set up.
     #[cfg(windows)]
     if let Command::Play(options) = &cli.command {
+        if options.print_env {
+            return play::print_env(options);
+        }
         // (Read before `prepare` clears the `VICTORY_...` variables: the menu's restart sets it.)
         let preload = options.preload || std::env::var_os("VICTORY_PRELOAD").is_some_and(|v| v == "1");
         let done = play::prepare(options).and_then(|ready| {

@@ -425,11 +425,33 @@ fn title_priority(asked: i32) -> i32 {
     }
 }
 
-/// [`title_priority`].
+/// `VICTORY_TITLE_PRIORITY_CAP=<n>` (-2..=2, off by default): the title's "above normal" and
+/// "highest" threads run at `n` at most. The title starts its two job pools (8 and 5 workers, a
+/// read-only table of the 1.0.2.1 executable) at "highest": on the console they own seven cores,
+/// here they take processors first from the layer's own threads and from the rest of the desktop.
+/// Time-critical threads keep their priority. Ported from the runkis-nvidia fork (cae3ec2,
+/// GPL-3.0-or-later).
+fn priority_cap(text: Option<&str>) -> Option<i32> {
+    let n: i32 = text?.trim().parse().ok()?;
+    (-2..=2).contains(&n).then_some(n)
+}
+
+/// `priority` under the cap `cap` (see [`priority_cap`]).
+fn capped(priority: i32, cap: Option<i32>) -> i32 {
+    const HIGHEST: i32 = 2;
+    match cap {
+        Some(cap) if priority > cap && priority <= HIGHEST => cap,
+        _ => priority,
+    }
+}
+
+/// [`title_priority`], under [`priority_cap`].
 pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
     static AS_SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static CAP: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
     let as_set = *AS_SET.get_or_init(|| std::env::var_os("VICTORY_TITLE_PRIORITIES").is_some_and(|v| v == "0"));
-    let priority = if as_set { priority } else { title_priority(priority) };
+    let cap = *CAP.get_or_init(|| priority_cap(std::env::var("VICTORY_TITLE_PRIORITY_CAP").ok().as_deref()));
+    let priority = if as_set { priority } else { capped(title_priority(priority), cap) };
     // SAFETY: the title passes a thread handle.
     unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
 }
@@ -683,6 +705,21 @@ mod host {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_cap_lowers_only_raised_threads() {
+        assert_eq!(priority_cap(None), None);
+        assert_eq!(priority_cap(Some("0")), Some(0));
+        assert_eq!(priority_cap(Some(" 1 ")), Some(1));
+        assert_eq!(priority_cap(Some("3")), None);
+        assert_eq!(priority_cap(Some("high")), None);
+        let given: Vec<i32> = [-1, 0, 1, 2, 15].into_iter().map(|p| capped(p, Some(0))).collect();
+        assert_eq!(given, [-1, 0, 0, 0, 15]);
+        let given: Vec<i32> = [-1, 0, 1, 2, 15].into_iter().map(|p| capped(p, Some(1))).collect();
+        assert_eq!(given, [-1, 0, 1, 1, 15]);
+        // Off: as before.
+        let given: Vec<i32> = [-1, 0, 1, 2, 15].into_iter().map(|p| capped(p, None)).collect();
+        assert_eq!(given, [-1, 0, 1, 2, 15]);
+    }
     /// The title's idle and lowest threads run below normal; the others as
     /// it sets them.
     #[test]

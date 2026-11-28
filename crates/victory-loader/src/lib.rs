@@ -35,6 +35,8 @@ mod stacks;
 #[cfg(windows)]
 mod threads;
 #[cfg(windows)]
+pub mod title_pool;
+#[cfg(windows)]
 mod thunks;
 #[cfg(windows)]
 mod tls;
