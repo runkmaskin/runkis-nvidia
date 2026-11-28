@@ -3668,6 +3668,31 @@ mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// Title memory reserved without write watching (the runtime's
+    /// `VICTORY_UNWATCHED_CPU_MEMORY=1` leaves memory the GPU cannot reach
+    /// so) that a copy covers all the same: the kernel refuses the asking
+    /// and, private memory being no view, the guards do too. No answer is
+    /// none that says "not written": the copy's refresh takes it whole
+    /// (`Shadow::update_free`), a busy range counts as stale. Dearer, never
+    /// staler; and the memory is left as it was, unguarded.
+    #[test]
+    fn unwatched_private_memory_has_no_answer() {
+        // SAFETY: a fresh allocation without write watching, freed at the end.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 4 * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let end = p + 4 * BLOCK;
+        for guarded in [false, true] {
+            assert!(writes(p, end, guarded).is_none(), "guarded {guarded}");
+        }
+        assert_eq!(protection(p + BLOCK), PAGE_READWRITE);
+        // SAFETY: committed pages of ours, still writable.
+        unsafe { ((p + BLOCK + 8) as *mut u8).write_volatile(1) };
+        assert!(writes(p, end, true).is_none());
+        title_memory_freed(p, 0);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
     /// The runtime maps a view and then tells us; a copy's refresh on another
     /// thread can guard it in between. Told, it is the title's to write: a
     /// block left read-only and forgotten would be an access violation in

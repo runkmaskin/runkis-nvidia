@@ -2437,15 +2437,55 @@ pub fn title_memory_write_combined(at: usize, len: usize) {
 /// The title let go of `[at, at + len)` (`len` 0: of the allocation at `at`):
 /// write-combined regions in it are forgotten.
 pub(crate) fn write_combined_freed(at: usize, len: usize) {
-    let (at, end) = (at as u64, at.saturating_add(len) as u64);
     let mut all = WRITE_COMBINED.write().unwrap_or_else(|e| e.into_inner());
-    all.retain(|&(from, to)| {
-        if len == 0 {
-            from != at
-        } else {
-            to <= at || from >= end
+    forget_write_combined(&mut all, at, len, wc_free_split());
+}
+
+/// Whether a decommit or release of part of a write-combined region forgets
+/// that part alone and keeps the rest (`VICTORY_WC_FREE_SPLIT=1`; off by
+/// default: the whole region is forgotten, as before).
+///
+/// The game asks for its write-combined heaps in one call each (1.2 and
+/// 1.8 GB, logs play-1128-0227). A `VirtualFree` with `MEM_DECOMMIT` of a
+/// few pages inside one makes all of it ordinary memory to us: no copy of
+/// it is write-combined any more, and `VICTORY_WC_NO_BACK` / `VICTORY_WC_BAR`
+/// stop working for the heap. (Whether the game decommits there is what the
+/// runtime's line "the title frees memory" says.) What is left of the
+/// region is still memory the title asked for
+/// write-combined, and pages committed there again come with their own
+/// protection ([`title_memory_write_combined`] if it is write-combined).
+fn wc_free_split() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_WC_FREE_SPLIT").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// [`write_combined_freed`] on the regions `all`: `len` 0 forgets the
+/// region that starts at `at` (the release of an allocation); else what
+/// overlaps `[at, at + len)`, whole, or with `split` only that part.
+fn forget_write_combined(all: &mut Vec<(u64, u64)>, at: usize, len: usize, split: bool) {
+    let (at, end) = (at as u64, at.saturating_add(len) as u64);
+    if len == 0 {
+        all.retain(|&(from, _)| from != at);
+        return;
+    }
+    if !split {
+        all.retain(|&(from, to)| to <= at || from >= end);
+        return;
+    }
+    let mut kept = Vec::with_capacity(all.len() + 1);
+    for &(from, to) in all.iter() {
+        if to <= at || from >= end {
+            kept.push((from, to));
+            continue;
         }
-    });
+        if from < at {
+            kept.push((from, at));
+        }
+        if end < to {
+            kept.push((end, to));
+        }
+    }
+    *all = kept;
 }
 
 /// Whether all of `[start, start + len)` lies in write-combined title memory
@@ -6160,6 +6200,37 @@ mod write_combined_tests {
             !is_write_combined(other as u64, 0x1000),
             "the allocation released"
         );
+    }
+
+    /// `VICTORY_WC_FREE_SPLIT`: off, a part let go forgets the whole region
+    /// (as before); on, only that part, and the release of the allocation
+    /// forgets all that starts at it, as before.
+    #[test]
+    fn a_part_let_go_splits_the_region() {
+        use super::forget_write_combined;
+        let region = vec![(0x1000_0000u64, 0x2000_0000u64)];
+        for split in [false, true] {
+            // Outside it, or the release of another allocation: nothing.
+            let mut all = region.clone();
+            forget_write_combined(&mut all, 0x3000_0000, 0x1000, split);
+            forget_write_combined(&mut all, 0x1000_1000, 0, split);
+            assert_eq!(all, region);
+            // The release of the allocation: gone.
+            forget_write_combined(&mut all, 0x1000_0000, 0, split);
+            assert!(all.is_empty());
+        }
+        let mut all = region.clone();
+        forget_write_combined(&mut all, 0x1800_0000, 0x1_0000, false);
+        assert!(all.is_empty(), "off: the whole region");
+        let mut all = region.clone();
+        forget_write_combined(&mut all, 0x1800_0000, 0x1_0000, true);
+        assert_eq!(all, [(0x1000_0000, 0x1800_0000), (0x1801_0000, 0x2000_0000)]);
+        // Its edges, and a part over both ends.
+        forget_write_combined(&mut all, 0x1000_0000, 0x1000, true);
+        forget_write_combined(&mut all, 0x1fff_f000, 0x10_0000, true);
+        assert_eq!(all, [(0x1000_1000, 0x1800_0000), (0x1801_0000, 0x1fff_f000)]);
+        forget_write_combined(&mut all, 0x0, 0x3000_0000, true);
+        assert!(all.is_empty());
     }
 }
 
