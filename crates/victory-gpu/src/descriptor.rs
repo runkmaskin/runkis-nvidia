@@ -12,6 +12,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+mod rounds;
 
 thread_local! {
     /// Set while this thread runs the pass over textures picked by index
@@ -283,25 +285,45 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                     SYNC_ROUNDS.1.notify_all();
                 }
             }
+            /// No round of this thread's under way, however it ends
+            /// ([`rounds::RUNNING`]; set under the rounds' lock).
+            struct Idle;
+            impl Drop for Idle {
+                fn drop(&mut self) {
+                    let r = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+                    rounds::RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
+                    drop(r);
+                    // A submission that found it under way may run the next.
+                    if rounds::on() {
+                        SYNC_ROUNDS.1.notify_all();
+                    }
+                }
+            }
+            // With `VICTORY_HEAP_ROUNDS_EARLY=1` a submission may be running
+            // a round itself: this thread begins none until it is done.
+            // Off, nobody else sets it and the loop is the old one.
+            let free = |r: &(u64, u64)| rounds::claim(r, &rounds::RUNNING);
             // Between the rounds asked for, while submissions come.
             let mut last = std::time::Instant::now();
             loop {
                 let mut r = rounds();
-                let mut asked = r.0 != r.1;
+                let mut asked = r.0 != r.1 && free(&r);
                 while !asked {
                     let Some(every) = sync_early().filter(|_| last.elapsed().as_millis() < 500) else {
                         r = SYNC_ROUNDS.1.wait(r).unwrap_or_else(|e| e.into_inner());
-                        asked = r.0 != r.1;
+                        asked = r.0 != r.1 && free(&r);
                         continue;
                     };
                     let (back, over) = SYNC_ROUNDS.1.wait_timeout(r, every).unwrap_or_else(|e| e.into_inner());
                     r = back;
-                    asked = r.0 != r.1;
-                    if over.timed_out() {
+                    asked = r.0 != r.1 && free(&r);
+                    if over.timed_out() && !asked && !rounds::RUNNING.load(std::sync::atomic::Ordering::Relaxed) {
+                        rounds::RUNNING.store(true, std::sync::atomic::Ordering::Relaxed);
                         break;
                     }
                 }
                 drop(r);
+                let _idle = Idle;
                 priority.keep();
                 let _over = asked.then(|| {
                     last = std::time::Instant::now();
@@ -406,6 +428,19 @@ impl Drop for SyncedHeaps {
             return;
         };
         let began = std::time::Instant::now();
+        if rounds::on() {
+            // Not begun yet: run here rather than wait for the thread to wake.
+            let had = rounds::wait_or_run(&SYNC_ROUNDS.0, &SYNC_ROUNDS.1, &rounds::RUNNING, mine, true, |_| {
+                let _round = crate::timeline::span("the heaps' records, for a submission, on its thread");
+                sync_heaps();
+            });
+            ROUNDS_HERE[0].fetch_add(had.ran, std::sync::atomic::Ordering::Relaxed);
+            ROUNDS_HERE[1].fetch_add(had.ran_us, std::sync::atomic::Ordering::Relaxed);
+            ROUNDS_HERE[2].fetch_add(began.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            ROUNDS_HERE[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SYNCED[6].fetch_add(began.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
         while rounds.1 < mine {
             rounds = SYNC_ROUNDS.1.wait(rounds).unwrap_or_else(|e| e.into_inner());
@@ -733,6 +768,12 @@ fn sync_jobs() -> (usize, usize) {
 #[cfg(windows)]
 pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
+/// Since the last frame line, with [`rounds::on`]: rounds run by the
+/// submission that waited, their microseconds, microseconds waited in all
+/// (those included), waits.
+#[cfg(windows)]
+static ROUNDS_HERE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// The same, of [`SYNCED`]'s pages: those in view memory that was guarded;
 /// bytes read; nanoseconds asking what was written, reading it and comparing
 /// it with what was last seen, making views.
@@ -750,6 +791,18 @@ pub(crate) fn sync_line(frames: f64) {
             twins as f64 / frames,
             moved as f64 / frames,
             lost as f64 / frames
+        );
+    }
+    let here = [0, 1, 2, 3].map(|i| ROUNDS_HERE[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
+    if rounds::on() {
+        tracing::info!(
+            "the heaps' records' rounds run by the submission that waited (VICTORY_HEAP_ROUNDS_EARLY=1) per frame: {:.1} of {:.1} \
+             waits, {:.2} ms of rounds; the submitting thread waited {:.2} ms in all (off: the same figure is the \"waited\" of the \
+             heaps' line)",
+            here[0] / frames,
+            here[3] / frames,
+            here[1] / 1e3 / frames,
+            here[2] / 1e3 / frames,
         );
     }
     let [pages, looked, mirrored, micros, tabled, later, waited] = [0, 1, 2, 3, 4, 5, 6].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
