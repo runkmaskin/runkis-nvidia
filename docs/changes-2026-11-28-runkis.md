@@ -106,3 +106,57 @@ read 200-400 while no draw was dropped for it.
 - **Never made by design:** device methods 0x1c8 and 0x218 (not implemented, `device.rs`), at least 16,384 and
   2,048 calls a run. The title goes without those pipelines and draws nothing with them.
 - **Translator warnings in the logs:** only the two "does not translate" lines above.
+## Review of the port (2026-11-28, later)
+
+- **`VICTORY_FENCE_SLEEP`, read from the title's code.** The patched call is in a generic fence wait
+  (+0x4fb0ad0: fence object, target, a callback pair, a flag), used by many threads, not only at the end of a
+  frame (8,192 waits in the first 40 s of a run). On the path patched, `r13` is set to `0x80000000000000`
+  (bit 55) right before the loop, so the stub's compare is the title's; it now takes `r13` itself anyway. After
+  `Sleep(0)` the loop calls +0x10a0c0 with a local object: a GPU-hang watchdog (only when a title flag is on)
+  that, after ten turns without progress and about 10 s on the clock, calls the title's device-lost handler. Its
+  clock is wall time, so blocking does not change when it fires. The stub returns to the title's own compare,
+  so the loop leaves at the same value as before; what changes is when the waiting thread wakes and how many
+  turns it makes. `VICTORY_FENCE_SLEEP_MOST_MS` sets the bound, and the log says how many waits gave up at it.
+- **The mouse stick** (`VICTORY_MOUSE`): it was dropped with `VICTORY_ONE_PAD=0`, read one 8 ms poll at a time
+  (slow moves read as 0 at most of the title's frames), grabbed the cursor into the console window, and read a
+  jump on coming back to the window. All fixed (commit "Review fixes of the port commits").
+- **`VICTORY_TITLE_PRIORITY_CAP`** below 0 also lowered normal threads; only raised ones are capped now.
+- **The launcher's profiles.** "Stad (768p, 2K)" and "Min PC (768p, 2K)" (schema 1) become `--series-s --dlss
+  quality` (a 720-line scene of the 1080p output), `VICTORY_FULLSCREEN=1` (they were borderless), no frame rate
+  cap, frame generation ready but off, and `VICTORY_MOUSE=1`; Stad keeps its own data folder. "2K" was the old
+  base's present scale to the monitor; on this base the 1080p output fills the screen through Windows. With
+  `VICTORY_MOUSE=1` the native mouse (`VICTORY_MOUSE_CAPTURE`) is not fed, by design; F1 lets the cursor go and
+  the stick reads nothing while the menu is open. Upstream's own path gives the title no mouse unless
+  `VICTORY_MOUSE_CAPTURE=1`, which is why the mouse did not steer there.
+- **The view heap cap.** An RTX 4070 SUPER says `MaxViewDescriptorHeapSize` 1,000,000 and makes no larger
+  shader-visible heap: the cap is the card's and cannot be raised there. The title's heap has 1,245,184 slots, of
+  which the host keeps 737,855 beside its 2^18 dynamic slots. In the city the title rewrites all of the rest
+  (up to slot 1,245,182, about 3 million slots a second): its own ring of per-draw tables, which the layer
+  makes in its dynamic slots; no run warned of a draw asking for one of those slots directly, so nothing shows
+  that views are lost there. The heap sync counts those slots (info line). `VICTORY_DYNAMIC_SLOTS` now also
+  applies on such a card (2^17: 868,927 title slots); in its one city run (V2) the card's time a frame was
+  66-71 ms against 36-40 ms without it, the copies 66-74 MB against about 45: keep it off.
+
+### Game runs of the review (city save copy, Series X 1440p DLSS Quality, scratch `VICTORY_HOME`)
+
+Captures of the game window (PrintWindow) at the seconds named; every run reached the world (DLSS running) at
+47-68 s.
+
+| Run | Build | Switch | 90 s | 120 s | 150 s | 180 s | 195 s |
+|---|---|---|---|---|---|---|---|
+| A | `b98bf65` | none | | the room | the room | the room | |
+| B | `b98bf65` | `VICTORY_FENCE_SLEEP=1` | | **white** | **white** | (run closed at 04:33) | |
+| A2 | this branch | none | the room | the room | the room | the room | the room |
+| B2 | this branch | `VICTORY_FENCE_SLEEP=1` | the room | the room | the room | the room | the room |
+| C2 | this branch | `VICTORY_FENCE_SLEEP=1`, `_MOST_MS=1` | the room | the room | the room | the room | the room |
+| V2 | this branch | `VICTORY_DYNAMIC_SLOTS=131072` | **white** | (run closed at 105 s) | | | |
+
+The white picture came in runs with different switches (B, V2) and, by the coordinator's report, in another
+agent's run with neither (`VICTORY_CARD_PARTS=1`); B2 and C2, with the fence switch, were not white at any
+capture. It is not the fence switch's: the switch keeps the title's exit condition, and the same switch ran
+clean twice. What makes a picture white for a while in the world is still open. B's log: 15 fps and 8 ms of
+the card a frame while white, against 10 fps and 44 ms in A: the card did less work a frame while it was
+white.
+- **Tests and lints.** The two `indirect::tests` failures on upstream were tests written for
+  `VICTORY_INDIRECT_REST` on, which upstream turned off by default; both now test the default.
+  `cargo clippy --workspace --all-targets -- -D warnings` is clean, with and without `--all-features`.
