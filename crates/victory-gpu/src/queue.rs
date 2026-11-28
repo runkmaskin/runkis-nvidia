@@ -1090,6 +1090,7 @@ extern "system" fn present(
 fn frame_ends() {
     crate::timeline::presented();
     crate::faultbook::frame();
+    crate::census::frame();
     crate::ab::presented(|switch, was, will| {
         if switch == "VICTORY_ASYNC_SUBMIT" && was && !will {
             behind::leave();
