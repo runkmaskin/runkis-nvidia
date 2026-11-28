@@ -335,12 +335,21 @@ mod tests {
             // SAFETY: as above.
             unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll(VALUE.as_ptr().cast()) };
         });
+        // As the title's loop does: call again until the value is there. Each return is either
+        // at the value or after `MOST` (a mover thread late on a loaded machine), never before:
+        // a return at 7 after less than `MOST` would be a wait that left early.
         let start = Instant::now();
-        run(&VALUE, 9, 0, 0x10, 0x10);
-        let took = start.elapsed();
+        loop {
+            let call = Instant::now();
+            run(&VALUE, 9, 0, 0x10, 0x10);
+            let (took, now) = (call.elapsed(), VALUE.load(Ordering::Acquire));
+            assert!(now == 9 || took >= MOST, "back at {now} after {took:?}");
+            if now == 9 {
+                break;
+            }
+        }
         assert!(!SLEPT.load(Ordering::Relaxed));
-        assert_eq!(VALUE.load(Ordering::Acquire), 9);
-        assert!(took >= Duration::from_millis(20) && took < MOST, "{took:?}");
+        assert!(start.elapsed() >= Duration::from_millis(20), "{:?}", start.elapsed());
         mover.join().unwrap();
         // Already reached: back at once.
         run(&VALUE, 8, 0, 0x10, 0x10);

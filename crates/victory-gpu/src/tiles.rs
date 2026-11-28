@@ -1125,7 +1125,7 @@ void look() {
     }
 
     /// The levels from `first` on, a bit a level.
-    fn from_level(first: u32) -> u32 {
+    fn with_levels_from(first: u32) -> u32 {
         (u32::MAX << first) & ((1 << u32::from(LEVELS)) - 1)
     }
 
@@ -1149,7 +1149,7 @@ void look() {
         let upload = rig.filled(&layout, |level| level as u8 + 1);
         for first in [3u32, 1, 0] {
             // Ahead of the list on the queue, as at a submission.
-            rig.give(&tiled, &texture, from_level(first));
+            rig.give(&tiled, &texture, with_levels_from(first));
             let read = rig.round_trip(&texture, &layout, Some(&upload));
             for (level, bytes) in read.iter().enumerate() {
                 let want = if tiled.has_tiles(level as u32) { level as u8 + 1 } else { 0 };
@@ -1277,7 +1277,7 @@ void look() {
         let (texture, tiled) = rig.reserved(&desc);
         // Every level but the largest; each level's bytes are sixteen
         // times its number plus one.
-        rig.give(&tiled, &texture, from_level(1));
+        rig.give(&tiled, &texture, with_levels_from(1));
         assert_eq!(tiled.first_shown(), Some(1));
         let upload = rig.filled(&layout, |level| (level as u8 + 1) * 16);
         rig.round_trip(&texture, &layout, Some(&upload));
@@ -1381,14 +1381,14 @@ void look() {
         };
         // No room: nothing is given, the held levels are said to wait,
         // nothing is shown, every level reads zeros.
-        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), false);
+        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, with_levels_from(3), false);
         rig.check("an upload without room");
         assert!(!changed && waiting, "without room: changed {changed}, waiting {waiting}");
         assert_eq!(tiled.given_bytes(), 0, "without room no tile is given");
         assert_eq!(tiled.first_shown(), None);
         read_as_given(rig, "without room");
         // Asked again with room: the same levels get theirs.
-        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), true);
+        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, with_levels_from(3), true);
         rig.check("the upload again, with room");
         assert!(changed && !waiting, "with room: changed {changed}, waiting {waiting}");
         assert!(tiled.has_tiles(3) && !tiled.has_tiles(2));
@@ -1397,7 +1397,7 @@ void look() {
         // More levels held and no room again: the ones that have tiles
         // are brought up to date, the new ones wait, the view stays.
         let before = tiled.given_bytes();
-        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), false);
+        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, with_levels_from(1), false);
         rig.check("more levels held, without room");
         assert!(!changed && waiting, "more levels without room: changed {changed}, waiting {waiting}");
         assert_eq!(tiled.given_bytes(), before);
@@ -1412,7 +1412,7 @@ void look() {
         assert_eq!(tiled.first_shown(), Some(0));
         assert_eq!(tiled.claim(1 << 0), 0, "a level with tiles is not claimed again");
         // With room everything held gets its tiles.
-        let (_, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), true);
+        let (_, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, with_levels_from(1), true);
         rig.check("the last upload, with room");
         assert!(!waiting && tiled.whole());
         read_as_given(rig, "everything given");

@@ -192,6 +192,8 @@ struct Cli {
     command: Command,
 }
 
+// (Play's options are most of it; one command is parsed per start.)
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
@@ -566,6 +568,20 @@ fn show_config() -> Result<()> {
     Ok(())
 }
 
+/// Paths given on the command line, or the configured game + test titles.
+pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    if !paths.is_empty() {
+        return Ok(paths);
+    }
+    let cfg = victory_core::Config::load()?;
+    let all: Vec<PathBuf> = cfg.game_dir.into_iter().chain(cfg.test_titles).collect();
+    anyhow::ensure!(
+        !all.is_empty(),
+        "no paths given and none configured (see victory.example.toml)"
+    );
+    Ok(all)
+}
+
 #[cfg(test)]
 mod tests {
     /// A D3D12Core.dll's VS_FIXEDFILEINFO: signature, structure version, then
@@ -601,18 +617,4 @@ mod tests {
         assert_eq!(super::exported_sdk_version(&[0u8; 64]), None);
         assert_eq!(super::exported_sdk_version(b"MZ"), None);
     }
-}
-
-/// Paths given on the command line, or the configured game + test titles.
-pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
-    if !paths.is_empty() {
-        return Ok(paths);
-    }
-    let cfg = victory_core::Config::load()?;
-    let all: Vec<PathBuf> = cfg.game_dir.into_iter().chain(cfg.test_titles).collect();
-    anyhow::ensure!(
-        !all.is_empty(),
-        "no paths given and none configured (see victory.example.toml)"
-    );
-    Ok(all)
 }
