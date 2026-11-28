@@ -917,6 +917,17 @@ extern "system" fn present(
         if frame >= 256 {
             let (hits, misses) = crate::shader_cache::counts();
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
+            // `VICTORY_EARLY_DEPTH`: what became of the console's early depth
+            // test in the pixel programs translated so far.
+            let [given, off, exports] = victory_shader::emit::early_depth_counts();
+            if given + off + exports > 0 {
+                tracing::info!(
+                    given,
+                    off,
+                    exports,
+                    "pixel programs translated so far whose console code tests depth before them: given the host's early test (VICTORY_EARLY_DEPTH=1), left with the late test (switch off), left with it as they write depth or stencil"
+                );
+            }
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -1191,6 +1202,7 @@ extern "system" fn copy_page_mappings(
         return E_INVALIDARG;
     }
     let _called = crate::timeline::span("the title's CopyPageMappings");
+    let began = std::time::Instant::now();
     let batches = (count > 0).then(|| {
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
@@ -1214,6 +1226,9 @@ extern "system" fn copy_page_mappings(
         let mut at = b.destination;
         for r in ranges {
             let len = u64::from(r.count) * PAGE;
+            if let Some(pages) = MAPPED_PAGES.get(r.kind as usize) {
+                pages.fetch_add(u64::from(r.count), std::sync::atomic::Ordering::Relaxed);
+            }
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
             ok &= match r.kind {
@@ -1233,8 +1248,30 @@ extern "system" fn copy_page_mappings(
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
     }
+    use std::sync::atomic::Ordering::Relaxed;
+    MAPPING_MICROS.fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+    let calls = MAPPING_CALLS.fetch_add(1, Relaxed) + 1;
+    if calls.is_power_of_two() || calls.is_multiple_of(4096) {
+        let [runs, constant, unmapped, kept] = MAPPED_PAGES.each_ref().map(|c| c.load(Relaxed));
+        tracing::info!(
+            calls,
+            ms = MAPPING_MICROS.load(Relaxed) / 1000,
+            pages_of_runs = runs,
+            pages_of_one_page = constant,
+            pages_unmapped = unmapped,
+            pages_kept = kept,
+            "the title's page-mapping copies (CopyPageMappingsBatchX) since the start, by kind of range"
+        );
+    }
     S_OK
 }
+
+/// Since the start: the title's page-mapping calls, the time in them, and
+/// the 64 KiB pages they named by kind of range (pool pages in a run, one
+/// pool page repeated, unmapped, left as they were).
+static MAPPING_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MAPPING_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MAPPED_PAGES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 extern "system" fn desc(this: This, out: *mut QueueDesc) {
     if !out.is_null() {

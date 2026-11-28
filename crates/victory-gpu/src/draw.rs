@@ -115,6 +115,53 @@ fn bake_exact() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_EXACT").is_none_or(|v| v != "0"))
 }
 
+/// Whether the indirect-light stand-in skips a depth place that names a
+/// depth-stencil texture's stencil plane and takes another depth view of the
+/// program's tables of the image's size (`VICTORY_AMBIENT_STENCIL_SKIP=1`;
+/// off by default: the place is read as the depth whatever it is).
+///
+/// Why: after the `_ReflectiveCaustics` form of the probes' resolve the place
+/// the stand-in reads the depth from (`crate::ambient::DEPTH`) names the scene
+/// depth's stencil plane. Read as a depth it puts every point far away with
+/// its normal to the camera, and the estimate of the light around is wrong
+/// for that frame's points. Ported from trustno1-coder/VIctory-NVIDIA
+/// d226814d91 (GPL-3.0-or-later), which found it in a capture.
+fn ambient_stencil_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_STENCIL_SKIP").is_some_and(|v| v == "1"))
+}
+
+/// Whether a view is of a depth-stencil texture's stencil plane: formats
+/// X32_TYPELESS_G8X24_UINT (22) and X24_TYPELESS_G8_UINT (47), or a 2D view
+/// (dimension 4) of plane 1.
+fn stencil_view(view: Option<View>) -> bool {
+    match view {
+        Some(View::Shader(_, Some(d))) => {
+            matches!(crate::resource::pc_format(d[0]), 22 | 47) || (d[1] == 4 && d[5] == 1)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a host texture can be a depth for the stand-in: 2D, a 32-bit or
+/// 24-bit depth format or its family.
+fn depth_like(d: &D3D12_RESOURCE_DESC) -> bool {
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+        DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+    };
+    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && matches!(
+            d.Format,
+            DXGI_FORMAT_R32_TYPELESS
+                | DXGI_FORMAT_D32_FLOAT
+                | DXGI_FORMAT_R32G8X24_TYPELESS
+                | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                | DXGI_FORMAT_R24G8_TYPELESS
+                | DXGI_FORMAT_D24_UNORM_S8_UINT
+        )
+}
+
 /// Whether a texture found changed with nothing to tell of it is looked at
 /// again in the next frame (`VICTORY_RECHECK_SOON=0`: after four, as
 /// before).
@@ -3161,9 +3208,30 @@ impl State {
             once!(?role, "no stand-in for the indirect light: missing image UAV");
             return false;
         };
+        // A depth-stencil texture's view of its stencil plane is no depth
+        // (`ambient_stencil_skip`): another depth view of the tables of the
+        // image's size is taken instead.
+        let stencil_at = |(slot, offset): (u8, u32)| {
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return false;
+            };
+            stencil_view(crate::descriptor::view(table + u64::from(offset) * 4))
+        };
+        let depth_entry = |at: (u8, u32)| {
+            if !ambient_stencil_skip() || !stencil_at(at) {
+                return entry(ResourceType::Srv, at);
+            }
+            once!(?role, ?at, "stand-in: the depth place names a stencil plane; another depth view of the tables is taken");
+            t.used
+                .iter()
+                .filter(|u| u.kind == ResourceType::Srv && u.root == RootType::Table)
+                .filter(|u| !stencil_at((u.slot, u.table_offset_dwords)))
+                .filter_map(|u| entry(ResourceType::Srv, (u.slot, u.table_offset_dwords)))
+                .find(|(d, _)| depth_like(d) && (d.Width, d.Height) == (of.Width, of.Height))
+        };
         let depth = match role {
             Role::Resolve => {
-                let Some((seen, depth)) = entry(ResourceType::Srv, DEPTH) else {
+                let Some((seen, depth)) = depth_entry(DEPTH) else {
                     once!(?role, "no stand-in for the indirect light: missing depth SRV");
                     return false;
                 };
@@ -5246,6 +5314,25 @@ mod tests {
         assert_eq!(staging_budget_per_frame(Some(20 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
+    }
+
+    /// The stand-in's depth place is skipped when it names a stencil plane:
+    /// the scene depth's stencil view as the title writes it (format 22,
+    /// plane 1, as logged in a run), a 24-bit one (47), any 2D view of plane
+    /// 1; not its depth view (20) nor a colour texture.
+    #[test]
+    fn a_stencil_plane_view_is_no_depth_for_the_stand_in() {
+        use super::{View, stencil_view};
+        let view = |format: u32, dimension: u32, plane: u32| {
+            Some(View::Shader(0, Some([format, dimension, 5768, 0, 0, plane, 1, 0, 0, 0])))
+        };
+        assert!(stencil_view(view(22, 4, 1)));
+        assert!(stencil_view(view(47, 4, 1)));
+        assert!(stencil_view(view(61, 4, 1)));
+        assert!(!stencil_view(view(20, 4, 0)));
+        assert!(!stencil_view(view(41, 4, 0)));
+        assert!(!stencil_view(view(42, 2, 0)));
+        assert!(!stencil_view(None));
     }
 }
 

@@ -1912,8 +1912,15 @@ fn record_twin_copy(
     // plane since shaders last wrote the twin. In the title
     // nothing writes that plane but the twin's pass (its 192 draws against
     // it only test, run 29), so the twin lacks nothing. Counted.
-    if colour && twin.plane.is_some() {
-        crate::resource::PLANES[1].fetch_add(1, Ordering::Relaxed);
+    // (With `plane_back` a float plane is given to its twin by the caller.)
+    if colour
+        && let Some(plane) = &twin.plane
+    {
+        // SAFETY: live textures.
+        let given = plane_back() && plane_copyable(&unsafe { depth.GetDesc() }, &unsafe { plane.texture.GetDesc() });
+        if !given {
+            crate::resource::PLANES[1].fetch_add(1, Ordering::Relaxed);
+        }
     }
     let Some(through) = &twin.through else {
         // SAFETY: an open list and two live textures.
@@ -1980,6 +1987,150 @@ fn record_twin_copy(
         }
         list.ResourceBarrier(&[transition(through, source, common)]);
     }
+}
+
+/// Whether a depth texture's 32-bit float depth plane is given to its twin
+/// when the depth texture is copied into its twins (`VICTORY_PLANE_BACK=1`;
+/// off by default: only the stencil plane is, and the plane's twin keeps
+/// what shaders last wrote into it).
+///
+/// Why: the twin of the depth plane is drawn back into the plane whenever
+/// shaders wrote the twins (`HostList::pass_plane`), all of it. If draws
+/// wrote the plane since shaders last wrote its twin, that pass puts back
+/// the older depth over what they drew: the frame line's "times not given
+/// back to a twin" counts the copies that left it so, about one a frame in
+/// the world, next to about one pass a frame. A float plane can be copied
+/// whole, through a buffer, as the stencil plane is: the host lays out a
+/// depth plane of R32G8X24 for copies as R32, the format of the twin. (A
+/// 24-bit plane has no such format; its twin holds 16-bit steps.)
+pub(crate) fn plane_back() -> bool {
+    #[cfg(test)]
+    if PLANE_BACK_TEST.load(Ordering::Relaxed) > 0 {
+        return true;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLANE_BACK").is_some_and(|v| v == "1"))
+}
+
+/// Tests running with [`plane_back`] on, at this moment.
+#[cfg(test)]
+static PLANE_BACK_TEST: AtomicU32 = AtomicU32::new(0);
+
+/// [`plane_back`] on while it lives (tests).
+#[cfg(test)]
+pub(crate) struct PlaneBackForTest;
+
+#[cfg(test)]
+impl PlaneBackForTest {
+    pub(crate) fn on() -> PlaneBackForTest {
+        PLANE_BACK_TEST.fetch_add(1, Ordering::Relaxed);
+        PlaneBackForTest
+    }
+}
+
+#[cfg(test)]
+impl Drop for PlaneBackForTest {
+    fn drop(&mut self) {
+        PLANE_BACK_TEST.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether [`record_plane_back`] can copy the depth plane of `depth` into
+/// `plane`: R32G8X24 typeless (19) and an R32 typeless (39) twin.
+fn plane_copyable(depth: &D3D12_RESOURCE_DESC, plane: &D3D12_RESOURCE_DESC) -> bool {
+    depth.Format.0 == 19 && plane.Format.0 == 39 && depth.SampleDesc.Count == 1
+}
+
+/// Records into `list` the copy of the depth plane of `depth` (in the copy
+/// source state) into `plane`, its twin (in the copy destination state),
+/// through `through`, a buffer as big as the plane's subresources laid out
+/// for copies, which rests in the common state. Each mip and slice whole.
+fn record_plane_back(
+    list: &ID3D12GraphicsCommandList,
+    depth: &ID3D12Resource,
+    plane: &ID3D12Resource,
+    through: &ID3D12Resource,
+) {
+    let Some(host) = host() else { return };
+    // SAFETY: a live texture.
+    let of = unsafe { depth.GetDesc() };
+    let planes = u32::from(of.MipLevels) * u32::from(of.DepthOrArraySize);
+    let mut rows = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); planes as usize];
+    // SAFETY: a plain query writing `planes` footprints (the depth plane's
+    // subresources come first).
+    unsafe {
+        host.device.GetCopyableFootprints(&of, 0, planes, 0, Some(rows.as_mut_ptr()), None, None, None);
+    }
+    let subresource = |texture: &ID3D12Resource, index: u32| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: index,
+        },
+    };
+    let placed = |row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: as above.
+        pResource: unsafe { std::mem::transmute_copy(through) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: *row,
+        },
+    };
+    let (common, source, dest) = (
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    );
+    // SAFETY: an open list and live resources; the buffer holds these
+    // footprints.
+    unsafe {
+        list.ResourceBarrier(&[transition(through, common, dest)]);
+        for (i, row) in rows.iter().enumerate() {
+            list.CopyTextureRegion(&placed(row), 0, 0, 0, &subresource(depth, i as u32), None);
+        }
+        list.ResourceBarrier(&[transition(through, dest, source)]);
+        for (i, row) in rows.iter().enumerate() {
+            list.CopyTextureRegion(&subresource(plane, i as u32), 0, 0, 0, &placed(row), None);
+        }
+        list.ResourceBarrier(&[transition(through, source, common)]);
+    }
+    crate::resource::PLANES[3].fetch_add(1, Ordering::Relaxed);
+}
+
+/// With [`plane_back`]: the twin of the depth plane of `depth` and the buffer
+/// to copy the plane into it through, if the plane can be copied.
+fn plane_back_of<'a>(
+    depth: &crate::resource::HostTexture,
+    twin: &'a crate::resource::Twin,
+) -> Option<(&'a std::sync::Arc<crate::resource::HostTexture>, &'a ID3D12Resource)> {
+    if !plane_back() {
+        return None;
+    }
+    let plane = twin.plane.as_ref()?;
+    // SAFETY: live textures.
+    let (of, twin_desc) = unsafe { (depth.texture.GetDesc(), plane.texture.GetDesc()) };
+    if !plane_copyable(&of, &twin_desc) {
+        return None;
+    }
+    Some((plane, plane_through(&depth.texture, twin)?))
+}
+
+/// The buffer [`record_plane_back`] copies the depth plane of `depth`
+/// through: the twin's own, made the first time.
+fn plane_through<'a>(depth: &ID3D12Resource, twin: &'a crate::resource::Twin) -> Option<&'a ID3D12Resource> {
+    twin.plane_through
+        .get_or_init(|| {
+            let host = host()?;
+            // SAFETY: a live texture.
+            let of = unsafe { depth.GetDesc() };
+            let planes = u32::from(of.MipLevels) * u32::from(of.DepthOrArraySize);
+            let mut bytes = 0;
+            // SAFETY: a plain query; the out pointer is ours.
+            unsafe { host.device.GetCopyableFootprints(&of, 0, planes, 0, None, None, None, Some(&mut bytes)) };
+            host.uav_buffer(bytes)
+        })
+        .as_ref()
 }
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
@@ -8723,6 +8874,12 @@ impl HostList {
         self.settle(to, COPY_DEST);
         record_twin_copy(&self.list, &depth.texture, twin, colour);
         self.settle(&twin.colour, UNORDERED_ACCESS);
+        // The depth plane's twin is given the plane too (`plane_back`).
+        if colour && let Some((plane, through)) = plane_back_of(depth, twin) {
+            self.settle(plane, COPY_DEST);
+            record_plane_back(&self.list, &depth.texture, &plane.texture, through);
+            self.settle(plane, UNORDERED_ACCESS);
+        }
     }
 
     /// Before the list closes: the depth textures whose twins it wrote last
@@ -8837,7 +8994,10 @@ impl HostList {
             } else {
                 (&twin.colour, depth)
             };
-            for (texture, state) in [(from, COPY_SOURCE), (to, COPY_DEST)] {
+            // The depth plane's twin too, when it is given the plane
+            // (`plane_back`).
+            let plane = if *colour { plane_back_of(depth, twin) } else { None };
+            for (texture, state) in [(from, COPY_SOURCE), (to, COPY_DEST)].into_iter().chain(plane.map(|(p, _)| (p, COPY_DEST))) {
                 let key = std::sync::Arc::as_ptr(texture) as usize;
                 let real = texture.state.load(Ordering::Relaxed);
                 copying.insert(key, state);
@@ -8883,6 +9043,9 @@ impl HostList {
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
+                    if *colour && let Some((plane, through)) = plane_back_of(depth, twin) {
+                        record_plane_back(list, &depth.texture, &plane.texture, through);
+                    }
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -11393,6 +11556,12 @@ impl Meter {
                 tracing::info!(
                     "texture reads through the kernel that met a change of mapping, read again at the next refresh, per frame \
                      (VICTORY_TEXTURE_RECHECK=1): {rechecked:.1}"
+                );
+            }
+            let given = crate::resource::PLANES[3].load(Ordering::Relaxed);
+            if given > 0 {
+                tracing::info!(
+                    "depth planes copied into their twins, since the start (VICTORY_PLANE_BACK=1): {given}"
                 );
             }
             let bake = crate::texture::BAKE_WAITED.swap(0, Ordering::Relaxed);

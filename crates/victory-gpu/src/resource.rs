@@ -368,6 +368,9 @@ pub(crate) struct Twin {
     /// the bits of a 24-bit depth plane, so the two are not copied: a pass
     /// draws the twin into the plane.
     pub(crate) plane: Option<std::sync::Arc<HostTexture>>,
+    /// The buffer a 32-bit float depth plane is copied through into its
+    /// twin (`crate::host::plane_back`), made the first time it is needed.
+    pub(crate) plane_through: std::sync::OnceLock<Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>>,
 }
 
 #[cfg(windows)]
@@ -388,10 +391,11 @@ pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] =
 /// frame-rate line; and since the start, how often a depth plane's twin
 /// lacked what was written to the plane (not given to it), and how often a
 /// depth plane was used in the list that had written its twin, before the
-/// pass (which runs when the list closes).
+/// pass (which runs when the list closes); and since the start, the depth
+/// planes copied into their twins (`VICTORY_PLANE_BACK=1`).
 #[cfg(windows)]
-pub(crate) static PLANES: [std::sync::atomic::AtomicU64; 3] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+pub(crate) static PLANES: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// The colour twin of title texture `this`, if it has one.
 #[cfg(windows)]
@@ -585,6 +589,7 @@ fn twin_texture(
         behind: std::sync::atomic::AtomicU32::new(0),
         through,
         plane,
+        plane_through: std::sync::OnceLock::new(),
     }))
 }
 
@@ -4350,6 +4355,128 @@ mod tests {
     /// title's lighting computes for a class (the number times the float
     /// nearest 1/65535) then cover the texels of that class and no other.
     #[cfg(windows)]
+    /// `VICTORY_PLANE_BACK`: a float depth plane that draws wrote is given
+    /// to its twin when the depth texture is copied into its twins; without
+    /// it the twin keeps what it held (zeros here), and the pass that draws
+    /// the twin back into the plane would put those over the draws' depth.
+    #[test]
+    fn a_float_depth_plane_is_given_to_its_twin() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let _on = crate::host::PlaneBackForTest::on();
+        let null = std::ptr::null();
+        const DEPTH_WRITE: u32 = 0x10;
+        // D32 float with S8: R32G8X24 typeless on the host.
+        let desc = ResourceDesc {
+            flags: 6,
+            ..texture(4, 4, 20, 1)
+        };
+        let mut depth = null;
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, DEPTH_WRITE, null.cast(), &RESOURCE_IIDS[0], &mut depth),
+            S_OK
+        );
+        let host_depth = host_resource(depth).unwrap();
+        let Some(plane) = twin_plane_resource(depth) else {
+            return; // these twins are turned off
+        };
+        // SAFETY: live resources.
+        let (d, t) = unsafe { (host_depth.GetDesc(), plane.GetDesc()) };
+        assert_eq!((d.Format.0, t.Format.0), (19, 39));
+        // A draw's depth: the plane cleared to 0.25.
+        let clear = host.new_list().unwrap();
+        let view = host.dsv(
+            host_depth,
+            Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
+                Format: DXGI_FORMAT(20),
+                ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            }),
+        );
+        // SAFETY: an open list; the texture is in the depth-write state.
+        unsafe { clear.list.ClearDepthStencilView(view, D3D12_CLEAR_FLAG_DEPTH, 0.25, 0, None) };
+        clear.close();
+        host.execute(&[&clear]);
+        // A draw writes the depth, then a shader writes the twins.
+        let list = host.new_list().unwrap();
+        assert!(list.twin_use(depth, false, true));
+        assert!(list.twin_use(depth, true, true));
+        list.close();
+        host.execute(&[&list]);
+        // What the plane's twin holds.
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let buffer = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 1024,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a buffer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback)
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        let read = host.new_list().unwrap();
+        let (written, source) = (D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        // SAFETY: an open list and live resources; the twin rests in the
+        // unordered access state.
+        unsafe {
+            let l = &read.list;
+            l.ResourceBarrier(&[crate::host::transition(plane, written, source)]);
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&readback),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT(39),
+                            Width: 4,
+                            Height: 4,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(plane),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            l.ResourceBarrier(&[crate::host::transition(plane, source, written)]);
+        }
+        read.close();
+        host.execute(&[&read]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copy finished; the buffer is 1024 bytes.
+        let bytes = unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u8>(), 1024)
+        };
+        for y in 0..4 {
+            for x in 0..4 {
+                let at = y * 256 + x * 4;
+                let value = f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+                assert_eq!(value, 0.25, "texel {x},{y}");
+            }
+        }
+    }
+
     #[test]
     fn a_depth_planes_twin_is_drawn_into_the_plane() {
         use std::sync::atomic::Ordering::Relaxed;
