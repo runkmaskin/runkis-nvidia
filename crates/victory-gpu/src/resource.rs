@@ -2356,6 +2356,7 @@ pub(crate) fn audit() {
     // kept, oldest stable age in frames, stable bytes.
     let mut c = [0u64; 12];
     let mut said = 0;
+    let mut said_low = 0;
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let seen = seen.get_or_insert_with(Default::default);
     static LOW: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
@@ -2389,6 +2390,26 @@ pub(crate) fn audit() {
             let since = *low.entry(at).or_insert(frame);
             c[10] += 1;
             c[11] = c[11].max(frame.saturating_sub(since));
+            if frame.saturating_sub(since) >= 60 && said_low < 8 {
+                said_low += 1;
+                let wants = texture_layout(&r.desc).map_or(0, |t| t.planes[0].layout.bytes_from(viewed));
+                tracing::info!(
+                    texture = format_args!("{at:#x}"),
+                    memory = format_args!("{:#x}", r.data() as usize),
+                    width = r.desc.width,
+                    height = r.desc.height,
+                    levels = r.desc.mip_levels,
+                    base = host.base,
+                    viewed,
+                    wanted = r.host.wanted.load(Relaxed),
+                    grown = host.grown.load(Relaxed),
+                    bytes_wanted = wants,
+                    mapped_wanted = crate::texture::mapped_bytes(r.data().cast_const(), wants as usize),
+                    staged = crate::texture::is_staged(at as This),
+                    frames = frame.saturating_sub(since),
+                    "texture audit: a host copy starts at a larger level than a view of it shows now"
+                );
+            }
         } else {
             low.remove(&at);
         }

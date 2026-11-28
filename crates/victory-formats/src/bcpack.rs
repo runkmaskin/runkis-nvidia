@@ -744,10 +744,42 @@ fn pbits(mode: u16) -> bool {
     matches!(mode, 0 | 1 | 3 | 6 | 7)
 }
 
+/// Whether a block's rotation bits count in BC7 modes 4 and 5 only
+/// (`VICTORY_BC7_ROTATION=1`; off by default: in every mode, as before).
+///
+/// Why: only modes 4 and 5 of BC7 have a rotation field. A BCPack block of
+/// another mode whose control word has bits 4:3 set had alpha's precision
+/// swapped with a colour channel's and lost its p-bit, so its endpoints were
+/// written with the wrong widths: the block decodes as noise of colour. From
+/// fxceless/victory-fork 06702fe8 (after upstream VIctory pull request 3111),
+/// carried in trustno1-coder/VIctory-NVIDIA 40219ce, GPL-3.0.
+fn rotation_fix() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BC7_ROTATION").is_some_and(|v| v == "1"))
+}
+
+/// A block's channel rotation (0: none), from its control word.
+fn rotation(ctrl: u16) -> usize {
+    rotation_in(ctrl, rotation_fix())
+}
+
+/// [`rotation`], with the fix (`only_4_and_5`) or without it.
+fn rotation_in(ctrl: u16, only_4_and_5: bool) -> usize {
+    if only_4_and_5 && !matches!(ctrl & 7, 4 | 5) {
+        return 0;
+    }
+    usize::from(ctrl >> 3 & 3)
+}
+
 /// Channel precisions: the p-bit is red's lowest bit; rotation swaps alpha
 /// with the rotated channel.
 fn bc7_precision(ctrl: u16) -> [u8; 4] {
-    let (mode, rot) = (ctrl & 7, usize::from(ctrl >> 3 & 3));
+    precision_with(ctrl, rotation(ctrl))
+}
+
+/// [`bc7_precision`] of a block of control word `ctrl` rotated by `rot`.
+fn precision_with(ctrl: u16, rot: usize) -> [u8; 4] {
+    let mode = ctrl & 7;
     let mut p = BC7_BITS[usize::from(mode)];
     if rot != 0 {
         p.swap(3, rot - 1);
@@ -852,7 +884,7 @@ fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
     let mode = ctrl & 7;
     let subsets = usize::from((ctrl & 0xff) >> 6);
     let part = usize::from(ctrl >> 8 & 63);
-    let rot = usize::from(ctrl >> 3 & 3);
+    let rot = rotation(ctrl);
     let mut w = Bits::default();
     w.put(1 << mode, u32::from(mode) + 1);
     match mode {
@@ -1339,6 +1371,37 @@ mod tests {
         w.put(1, 1);
         w.put(1, 1);
         assert_eq!(dst, w.v.to_le_bytes());
+    }
+
+    /// Only BC7 modes 4 and 5 have a rotation field: with the fix, the
+    /// rotation bits of a block of any other mode change nothing (before, they
+    /// swapped alpha's precision with a colour channel's and dropped the
+    /// p-bit); modes 4 and 5 rotate as before.
+    #[test]
+    fn bc7_rotation_applies_only_to_modes_4_and_5() {
+        for (mode, subsets) in [(0u16, 3u16), (1, 2), (2, 3), (3, 2), (6, 1), (7, 2)] {
+            let base = (subsets << 6) | mode;
+            for rot in 1..=3u16 {
+                let ctrl = base | (rot << 3);
+                assert_eq!(rotation_in(ctrl, true), 0, "mode {mode} rot {rot}");
+                assert_eq!(precision_with(ctrl, rotation_in(ctrl, true)), precision_with(base, 0), "mode {mode} rot {rot}");
+                assert_ne!(
+                    precision_with(ctrl, rotation_in(ctrl, false)),
+                    precision_with(base, 0),
+                    "before the fix: mode {mode} rot {rot} took other widths"
+                );
+            }
+        }
+        for (mode, bits) in [(4u16, [5u8, 5, 5, 6]), (5u16, [7u8, 7, 7, 8])] {
+            for rot in 1..=3usize {
+                let ctrl = (1 << 6) | ((rot as u16) << 3) | mode;
+                assert_eq!(rotation_in(ctrl, true), rot);
+                assert_eq!(rotation_in(ctrl, false), rot);
+                let mut want = bits;
+                want.swap(3, rot - 1);
+                assert_eq!(precision_with(ctrl, rot), want, "mode {mode} rot {rot}");
+            }
+        }
     }
 
     #[test]
