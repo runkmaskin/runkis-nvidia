@@ -59,9 +59,25 @@ const MOST: Duration = Duration::from_millis(50);
 /// One `WaitOnAddress` at most this long (ms): the layer wakes it sooner.
 const SLICE_MS: u32 = 4;
 
-/// Waits and the microseconds spent in them, for the log.
+/// Waits and the microseconds spent in them, those that gave up at the bound with the value not
+/// there, and the longest one (microseconds), for the log.
 static WAITS: AtomicU64 = AtomicU64::new(0);
 static WAITED_US: AtomicU64 = AtomicU64::new(0);
+static GAVE_UP: AtomicU64 = AtomicU64::new(0);
+static LONGEST_US: AtomicU64 = AtomicU64::new(0);
+
+/// [`MOST`], or `VICTORY_FENCE_SLEEP_MOST_MS` (0 to 1000): to tell a long block from the yield
+/// `Sleep(0)` was, in a game A/B.
+fn most() -> Duration {
+    static MS: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_FENCE_SLEEP_MOST_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms <= 1000)
+            .map_or(MOST, Duration::from_millis)
+    })
+}
 
 /// The title's condition: the fence's value has reached `target` (`sub rdx, rsi; test rdx, r13`:
 /// the difference has none of `mask`'s bits, bit 55 for the title's 56-bit values), or it is all
@@ -90,10 +106,12 @@ extern "system" fn wait(value: *const u64, target: u64, mask: u64) {
     // SAFETY: the title's fence address, an aligned u64 (checked above) that the layer stores
     // atomically.
     let at = unsafe { AtomicU64::from_ptr(value.cast_mut()) };
-    let start = Instant::now();
+    let (start, most) = (Instant::now(), most());
+    let mut there;
     loop {
         let now = at.load(Ordering::Acquire);
-        if reached(now, target, mask) || start.elapsed() >= MOST {
+        there = reached(now, target, mask);
+        if there || start.elapsed() >= most {
             break;
         }
         #[cfg(windows)]
@@ -105,8 +123,10 @@ extern "system" fn wait(value: *const u64, target: u64, mask: u64) {
     let us = start.elapsed().as_micros() as u64;
     let n = WAITS.fetch_add(1, Ordering::Relaxed) + 1;
     let total = WAITED_US.fetch_add(us, Ordering::Relaxed) + us;
+    let gave_up = GAVE_UP.fetch_add(u64::from(!there), Ordering::Relaxed) + u64::from(!there);
+    let longest = LONGEST_US.fetch_max(us, Ordering::Relaxed).max(us);
     if n.is_power_of_two() && n >= 64 {
-        tracing::info!(waits = n, ms = total / 1000, "{FENCE_SLEEP_ENV}: the title's frame fence waits slept");
+        tracing::info!(waits = n, ms = total / 1000, gave_up, longest_ms = longest / 1000, "{FENCE_SLEEP_ENV}: the title's frame fence waits slept");
     }
 }
 
