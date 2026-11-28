@@ -424,6 +424,56 @@ impl Ranges {
     }
 }
 
+/// Ranges the kernel is writing or has just been about to write: not made
+/// read-only meanwhile (the kernel's write would fail instead of faulting).
+///
+/// A write the runtime tells of (`crate::watch::writing`: our copies into
+/// title memory, DirectStorage, the title's fills) is done by the caller
+/// right after it tells: its range is kept for 50 to 100 ms. A file read
+/// (`crate::watch::kernel_writing`) is kept until the read is over. They
+/// were kept for the whole sample, and in run census-111834 every page
+/// landed into the 20 MB committed buffer was held open so (5136 a frame).
+#[derive(Default)]
+struct Kernel {
+    now: Ranges,
+    before: Ranges,
+    since: Option<std::time::Instant>,
+    /// File reads under way: start, end.
+    open: Vec<(usize, usize)>,
+}
+
+impl Kernel {
+    /// The newest ranges become the older ones every 50 ms.
+    fn age(&mut self) {
+        let now = std::time::Instant::now();
+        let since = *self.since.get_or_insert(now);
+        let gone = now.duration_since(since);
+        if gone >= std::time::Duration::from_millis(100) {
+            // (Nothing was told for two periods: all of it is old.)
+            self.before = Ranges::default();
+            self.now = Ranges::default();
+            self.since = Some(now);
+        } else if gone >= std::time::Duration::from_millis(50) {
+            self.before = std::mem::take(&mut self.now);
+            self.since = Some(now);
+        }
+    }
+
+    fn meets(&mut self, from: usize, to: usize) -> bool {
+        self.age();
+        self.now.meets(from, to) || self.before.meets(from, to) || self.open.iter().any(|&(a, e)| a < to && from < e)
+    }
+
+    fn add(&mut self, from: usize, to: usize) {
+        self.age();
+        self.now.add(from, to);
+    }
+
+    fn full(&self) -> bool {
+        self.now.full() || self.open.len() >= MOST_KERNEL_RANGES
+    }
+}
+
 /// Everything of a sample.
 #[derive(Default)]
 struct State {
@@ -453,7 +503,10 @@ struct State {
     /// Why the sample ended.
     ended: &'static str,
     /// Ranges the kernel wrote: not made read-only again.
-    kernel: Ranges,
+    kernel: Kernel,
+    /// Who told of kernel writes into committed buffers: (file, line) of
+    /// the caller, how many, bytes.
+    kernel_callers: HashMap<(&'static str, u32), (u64, u64)>,
     /// Host copies refreshed: by start and length, and by start alone.
     ids: HashMap<(usize, usize), usize>,
     by_start: BTreeMap<usize, Vec<usize>>,
@@ -916,7 +969,24 @@ pub(crate) fn landed_by(by: usize, start: usize, len: usize, from: usize, to: us
         let plain: u64 = runs.iter().map(|&(a, e, _)| ((e - a) / PAGE) as u64).sum();
         s.totals.land[LAND_ELIGIBLE] += plain;
         s.totals.land[LAND_NOT_PLAIN] += ((to - from) / PAGE) as u64 - plain;
-        for (a, e, p) in runs.into_iter().rev() {
+        // Block by block: one kernel write must not hold a whole run (one
+        // allocation, the whole buffer) open.
+        let chunks: Vec<(usize, usize, u32)> = runs
+            .into_iter()
+            .rev()
+            .flat_map(|(a, e, p)| {
+                let mut at = a;
+                std::iter::from_fn(move || {
+                    (at < e).then(|| {
+                        let end = ((at / BLOCK + 1) * BLOCK).min(e);
+                        let chunk = (at, end, p);
+                        at = end;
+                        chunk
+                    })
+                })
+            })
+            .collect();
+        for (a, e, p) in chunks {
             if s.kernel.meets(a, e) {
                 s.totals.land[LAND_KERNEL] += ((e - a) / PAGE) as u64;
                 continue;
@@ -958,9 +1028,32 @@ pub(crate) fn landed_by(by: usize, start: usize, len: usize, from: usize, to: us
     s.totals.arm_us += us;
 }
 
-/// The kernel will write `[at, at + len)` (a file read, a copy of ours
-/// through it): opened, and left so for the rest of the sample.
-pub(crate) fn disarm(at: usize, len: usize) {
+/// The kernel will write `[at, at + len)` (a copy of ours through it, the
+/// runtime's DirectStorage, told by `from`): opened, and not made read-only
+/// for a while ([`Kernel`]).
+pub(crate) fn disarm(at: usize, len: usize, from: &'static std::panic::Location<'static>) {
+    disarm_as(at, len, from, false);
+}
+
+/// A file read into `[at, at + len)` begins (`crate::watch::kernel_writing`):
+/// opened, and not made read-only until [`kernel_read_done`].
+pub(crate) fn kernel_read(at: usize, len: usize, from: &'static std::panic::Location<'static>) {
+    disarm_as(at, len, from, true);
+}
+
+/// The file reads into `[from, to)` are over.
+pub(crate) fn kernel_read_done(from: usize, to: usize) {
+    if bits().is_none() {
+        return;
+    }
+    if let Some(s) = state().as_mut() {
+        if let Some(i) = s.kernel.open.iter().position(|&(a, e)| from <= a && e <= to) {
+            s.kernel.open.swap_remove(i);
+        }
+    }
+}
+
+fn disarm_as(at: usize, len: usize, from: &'static std::panic::Location<'static>, read: bool) {
     if bits().is_none() || len == 0 {
         return;
     }
@@ -975,7 +1068,24 @@ pub(crate) fn disarm(at: usize, len: usize) {
     let end = at.saturating_add(len);
     s.generation += 1;
     s.totals.kernel_ranges += 1;
-    s.kernel.add(at, end);
+    if read {
+        if s.kernel.open.len() < MOST_KERNEL_RANGES {
+            s.kernel.open.push((at, end));
+        }
+    } else {
+        s.kernel.add(at, end);
+    }
+    // Who tells of kernel writes into committed buffers (diagnostics of the
+    // diagnostics: run census-111834 had them hold every landed page).
+    let committed = BUFFERS.lock().unwrap_or_else(|e| e.into_inner()).range(..end).next_back().is_some_and(|(_, &(e, _))| e > at);
+    if committed {
+        let key = (from.file(), from.line());
+        if s.kernel_callers.contains_key(&key) || s.kernel_callers.len() < 64 {
+            let entry = s.kernel_callers.entry(key).or_default();
+            entry.0 += 1;
+            entry.1 += len as u64;
+        }
+    }
     open_pages(s, at / PAGE, end.div_ceil(PAGE).min(PAGES));
 }
 
@@ -1506,6 +1616,20 @@ fn report(s: &State, ms: f64, name: &dyn Fn(usize) -> String) -> String {
         per(t.land[LAND_UPGRADED])
     );
     {
+        let mut callers: Vec<_> = s.kernel_callers.iter().collect();
+        callers.sort_unstable_by_key(|(_, n)| std::cmp::Reverse(n.1));
+        let _ = writeln!(
+            out,
+            "  kernel writes told into committed buffers, per frame, by who told: {}",
+            callers
+                .iter()
+                .take(8)
+                .map(|((file, line), n)| format!("{file}:{line} {:.1}x {:.2} MB", per(n.0), per(n.1) / 1e6))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    {
         let buffers = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
         let mut big: Vec<(usize, usize, bool)> = buffers.iter().map(|(&a, &(e, own))| (a, e - a, own)).collect();
         big.sort_unstable_by_key(|b| std::cmp::Reverse(b.1));
@@ -1826,6 +1950,41 @@ mod tests {
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// A kernel write told of keeps its range open for a while, not for the
+    /// rest of the sample (run census-111834: every page landed into the
+    /// committed buffer was held open so); a file read keeps it until it is
+    /// over. Who told is counted for committed buffers.
+    #[test]
+    fn kernel_writes_keep_their_range_open_for_a_while() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let size = 4 * BLOCK;
+        let at = memory(size).unwrap();
+        assert!(begin(Limits { stores: 1, arm_us: u64::MAX / 4, stall_ms: 60_000 }, 0));
+        AS_TITLE.set(true);
+        committed(at, size, true, true);
+        disarm(at, BLOCK, std::panic::Location::caller());
+        kernel_read(at + 2 * BLOCK, BLOCK, std::panic::Location::caller());
+        landed_by(path::RELAY_CARD, at, size, at, at + size, size);
+        assert_eq!(protection_at(at + PAGE), PAGE_READWRITE, "just told of");
+        assert_eq!(protection_at(at + 2 * BLOCK + PAGE), PAGE_READWRITE, "being read into");
+        assert_eq!(protection_at(at + BLOCK + PAGE), PAGE_NOACCESS);
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        landed_by(path::RELAY_CARD, at, size, at, at + size, size);
+        assert_eq!(protection_at(at + PAGE), PAGE_NOACCESS, "the write is long done");
+        assert_eq!(protection_at(at + 2 * BLOCK + PAGE), PAGE_READWRITE, "the read is not");
+        kernel_read_done(at + 2 * BLOCK, at + 3 * BLOCK);
+        landed_by(path::RELAY_CARD, at, size, at, at + size, size);
+        assert_eq!(protection_at(at + 2 * BLOCK + PAGE), PAGE_NOACCESS, "the read is over");
+        AS_TITLE.set(false);
+        let (s, ms) = end().unwrap();
+        assert_eq!(s.kernel_callers.values().map(|n| n.0).sum::<u64>(), 2);
+        let text = report(&s, ms, &|a| format!("{a:#x}"));
+        assert!(text.contains("census.rs:"), "{text}");
+        committed(at, size, true, false);
+        // SAFETY: the test's own memory.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
     /// With no time for it in the frame, nothing is made read-only.
     #[test]
     fn arming_keeps_to_its_time() {
@@ -1926,7 +2085,7 @@ mod tests {
             assert_eq!(state().as_ref().unwrap().totals.queries, asked);
             p.add(2 * PAGE / 8 + 1).write_volatile(8);
             // A kernel write: its pages open and stay so.
-            disarm(at + 8 * PAGE, 2 * PAGE);
+            disarm(at + 8 * PAGE, 2 * PAGE, std::panic::Location::caller());
             assert_eq!(protection_at(at + 8 * PAGE), PAGE_READWRITE);
             refreshed(at, size, at, at + size, 0, Kind::Watched);
             assert!(!armed(at / PAGE + 8) && !armed(at / PAGE + 9));
