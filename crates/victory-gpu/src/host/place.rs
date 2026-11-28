@@ -59,6 +59,10 @@ pub(super) struct Placed {
     pub(super) shadow: std::sync::Arc<Shadow>,
     /// Upload memory the list copies from, to be given the source's bytes.
     from: Option<usize>,
+    /// The destination is title memory in the card's memory (`crate::wcvram`):
+    /// the list's copy is the only one, and title memory is not written or read
+    /// on the CPU at submission.
+    card: bool,
 }
 
 impl Placed {
@@ -82,6 +86,15 @@ impl Placed {
         if !free && self.from.is_none() {
             return None;
         }
+        if self.card {
+            if let Some(to) = self.from {
+                // (What is not there reads as zeros, as any copy's source.)
+                copy_mapped(to as *mut u8, self.src as *const u8, self.len, false);
+            }
+            return None;
+        }
+        // Out of the card's memory: counted with the copies that read it.
+        crate::wcvram::copied(self.dst, self.src, self.len);
         let mut bytes = vec![0u8; self.len];
         // (What is not there reads as zeros, as any copy's source.)
         copy_mapped(bytes.as_mut_ptr(), self.src as *const u8, self.len, false);
@@ -201,6 +214,13 @@ impl HostList {
         let Some(host) = host() else {
             return false;
         };
+        // Into write-combined title memory in the card's memory: on the card,
+        // whatever the source (`copy_into_card`).
+        if crate::wcvram::touches(dst, len)
+            && let Some(to) = crate::shadow::find(dst as u64, len as u64).filter(|s| s.in_place() && crate::wcvram::declares(dst as u64, len as u64))
+        {
+            return self.copy_into_card(host, to, dst, src, len);
+        }
         let Some(to) = crate::shadow::peek(dst as u64, len as u64).filter(|s| !s.in_place()) else {
             return false;
         };
@@ -254,8 +274,73 @@ impl HostList {
             len,
             shadow: to,
             from: scratch.map(|s| s.2 as usize),
+            card: false,
         }));
         deferred.title_written();
+        self.changed_something();
+        true
+    }
+
+    /// [`HostList::place_copy`] into title memory in the card's memory
+    /// (`crate::wcvram`), whose host copy is that memory: the list copies out
+    /// of the source's buffer there if the source is in the card's memory too,
+    /// else out of upload memory that takes the source's bytes at submission
+    /// (title memory in the PC's memory, read on the CPU as before). Title
+    /// memory at the destination is not written on the CPU, nor read back: a
+    /// read of it there would cross the bus uncached. The bytes are declared
+    /// written, as a shader's write, so that steps of later submissions that
+    /// read them on the CPU wait for the card.
+    ///
+    /// What changes: the destination takes the bytes when the list runs, in
+    /// the list's order, as on the console; a step of ours in the same
+    /// submission that reads the destination on the CPU reads it as it was
+    /// (before, title memory took the copy at submission).
+    fn copy_into_card(&self, host: &Host, to: std::sync::Arc<Shadow>, dst: usize, src: usize, len: usize) -> bool {
+        let from = Some(crate::shadow::find(src as u64, len as u64))
+            .flatten()
+            .filter(|s| s.in_place() && crate::wcvram::declares(src as u64, len as u64));
+        let scratch = match &from {
+            Some(_) => None,
+            None if len <= MOST => match self.scratch_at(len as u64) {
+                Some(scratch) => Some(scratch),
+                None => return false,
+            },
+            None => return false,
+        };
+        let at = to.offset(dst as u64);
+        // SAFETY (all): an open list; live buffers (the list holds the copies
+        // and its scratch memory), ranges inside them.
+        unsafe { wait_for_all(host, &self.list) };
+        match (&from, &scratch) {
+            (Some(from), _) => {
+                let offset = from.offset(src as u64);
+                if from.buffer.as_raw() == to.buffer.as_raw() {
+                    let Some(between) = self.between(host, len as u64) else {
+                        return false;
+                    };
+                    unsafe {
+                        self.list.CopyBufferRegion(&between, 0, &from.buffer, offset, len as u64);
+                        self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        wait_for_all(host, &self.list);
+                        self.list.CopyBufferRegion(&to.buffer, at, &between, 0, len as u64);
+                    }
+                } else {
+                    unsafe { self.list.CopyBufferRegion(&to.buffer, at, &from.buffer, offset, len as u64) };
+                }
+            }
+            (None, Some((from, offset, _))) => unsafe {
+                self.list.CopyBufferRegion(&to.buffer, at, from, *offset, len as u64);
+            },
+            (None, None) => return false,
+        }
+        unsafe { wait_for_all(host, &self.list) };
+        STATS[0].fetch_add(1, Ordering::Relaxed);
+        STATS[1].fetch_add(len as u64, Ordering::Relaxed);
+        crate::wcvram::copied_on_card();
+        to.gpu_writes(self, dst as u64, len as u64);
+        if let Some(scratch) = scratch {
+            self.deferred().copies.push(Step::Placed(Placed { dst, src, len, shadow: to, from: Some(scratch.2 as usize), card: true }));
+        }
         self.changed_something();
         true
     }

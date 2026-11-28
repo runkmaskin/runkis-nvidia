@@ -98,6 +98,9 @@ pub(crate) struct Shadow {
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: std::sync::atomic::AtomicBool,
+    /// Whether its title memory was asked for write-combined
+    /// (`crate::wcvram::is_write_combined`): 0 not known yet, 1 no, 2 yes.
+    wc: AtomicU8,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
@@ -3881,6 +3884,20 @@ impl Shadow {
         self.id
     }
 
+    /// Whether all of the copy's title memory was asked for write-combined
+    /// (`crate::wcvram::is_write_combined`); found once.
+    fn write_combined(&self) -> bool {
+        match self.wc.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let wc = crate::wcvram::is_write_combined(self.start, self.len);
+                self.wc.store(if wc { 2 } else { 1 }, Ordering::Relaxed);
+                wc
+            }
+        }
+    }
+
     /// Whether it is no copy but title memory in place (`crate::inplace`).
     pub(crate) fn in_place(&self) -> bool {
         self.place.is_some()
@@ -3954,6 +3971,7 @@ impl Shadow {
             card: None,
             window: false,
             changes_only: Default::default(),
+            wc: AtomicU8::new(0),
             mapped: false,
             place: None,
         }
@@ -3982,6 +4000,24 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            // In the card's memory instead of the PC's (`crate::wcvram`): the
+            // write is declared all the same, so that our steps that read the
+            // range on the CPU wait for the card as they waited for its
+            // landing; the landing finds nothing to merge.
+            if crate::wcvram::declares(self.start, self.len) {
+                let len = len.min(self.left(address));
+                list.defer_gpu_write(self, address as usize, len as usize);
+            }
+            return;
+        }
+        // Write-combined title memory, which the title's CPU does not read
+        // (`VICTORY_WC_NO_BACK`, `crate::wcvram::no_back`): what shaders write
+        // in its copy on the card stays there.
+        if self.card.is_some()
+            && crate::wcvram::no_back()
+            && crate::wcvram::left_on_card(self.write_combined(), self.len, len.min(self.left(address)))
+        {
+            self.written.store(true, Ordering::Relaxed);
             return;
         }
         self.written.store(true, Ordering::Relaxed);
@@ -6561,6 +6597,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && (size >= card_limits().0 || card_all());
+        // Write-combined title memory in the card's memory (`crate::wcvram`,
+        // `VICTORY_WC_VRAM=1`): the buffer is the title's own memory there.
+        if let Some(placed) = crate::wcvram::place_for(key.0, len, false) {
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            return entry.shadow.clone();
+        }
         // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
         // title's 32-bit graphics heap in place, big or not.
         if let Some(placed) = crate::port::place_for(key.0, len, false) {
@@ -6874,7 +6916,12 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
+    // Write-combined title memory in the card's memory (`crate::wcvram`,
+    // `VICTORY_WC_VRAM=1`): the window is a buffer placed in it.
+    if let Some(placed) = crate::wcvram::place_for(start, len, true)
+        .or_else(|| crate::port::place_for(start, len, true))
+        .or_else(|| crate::inplace::place_for(start, len, true))
+    {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());

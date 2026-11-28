@@ -570,6 +570,10 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         return;
     }
     let _called = crate::timeline::span("the title's ExecuteCommandLists");
+    // Write-combined title memory in the card's memory: what the title's
+    // threads wrote there leaves their write buffers before the card reads it.
+    #[cfg(windows)]
+    crate::wcvram::title_submits();
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::title_thread();
     #[cfg(windows)]

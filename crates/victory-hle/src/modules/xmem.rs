@@ -61,6 +61,9 @@ const PAGES_64K: u32 = PAGES_2M | PAGES_64K_BIT;
 /// adds GPU access bits (0x800-0x40000). Write-combining and uncached are
 /// dropped too: our GPU side reads this memory through the CPU.
 const HOST_PROTECTION: u32 = 0x1ff;
+/// The console's protection bit of write-combined memory: the CPU only
+/// writes it.
+const WRITE_COMBINED: u32 = 0x400;
 /// XMem flags of memory both processors reach: all of ours.
 const GRAPHICS: u64 = 3;
 /// XMem flag bit of 32-bit graphics memory.
@@ -128,6 +131,20 @@ fn virtual_alloc(base: *mut c_void, size: usize, kind: u32, flags: u64, protect:
     if placeholder {
         kind |= MEM_RESERVE | MEM_RESERVE_PLACEHOLDER;
     }
+    // Memory the title's CPU only writes, committed whole where we choose:
+    // card memory the CPU maps, if `VICTORY_WC_VRAM=1` (`victory_gpu::wcvram`).
+    // It is zeroed, as committed memory is, and never write-watched.
+    if asked & WRITE_COMBINED != 0 && base.is_null() && !placeholder && kind & MEM_COMMIT != 0 {
+        let card = victory_gpu::title_memory_write_combined(lowest, highest, align.max(PAGE), size);
+        if let Some(at) = card {
+            note_protection(asked, kind, flags, at, size);
+            return at as *mut c_void;
+        }
+    }
+    // A commit of card memory the title has (committed whole already).
+    if !base.is_null() && kind & (MEM_COMMIT | MEM_RESERVE) == MEM_COMMIT && victory_gpu::title_memory_in_card(base as usize, size) {
+        return base;
+    }
     let mut parameter = MEM_EXTENDED_PARAMETER::default();
     parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
     parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
@@ -184,6 +201,11 @@ fn virtual_alloc(base: *mut c_void, size: usize, kind: u32, flags: u64, protect:
     }
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
+    }
+    // Write-combined: memory the title's CPU writes and does not read
+    // (`VICTORY_WC_NO_BACK`; ported from trustno1-coder/VIctory-NVIDIA 50c15a1).
+    if !at.is_null() && asked & WRITE_COMBINED != 0 {
+        victory_gpu::title_memory_is_write_combined(at as usize, size);
     }
     // (Grand Theft Auto VI asks for its 32-bit heap with kind 0x42000,
     // without the 64 KiB page bits: not `placeholder` above, though the host

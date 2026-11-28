@@ -4023,6 +4023,17 @@ impl State {
                 let used = entry_at(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // Write-combined title memory in the card's memory
+                        // (`crate::wcvram`): a copy into upload memory would
+                        // read it on the CPU, uncached. On 256 bytes a
+                        // constant buffer view shows it where it is.
+                        if crate::wcvram::touches(address as usize, size as usize)
+                            && let Some(shadow) = crate::shadow::find(address, u64::from(size)).filter(|s| s.in_place())
+                            && crate::wcvram::constants_in_place(shadow.gpu(address))
+                        {
+                            host.constant_at(index, &shadow.buffer, shadow.gpu(address), size);
+                            continue;
+                        }
                         // Renderer port 5: title memory in place is the
                         // card's to read where it is; nothing is copied.
                         if crate::port_cbv::in_place_on() {

@@ -26,7 +26,7 @@
 //! -- --ignored --nocapture bench_shared_memory`.
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::ffi::c_void;
 
     use windows::Win32::Foundation::{CloseHandle, HANDLE};

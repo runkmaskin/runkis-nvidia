@@ -127,3 +127,108 @@ A/B on the Benchmark page, same scene, warm cache:
 2. `VICTORY_WINDOWS_BAR_MB=1024` on and off: `copies X ms` (may rise by a quarter), `on the GPU` (should fall),
    `gpu_used` (rises by the windows' bytes).
 3. Either way, compare 1 % lows: in place pins memory and ReBAR takes VRAM from textures.
+
+## Write-combined title memory in the card's memory (`VICTORY_WC_VRAM=1`, off)
+
+The title tells us which memory its CPU only writes: protection bit 0x400, write-combined, in `XMemVirtualAlloc`.
+On Series S its 1,277 MiB graphics pool is such memory (protection 0x2404, kind commit, flags 0x283; at an address
+of our choice in [4 GiB, 2^40)). In the 7800X3D log of 2026-11-27 two shader-written copies in it had 14.6 and 4.9
+MB fetched back a frame and nothing sent up. Copies in the title's second write-combined area (0x42404/0x2404 with
+kind 0x42000) were fetched back too, but that area is a placeholder for physical-page views (port 1's kind of
+memory), not one allocation. It is left alone here.
+
+**What the switch does** (`crates/victory-gpu/src/wcvram.rs`, hooks in `xmem.rs`, `shadow.rs`, `host.rs`,
+`host/place.rs`, `draw.rs`, `queue.rs`):
+- That pool (16 MiB or more, write-combined, committed, no address asked for) becomes one
+  `D3D12_HEAP_TYPE_GPU_UPLOAD` heap, with a buffer over all of it mapped for good. The mapping is the title's
+  allocation: no `VirtualAlloc`, no write watch, zeroed as committed memory is.
+- Title buffers and windows in it are buffers placed in that heap (the `Shadow` in-place form of `VICTORY_INPLACE`).
+  There is no host copy, no refresh, no compare and no landing for them.
+- What shaders write there is declared as for any copy, so that our CPU steps that read it wait for the card as
+  they waited for the landing. The landing then finds nothing to merge.
+- A constant buffer of a table in the pool on 256 bytes is a constant buffer view of the pool itself (no fill).
+- A title buffer copy into the pool is a copy on the card, at its place in the list (`place.rs`,
+  `copy_into_card`). Title memory there is not written or read on the CPU.
+- Each title `ExecuteCommandLists` calls `FlushProcessWriteBuffers` (ordering, below).
+
+**The address.** Direct3D maps the heap where the system finds room. Measured: at 0x1be_b046_0000 to
+0x2df_a0ce_0000, above 2^40, where translated shaders cannot reach (`upload.rs`). The system takes the first free
+stretch big enough, from a place of its own upwards and then from the bottom. So `wcvram::steered` reserves, for
+the moment the heap is made, every free stretch that could hold it plus everything around the target, except the
+place `xmem` would have used. The mapping then lands there every time (tests below; in game at 0x948c00000 in
+1.9 s). Allocations of the pool's size or more by other threads fail during that moment. A 64 KiB write-combined
+allocation of the title's went elsewhere; small ones are left alone now.
+
+**Facts on this PC** (7800X3D, RTX 4070 SUPER, *offline*, `bench_card_memory_the_title_writes`, release):
+
+| | write-back (today) | card memory the CPU maps |
+|---|---|---|
+| CPU memcpy write 64 KiB / 1 MiB / 16 MiB / 64 MiB | 60 / 39 / 22 / 14 GB/s | 20 / 15 / 10 / 14 GB/s |
+| CPU 8-byte stores every 64 bytes over 16 MiB | 0.18 ms | 2.8 ms |
+| CPU memcpy read 4 MiB | 23 GB/s | **0.024 GB/s** |
+| CPU dependent load | 26 ns | **875 ns** |
+| `FlushProcessWriteBuffers` | | 0.3 us (test process); 6.7-7.9 us in game, 17 a frame |
+
+`GPUUploadHeapSupported` is true. The mapping is private memory with protection 0x404 (read-write,
+write-combine). `GetWriteWatch` refuses it. `VirtualProtect` to read-only worked on a 1 GiB heap and was refused
+(error 87) on a 64 MiB one, so the guards of `watch.rs` cannot be relied on there.
+
+**Why `VICTORY_WC_NO_BACK` showed black flashes and a quarter fewer draws** (that switch is not in this tree; the
+reasoning is from the code and the traffic log). The pool's copies are written by shaders and fetched back every
+frame (14.6 + 4.9 MB). Not landing them left title memory without the card's results. The title's CPU reads them
+(its visibility and culling results: fewer draws). So do our own CPU steps and other host copies of the same
+bytes, which then made stale textures and buffers (flashes). Here the card's writes are the title's memory, so
+both get the right bytes with no landing, but every CPU read crosses the bus uncached.
+
+**Order.** A card write is visible to the CPU once the flight has run. The title learns of it from its fences,
+which are set after the flight's landing as before. A CPU write must leave the CPU's write-combining buffers before
+the card reads it. `sfence`, `mfence`, locked instructions, serializing instructions, uncached accesses and
+interrupts empty them (Intel SDM vol. 3 11.3.1, AMD APM vol. 2 7.7). A plain store does not, and that includes a
+release store on x86. A title thread that wrote and then told the submitting thread with a plain store could still
+hold the bytes. `FlushProcessWriteBuffers` at each title submission interrupts every processor that runs a thread
+of ours, which empties their buffers. Threads not running emptied theirs when they were switched out. Our own
+writes are emptied by the runtime's locked operations in `ExecuteCommandLists`.
+`model_the_card_sees_every_store_once_the_buffers_are_flushed` shows the race without the flush, and none with it
+or with a locked telling.
+
+**Measured in game** (768p Series S, speed set of `play-nvidia.ps1`, scripted Enter from 20 to 140 s, seconds
+150-300; one run each):
+
+| Run | fps | 1 % low | preparing ms | copying back ms | fetched MB/frame | peak private |
+|---|---|---|---|---|---|---|
+| off (23:26) | 23.5 | 11.5 | 22.1 | 16.8 | 41.0 | 25.1 GB |
+| off (00:51) | 21.0 | 11.0 | 21.8 | 17.3 | 40.3 | 25.2 GB |
+| `VICTORY_WC_NO_BACK=1`, `_MIN_KB=1024` (00:41) | 25.4 | 13.4 | 18.8 | **5.8** | 5.8 | 25.7 GB |
+| `VICTORY_WC_VRAM=1`, first version (23:06) | **3.1** | 1.8 | 353 | 13.3 | 21.7 | 22.2 GB |
+| `VICTORY_WC_VRAM=1`, constants and copies on the card (00:46) | **5.3** | 3.2 | 144 | 6.4 | 18.0 | 22.6 GB |
+
+In the first version 3,777 title buffers and 68 windows (559 MB) were in the pool. Fetches fell by about half, and
+the picture in the captures was right. But our CPU still read the pool every frame: 989 fills of constant buffers
+(1.9 MB), 28 buffer copies (131 KB) and 65 textures staged (289 KB), at 24 MB/s. That and the uncached hashing of
+textures that are not write-watched made preparing 353 ms. The constant buffers on 256 bytes and the buffer copies
+into the pool have been moved to the card since; see `docs/changes-2026-11-27.md` for the run after that.
+
+The second version left 630 fills of 111 KB and 3 copies of 2 KB a frame on the CPU. Only 325 of about 950
+constant buffers a frame lie on 256 bytes; the rest are still copied. Textures were 64 staged of 280 KB a frame.
+The frame was still 160-196 ms. Its own lines say where the time goes:
+- "texture refreshes per frame: 251 ms, 227 ms asking the write watch and the guards". The write watch refuses
+  the pool, and the guards cannot be relied on there, so every check of a texture in the pool asks again and
+  fails, then hashes the texture through the bus.
+- "copies 85 ms".
+- "41 ms on the GPU" against 8-14 off. Not explained yet: the card should read this memory at its own speed.
+
+**`VICTORY_WC_NO_BACK`** is the measured part. It is ported from trustno1-coder/VIctory-NVIDIA 50c15a1 and
+2f81d0c (GPL-3.0), and it lives in `wcvram.rs` with its check in `Shadow::gpu_writes`. Shader writes into card
+copies of 1 MiB or more in write-combined memory stay on the card. "Copying back" fell from 17 to 5.8 ms a frame
+and fetches from 40 to 5.8 MB, at +2 to +4 fps against the two off runs. Its known risks: the title or another host
+copy reading such bytes reads old ones, and a page the title writes goes up whole over shader results. The 1 MiB
+floor is the fork's answer to its near-black cutscenes. In the captured frames 4000-4007 of this run one
+character's face was rainbow-coloured, the "rainbow skin" of `docs/speed-mode-bugs.md`. The off runs' captures
+show other shots of the same scene, so the switch can be neither blamed nor cleared for it from these frames. The
+other faces and the picture were right, with no flicker between consecutive frames (luma changes under 3.3 of
+255 between frames, against camera cuts of 9.9 in the off run). One run each: repeat before turning it on.
+
+**What is still read on the CPU** (counted on the frame-rate line "write-combined title memory in the card's
+memory"): constant buffers not on 256 bytes, copies out of the pool into memory elsewhere, and textures in the
+pool. `texture.rs` detiles and hashes title memory on the CPU. A texture there would need its bytes fetched by the
+card into the PC's memory first, or a detile on the card. Not done.

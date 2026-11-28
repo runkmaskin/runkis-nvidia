@@ -119,6 +119,9 @@ mod watch_bench;
 mod texback;
 #[cfg(windows)]
 mod zerocopy;
+// Write-combined title memory in the card's memory (VICTORY_WC_VRAM=1, off).
+#[cfg(windows)]
+mod wcvram;
 
 #[cfg(windows)]
 pub use host::on_failure;
@@ -135,6 +138,8 @@ pub fn switched(switch: &str) -> Option<bool> {
 pub fn frame_phase() -> u32 {
     copystat::phase()
 }
+#[cfg(windows)]
+pub use wcvram::{title_memory_in_card, title_memory_is_write_combined, title_memory_write_combined};
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
