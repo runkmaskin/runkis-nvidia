@@ -436,11 +436,12 @@ fn priority_cap(text: Option<&str>) -> Option<i32> {
     (-2..=2).contains(&n).then_some(n)
 }
 
-/// `priority` under the cap `cap` (see [`priority_cap`]).
+/// `priority` under the cap `cap` (see [`priority_cap`]): only raised threads ("above normal" and
+/// "highest") are lowered; a cap below normal never pulls normal or lowered threads further down.
 fn capped(priority: i32, cap: Option<i32>) -> i32 {
     const HIGHEST: i32 = 2;
     match cap {
-        Some(cap) if priority > cap && priority <= HIGHEST => cap,
+        Some(cap) if priority > 0 && priority > cap && priority <= HIGHEST => cap,
         _ => priority,
     }
 }
@@ -716,6 +717,9 @@ mod tests {
         assert_eq!(given, [-1, 0, 0, 0, 15]);
         let given: Vec<i32> = [-1, 0, 1, 2, 15].into_iter().map(|p| capped(p, Some(1))).collect();
         assert_eq!(given, [-1, 0, 1, 1, 15]);
+        // A cap below normal lowers the raised threads only: normal ones stay normal.
+        let given: Vec<i32> = [-2, -1, 0, 1, 2, 15].into_iter().map(|p| capped(p, Some(-2))).collect();
+        assert_eq!(given, [-2, -1, 0, -2, -2, 15]);
         // Off: as before.
         let given: Vec<i32> = [-1, 0, 1, 2, 15].into_iter().map(|p| capped(p, None)).collect();
         assert_eq!(given, [-1, 0, 1, 2, 15]);

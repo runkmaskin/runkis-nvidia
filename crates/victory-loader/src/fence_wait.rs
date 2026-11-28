@@ -63,22 +63,37 @@ const SLICE_MS: u32 = 4;
 static WAITS: AtomicU64 = AtomicU64::new(0);
 static WAITED_US: AtomicU64 = AtomicU64::new(0);
 
-/// The title's condition: the fence's value has reached `target` (56-bit values compared by the
-/// sign of their difference, bit 55), or it is all ones (the device is gone; the title's loop
-/// takes its own path for that).
-pub(crate) fn reached(value: u64, target: u64) -> bool {
-    value == u64::MAX || value.wrapping_sub(target) & (1 << 55) == 0
+/// The title's condition: the fence's value has reached `target` (`sub rdx, rsi; test rdx, r13`:
+/// the difference has none of `mask`'s bits, bit 55 for the title's 56-bit values), or it is all
+/// ones (the device is gone; the title's loop takes its own path for that).
+///
+/// `mask` is the title's own `r13`, handed over by the stub, not a constant of ours: the bytes
+/// checked before patching show `test rdx, r13` but not what `r13` holds, and a constant that
+/// differed from it would make [`wait`] block for [`MOST`] where the title's loop had already left
+/// (or return where it had not, which only costs a turn of the loop).
+pub(crate) fn reached(value: u64, target: u64, mask: u64) -> bool {
+    value == u64::MAX || value.wrapping_sub(target) & mask == 0
 }
 
-/// Blocks until the 64-bit value at `value` meets [`reached`] for `target`, or [`MOST`] passed.
-/// Called by the title's code in place of `Sleep(0)`.
-extern "system" fn wait(value: *const u64, target: u64) {
-    // SAFETY: the title's fence address, an aligned u64 that the layer stores atomically.
+/// Blocks until the 64-bit value at `value` meets [`reached`] for `target` and `mask`, or
+/// [`MOST`] passed. Called by the title's code in place of `Sleep(0)`.
+extern "system" fn wait(value: *const u64, target: u64, mask: u64) {
+    if value.is_null() || !value.is_aligned() {
+        // Not a value the layer stores atomically (or not one at all): as before.
+        #[cfg(windows)]
+        // SAFETY: a plain yield.
+        unsafe {
+            windows_sys::Win32::System::Threading::Sleep(0)
+        };
+        return;
+    }
+    // SAFETY: the title's fence address, an aligned u64 (checked above) that the layer stores
+    // atomically.
     let at = unsafe { AtomicU64::from_ptr(value.cast_mut()) };
     let start = Instant::now();
     loop {
         let now = at.load(Ordering::Acquire);
-        if reached(now, target) || start.elapsed() >= MOST {
+        if reached(now, target, mask) || start.elapsed() >= MOST {
             break;
         }
         #[cfg(windows)]
@@ -96,26 +111,30 @@ extern "system" fn wait(value: *const u64, target: u64) {
 }
 
 /// The stub at `stub`, called in place of the `Sleep(0)` helper with the title's registers: calls
-/// `wait(rdi, rsi)` when `r14` is 0 and `r12` is `rbp` (the loop's plain form), else jumps to
+/// `wait(rdi, rsi, r13)` when `r14` is 0 and `r12` is `rbp` (the loop's plain form), else jumps to
 /// `sleep0`. Either returns to the title's code.
 fn stub(wait: usize, sleep0: usize) -> Vec<u8> {
     let mut code = vec![
         0x4d, 0x85, 0xf6, // test r14, r14
-        0x75, 0x17, // jne sleep
+        0x75, 0x1a, // jne sleep
         0x49, 0x39, 0xec, // cmp r12, rbp
-        0x75, 0x12, // jne sleep
+        0x75, 0x15, // jne sleep
         0x48, 0x89, 0xf9, // mov rcx, rdi
         0x48, 0x89, 0xf2, // mov rdx, rsi
+        0x4d, 0x89, 0xe8, // mov r8, r13 (the title's compare mask)
         0x48, 0xb8, // mov rax, wait
     ];
     code.extend((wait as u64).to_le_bytes());
     code.extend([0xff, 0xe0]); // jmp rax
-    debug_assert_eq!(code.len(), 28);
+    debug_assert_eq!(code.len(), SLEEP_AT);
     code.extend([0x48, 0xb8]); // sleep: mov rax, sleep0
     code.extend((sleep0 as u64).to_le_bytes());
     code.extend([0xff, 0xe0]); // jmp rax
     code
 }
+
+/// Where the stub's `sleep` path begins.
+const SLEEP_AT: usize = 31;
 
 /// `call rel32` at `at` to `to`, if it reaches.
 fn call(at: usize, to: usize) -> Option<[u8; 5]> {
@@ -191,10 +210,13 @@ pub unsafe fn apply_asked(base: usize, hash: &blake3::Hash) {
 mod tests {
     use super::*;
 
+    /// The title's `r13` in this loop: bit 55 of its 56-bit values.
+    const BIT55: u64 = 0x0080_0000_0000_0000;
+
     /// The title's inline test, as its instructions do it: `sub rdx, rsi; test rdx, r13` with
     /// r13 = 1 << 55, leaving on zero; and the `cmp rdx, -1` before it.
     fn title_leaves(value: u64, target: u64) -> bool {
-        value == u64::MAX || (value.wrapping_sub(target) & 0x0080_0000_0000_0000) == 0
+        value == u64::MAX || (value.wrapping_sub(target) & BIT55) == 0
     }
 
     #[test]
@@ -209,13 +231,17 @@ mod tests {
             let target = x & mask;
             let value = x.rotate_left(17) & mask;
             for v in [value, target, target.wrapping_add(1), target.wrapping_sub(1), u64::MAX] {
-                assert_eq!(reached(v, target), title_leaves(v, target), "{v:#x} {target:#x}");
+                assert_eq!(reached(v, target, BIT55), title_leaves(v, target), "{v:#x} {target:#x}");
             }
         }
-        assert!(reached(5, 5));
-        assert!(reached(6, 5));
-        assert!(!reached(4, 5));
-        assert!(reached(u64::MAX, 5));
+        assert!(reached(5, 5, BIT55));
+        assert!(reached(6, 5, BIT55));
+        assert!(!reached(4, 5, BIT55));
+        assert!(reached(u64::MAX, 5, BIT55));
+        // The mask is the title's register, whatever it holds: with the sign bit, a value past
+        // the 56 bits is behind; with no bits at all the title's loop leaves at once, and so do we.
+        assert!(!reached(4, 5, 1 << 63));
+        assert!(reached(4, 5, 0));
     }
 
     #[test]
@@ -237,12 +263,14 @@ mod tests {
     #[test]
     fn the_stub_takes_the_plain_loop_only() {
         let s = stub(0x1122_3344_5566_7788, 0x7ff6_0000_1234);
-        assert_eq!(s.len(), 40);
+        assert_eq!(s.len(), SLEEP_AT + 12);
         // Both branches land on the second mov.
-        assert_eq!(5 + usize::from(s[4]), 28);
-        assert_eq!(10 + usize::from(s[9]), 28);
-        assert_eq!(&s[18..26], &0x1122_3344_5566_7788u64.to_le_bytes());
-        assert_eq!(&s[30..38], &0x7ff6_0000_1234u64.to_le_bytes());
+        assert_eq!(5 + usize::from(s[4]), SLEEP_AT);
+        assert_eq!(10 + usize::from(s[9]), SLEEP_AT);
+        // The third argument is the title's r13.
+        assert_eq!(&s[16..19], &[0x4d, 0x89, 0xe8]);
+        assert_eq!(&s[21..29], &0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!(&s[SLEEP_AT + 2..SLEEP_AT + 10], &0x7ff6_0000_1234u64.to_le_bytes());
         assert_eq!(call(0x1000, 0x2000), Some([0xe8, 0xfb, 0x0f, 0, 0]));
         assert_eq!(call(0, 1 << 40), None);
     }
@@ -260,28 +288,29 @@ mod tests {
             SLEPT.store(true, Ordering::Relaxed);
         }
         // A caller that sets the loop's registers as the title has them and calls the stub:
-        // rdi = value address, rsi = target, r14 = callback, r12 and rbp = the compares.
-        // push rbp/rdi/rsi/r12/r14 (5 pushes keep the stack aligned with the call),
-        // mov rdi, rcx; mov rsi, rdx; mov r14, r8; mov r12, r9; mov rbp, [rsp+0x50] (5th arg),
-        // sub rsp, 0x20; call [stub at r10 = rsp+0x78+... ] -- the stub's address goes in rax.
+        // rdi = value address, rsi = target, r14 = callback, r12 and rbp = the compares, r13 =
+        // the compare mask; the stub's address goes in rax.
         let place = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) } as usize;
         assert_ne!(place, 0);
         let body = stub(wait as *const () as usize, sleep0 as *const () as usize);
         let caller_at = place + 256;
+        // r13 = the compare mask (bit 55), as the title has it.
         let mut caller = vec![
-            0x55, 0x57, 0x56, 0x41, 0x54, 0x41, 0x56, // push rbp, rdi, rsi, r12, r14
+            0x55, 0x57, 0x56, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, // push rbp, rdi, rsi, r12, r13, r14
             0x48, 0x89, 0xcf, // mov rdi, rcx
             0x48, 0x89, 0xd6, // mov rsi, rdx
             0x4d, 0x89, 0xc6, // mov r14, r8
             0x4d, 0x89, 0xcc, // mov r12, r9
-            0x48, 0x8b, 0x6c, 0x24, 0x50, // mov rbp, [rsp+0x50] (the 5th argument)
-            0x48, 0x83, 0xec, 0x20, // sub rsp, 0x20
-            0x48, 0xb8, // mov rax, stub
+            0x48, 0x8b, 0x6c, 0x24, 0x58, // mov rbp, [rsp+0x58] (the 5th argument)
+            0x49, 0xbd, // mov r13, bit 55
         ];
+        caller.extend(BIT55.to_le_bytes());
+        caller.extend([0x48, 0x83, 0xec, 0x28]); // sub rsp, 0x28 (six pushes: realigned)
+        caller.extend([0x48, 0xb8]); // mov rax, stub
         caller.extend((place as u64).to_le_bytes());
         caller.extend([0xff, 0xd0]); // call rax
-        caller.extend([0x48, 0x83, 0xc4, 0x20]); // add rsp, 0x20
-        caller.extend([0x41, 0x5e, 0x41, 0x5c, 0x5e, 0x5f, 0x5d, 0xc3]); // pop r14, r12, rsi, rdi, rbp; ret
+        caller.extend([0x48, 0x83, 0xc4, 0x28]); // add rsp, 0x28
+        caller.extend([0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c, 0x5e, 0x5f, 0x5d, 0xc3]); // pop r14, r13, r12, rsi, rdi, rbp; ret
         // SAFETY: our fresh page.
         unsafe {
             std::ptr::copy_nonoverlapping(body.as_ptr(), place as *mut u8, body.len());

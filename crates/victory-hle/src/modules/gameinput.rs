@@ -343,6 +343,37 @@ fn mouse_stick(dx: f32, dy: f32, sense: f32) -> (f32, f32) {
     (axis(dx), -axis(dy))
 }
 
+/// The mouse's moves of the last [`StickWindow::SPAN`], as the pixels of one poll on average.
+///
+/// The stick is a speed, and the title reads it once a frame (13 to 30 times a second here), not
+/// at every 8 ms poll. Taken from one poll alone, a slow move (under a pixel a poll) read as 0 at
+/// most polls and as a jump at the others, and the title saw the one its frame landed on: the
+/// camera stood still or jerked. Averaged over a few polls the stick holds the move's speed
+/// between frames, and it is back at 0 one span after the mouse stops.
+#[derive(Default)]
+struct StickWindow {
+    moves: VecDeque<(Instant, f32, f32)>,
+}
+
+impl StickWindow {
+    const SPAN: Duration = Duration::from_millis(48);
+
+    /// Adds a poll's move at `now` and gives the average move a poll over the span.
+    fn push(&mut self, now: Instant, dx: f32, dy: f32) -> (f32, f32) {
+        self.moves.push_back((now, dx, dy));
+        while self.moves.front().is_some_and(|&(at, _, _)| now.duration_since(at) >= Self::SPAN) {
+            self.moves.pop_front();
+        }
+        let (x, y) = self.moves.iter().fold((0.0, 0.0), |(x, y), &(_, dx, dy)| (x + dx, y + dy));
+        let polls = Self::SPAN.as_secs_f32() / POLL.as_secs_f32();
+        (x / polls, y / polls)
+    }
+
+    fn clear(&mut self) {
+        self.moves.clear();
+    }
+}
+
 /// A native mouse delta scaled by `sense` (and flipped up-down when `invert_y`), whole counts, the
 /// fractions kept in `rest` for the next sample so slow moves are not lost.
 fn scaled_delta(rest: &mut (f64, f64), (dx, dy): (i64, i64), sense: f64, invert_y: bool) -> (i64, i64) {
@@ -739,14 +770,16 @@ impl Hub {
             let buttons = source.mouse_buttons(&keymap().mouse_keys());
             (pads, source.keys(), source.mouse(), source.mouse_pad(), buttons)
         };
-        // The mouse as the right stick (`VICTORY_MOUSE`) joins the one pad: it has no device of
-        // its own as a pad.
-        if self.one_pad
-            && let Some(stick) = stick
-        {
-            pads[0] = Some(pads[0].map_or(stick, |pad| merged(pad, stick)));
+        // The mouse as the right stick (`VICTORY_MOUSE`) has no device of its own as a pad: it
+        // joins the stand-in pad, which is the one pad, or, with each host pad a device of its own
+        // (`VICTORY_ONE_PAD=0`), the pad the title has while there is no stand-in: the first one.
+        let mut stand_in = fallback(keymap(), &keys, &buttons);
+        if let Some(stick) = stick {
+            match pads.iter_mut().flatten().next() {
+                Some(pad) if !self.one_pad => *pad = merged(*pad, stick),
+                _ => stand_in = merged(stand_in, stick),
+            }
         }
-        let stand_in = fallback(keymap(), &keys, &buttons);
         let events = self.state().poll(&self.devices, self.one_pad, pads, stand_in, keys, mouse);
         self.deliver(events);
     }
@@ -1504,6 +1537,10 @@ mod host {
         mouse: MouseState,
         /// The fractions of scaled native mouse moves not yet given (`VICTORY_MOUSE_SENSE`).
         mouse_rest: (f64, f64),
+        /// `VICTORY_MOUSE`: the cursor is held at the game window's centre (since the last poll
+        /// that found the game in front), and the moves of the last polls.
+        stick_held: bool,
+        stick_moves: super::StickWindow,
         /// The input snapshot for this poll and the HID connection owning each slot.
         pads: [Option<PadState>; PADS],
         hid_slots: [Option<u64>; PADS],
@@ -1599,40 +1636,58 @@ mod host {
                 .collect()
         }
 
-        /// `VICTORY_MOUSE=1`: while the title's window has focus and the F1 menu is closed, the
-        /// cursor is held at the window's centre, and how far it moved since the last poll is the
-        /// right stick (`VICTORY_MOUSE_SENSE` scales it: 1 is 12 pixels in one poll for a full
-        /// stick). The buttons are the keymap's (`MOUSE_KEYMAP` by default).
+        /// `VICTORY_MOUSE=1`: while the game's window is in front and the F1 menu is closed, the
+        /// cursor is held at the window's centre, and how far it moved is the right stick
+        /// (`VICTORY_MOUSE_SENSE` scales it: 1 is 12 pixels a poll for a full stick, averaged over
+        /// a few polls by [`super::StickWindow`]). The buttons are the keymap's (`MOUSE_KEYMAP` by
+        /// default).
         fn mouse_pad(&mut self) -> Option<PadState> {
             use windows_sys::Win32::Foundation::{POINT, RECT};
-            use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect, SetCursorPos};
+            use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+            use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, GetCursorPos, IsIconic, SetCursorPos};
             if !super::mouse_stick_on() {
                 return None;
             }
             let menu_open = victory_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed);
-            if menu_open || !focused() {
+            let window = game_in_front();
+            let mut area = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            let mut origin = POINT { x: 0, y: 0 };
+            let mut at = POINT { x: 0, y: 0 };
+            // SAFETY: plain queries of our own window and the cursor.
+            let found = !menu_open
+                && window.is_some_and(|w| unsafe {
+                    IsIconic(w) == 0
+                        && GetClientRect(w, &mut area) != 0
+                        && ClientToScreen(w, &mut origin) != 0
+                        && area.right > 0
+                        && area.bottom > 0
+                        && GetCursorPos(&mut at) != 0
+                });
+            if !found {
                 // The menu has the mouse, or the user is elsewhere: the cursor is let go.
+                self.stick_held = false;
+                self.stick_moves.clear();
                 return Some(PadState::default());
             }
-            let mut window = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-            let mut at = POINT { x: 0, y: 0 };
-            // SAFETY: plain queries and our own window's centre.
-            unsafe {
-                if GetWindowRect(GetForegroundWindow(), &mut window) == 0 || GetCursorPos(&mut at) == 0 {
-                    return Some(PadState::default());
-                }
-                let centre = ((window.left + window.right) / 2, (window.top + window.bottom) / 2);
-                SetCursorPos(centre.0, centre.1);
-                let dy = (at.y - centre.1) as f32;
-                let dy = if super::mouse_invert_y() { -dy } else { dy };
-                let (x, y) = super::mouse_stick((at.x - centre.0) as f32, dy, (super::mouse_sense() / 12.0) as f32);
-                Some(PadState { right_x: x, right_y: y, ..Default::default() })
+            let centre = (origin.x + area.right / 2, origin.y + area.bottom / 2);
+            // SAFETY: a point inside our own window.
+            unsafe { SetCursorPos(centre.0, centre.1) };
+            if !std::mem::replace(&mut self.stick_held, true) {
+                // Back in front (a click into the window, the menu closed): where the cursor was
+                // is not a move.
+                return Some(PadState::default());
             }
+            let dx = (at.x - centre.0) as f32;
+            let dy = (at.y - centre.1) as f32;
+            let dy = if super::mouse_invert_y() { -dy } else { dy };
+            let (dx, dy) = self.stick_moves.push(Instant::now(), dx, dy);
+            let (x, y) = super::mouse_stick(dx, dy, (super::mouse_sense() / 12.0) as f32);
+            Some(PadState { right_x: x, right_y: y, ..Default::default() })
         }
 
         fn mouse_buttons(&mut self, wanted: &[u8]) -> Vec<u8> {
             let menu_open = victory_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed);
-            if menu_open || !focused() {
+            if menu_open || game_in_front().is_none() {
                 return Vec::new();
             }
             // SAFETY: plain queries.
@@ -1794,6 +1849,16 @@ mod host {
         assert_eq!(live_line("D x", t).unwrap().hold, Duration::from_millis(200));
         assert!(live_line("Shift", t).is_none());
         assert!(live_line("", t).is_none());
+    }
+
+    /// The foreground window, when it is one of ours and not the console window this process
+    /// writes to: the game's (the mouse is not taken from a click into the console, where
+    /// `focused` also holds, as Windows gives a console window to the process it serves).
+    fn game_in_front() -> Option<windows_sys::Win32::Foundation::HWND> {
+        use windows_sys::Win32::System::Console::GetConsoleWindow;
+        // SAFETY: plain queries.
+        let (front, console) = unsafe { (GetForegroundWindow(), GetConsoleWindow()) };
+        (!front.is_null() && front != console && focused()).then_some(front)
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -2247,6 +2312,40 @@ mod tests {
         host.lock().unwrap().buttons = vec![0x01];
         hub.poll();
         assert_eq!(pad(hub).right_trigger, 0.0);
+    }
+
+    /// With each host pad a device of its own (`VICTORY_ONE_PAD=0`) the mouse stick still turns
+    /// the camera: on the stand-in while there is no pad, then on the first pad (it was dropped).
+    #[test]
+    fn the_mouse_stick_reaches_the_title_without_the_one_pad() {
+        let (hub, host) = fake_with(false);
+        let right_x = |hub: &Hub, device: usize| match &hub.state().slots[device].history.back().unwrap().value {
+            Value::Pad(p) => p.right_x,
+            _ => unreachable!(),
+        };
+        host.lock().unwrap().stick = Some(PadState { right_x: 0.5, ..Default::default() });
+        hub.poll();
+        assert_eq!(right_x(hub, FALLBACK), 0.5);
+        host.lock().unwrap().pads[2] = Some(PadState { left_y: 1.0, ..Default::default() });
+        hub.poll();
+        assert_eq!(right_x(hub, 2), 0.5);
+    }
+
+    #[test]
+    fn the_stick_holds_a_slow_move_between_polls() {
+        let start = Instant::now();
+        let mut w = StickWindow::default();
+        // Half a pixel a poll on average: one pixel every second poll.
+        let got: Vec<f32> = (0..12u32).map(|n| w.push(start + POLL * n, (n % 2) as f32, 0.0).0).collect();
+        // Once the span is full the average no longer falls to 0 between the pixels.
+        assert!(got[6..].iter().all(|&x| (0.3..=0.7).contains(&x)), "{got:?}");
+        // A steady move is its own speed: 6 pixels a poll.
+        let mut w = StickWindow::default();
+        let last = (0..12u32).map(|n| w.push(start + POLL * n, 6.0, -6.0)).last().unwrap();
+        assert!((last.0 - 6.0).abs() < 0.01 && (last.1 + 6.0).abs() < 0.01, "{last:?}");
+        // Stopped: back at 0 one span later.
+        let after = start + POLL * 11 + StickWindow::SPAN;
+        assert_eq!(w.push(after, 0.0, 0.0), (0.0, 0.0));
     }
 
     #[test]
