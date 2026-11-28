@@ -1922,6 +1922,22 @@ fn all_there(at: *const u8, len: usize) -> bool {
     }
 }
 
+/// Whether `[at, at + len)` is mapped as [`all_there`] asks, without making
+/// memory the runtime mapped lazily real first ([`committed`] does): such
+/// memory counts as not mapped. For the sweep's choice of host copies to let
+/// go (`crate::resource::let_go_unmapped`), where a wrong "not mapped" costs
+/// an upload and making a page real would cost the memory it is to save.
+pub(crate) fn mapped_now(at: *const u8, len: usize) -> bool {
+    if let Some(there) = by_views().then(|| crate::inplace::shown_bytes(at as usize, len)).flatten() {
+        return there >= len as u64;
+    }
+    if crate::watch::soft().is_some() {
+        // (The views the runtime keeps alone are asked, nothing is made.)
+        return committed(at, len);
+    }
+    committed_there(at, len)
+}
+
 /// Whether how much of title memory is mapped is asked of the runtime's
 /// views of physical pages first (`VICTORY_MAPPED_BY_VIEWS=0`: of Windows).
 fn by_views() -> bool {

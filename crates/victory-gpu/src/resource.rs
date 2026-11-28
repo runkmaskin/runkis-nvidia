@@ -2294,6 +2294,10 @@ pub(crate) fn let_go_idle() {
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
+    // The PC's memory too (`VICTORY_TEXTURE_RAM=1`, off by default).
+    let vram_plan = (idle_ms, most);
+    let (idle_ms, most) = ram_rule(ram_settings(), crate::residency::pressured(), idle_ms, most);
+    let by_ram = (idle_ms, most) != vram_plan;
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -2379,6 +2383,17 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
+    if by_ram && went > 0 {
+        RAM_SWEPT[0].fetch_add(went, Relaxed);
+        RAM_SWEPT[1].fetch_add(bytes, Relaxed);
+    }
+    // Copies over title memory the title has unmapped (`VICTORY_TEXTURE_UNMAPPED=1`).
+    if unmapped_on() {
+        let (n, b) = let_go_unmapped(&all, IDLE_FRAMES);
+        went += n;
+        bytes += b;
+    }
+    say_ram_swept();
     // The table of textures is let go first: `slot_evict` takes it itself,
     // and a lock taken twice by one thread waits for ever (upstream's patch
     // 07: the hang of every run with `VICTORY_SLOT_EVICT=1` as soon as the
@@ -2399,6 +2414,156 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+// The PC's memory and the sweep.
+//
+// A host texture costs the PC's memory too: Windows charges what the card is
+// given against the commit limit (in census-20261128-051943 the process's
+// private bytes grew by the host textures' growth less the host copies'
+// shrinking, 428 MB against 439 MB, while the card had 2.6 GB free), and the
+// sweep keeps idle copies ten minutes while the card has room. With the
+// card's budget 77 % used, 5.9 GB of host textures were alive, none let go,
+// and Windows had 70-260 MB left to commit.
+
+/// `VICTORY_TEXTURE_RAM=1` (off by default): while the PC's memory is short
+/// (`crate::residency::pressured`), the sweep also lets go of host copies of
+/// textures the title fills that have been idle `VICTORY_TEXTURE_RAM_IDLE_S`
+/// seconds (30, 5 to 600), the longest idle first, at most
+/// `VICTORY_TEXTURE_RAM_MB` (256, 16 to 2048) a sweep (one a second). Their
+/// pieces of texture blocks come back after two and a half seconds and
+/// empty blocks go (`crate::pool::room` keeps two while the PC is short).
+/// The idle time and the bytes of a sweep.
+#[cfg(windows)]
+fn ram_settings() -> Option<(u64, u64)> {
+    static S: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        let var = |k: &str| std::env::var(k).ok();
+        ram_settings_from(
+            var("VICTORY_TEXTURE_RAM").as_deref(),
+            var("VICTORY_TEXTURE_RAM_IDLE_S").as_deref(),
+            var("VICTORY_TEXTURE_RAM_MB").as_deref(),
+        )
+    })
+}
+
+/// [`ram_settings`] from the three variables' values.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn ram_settings_from(on: Option<&str>, idle_s: Option<&str>, mb: Option<&str>) -> Option<(u64, u64)> {
+    let num = |v: Option<&str>| v.and_then(|v| v.trim().parse::<u64>().ok());
+    (on.map(str::trim) == Some("1"))
+        .then(|| (num(idle_s).unwrap_or(30).clamp(5, 600) * 1000, num(mb).unwrap_or(256).clamp(16, 2048) << 20))
+}
+
+/// The sweep's idle time and most bytes (`u64::MAX`: no limit, nothing
+/// sorted) as the card's rule gave them, with [`ram_settings`] while the PC
+/// is short of memory: the shorter idle time, and at least a sweep's bytes.
+/// Off, or with memory to spare: as they were.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn ram_rule(settings: Option<(u64, u64)>, pressured: bool, idle_ms: u64, most: u64) -> (u64, u64) {
+    match settings {
+        Some((idle, step)) if pressured => (idle_ms.min(idle), if most == u64::MAX { step } else { most.max(step) }),
+        _ => (idle_ms, most),
+    }
+}
+
+/// Host copies let go by the sweep while the PC was short of memory with
+/// [`ram_settings`] (a sweep that let go more than the card's rule alone
+/// would counts whole), and by [`let_go_unmapped`]: counts and bytes.
+#[cfg(windows)]
+pub(crate) static RAM_SWEPT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[cfg(windows)]
+fn say_ram_swept() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = RAM_SWEPT[0].load(Relaxed) + RAM_SWEPT[2].load(Relaxed);
+    if n == 0 || n < 2 * SAID.load(Relaxed).max(64) {
+        return;
+    }
+    SAID.store(n, Relaxed);
+    tracing::info!(
+        "host copies of textures let go for the PC's memory, since the start: {} idle while it was short (VICTORY_TEXTURE_RAM) {} MB, {} over title memory no longer mapped (VICTORY_TEXTURE_UNMAPPED) {} MB",
+        RAM_SWEPT[0].load(Relaxed),
+        RAM_SWEPT[1].load(Relaxed) >> 20,
+        RAM_SWEPT[2].load(Relaxed),
+        RAM_SWEPT[3].load(Relaxed) >> 20,
+    );
+}
+
+/// `VICTORY_TEXTURE_UNMAPPED=1` (off by default): the sweep lets go of host
+/// copies of placed textures the title fills whose title memory is not
+/// mapped any more (its first page, as the memory line's estimate: 1,287 MB
+/// of them in census-20261128-050955, none shown by a slot), idle five
+/// seconds and held by nothing else, whatever room the card has. A part of
+/// the textures at each sweep ([`UNMAPPED_PART`]): each is a question to
+/// Windows. A use makes the copy again from title memory, as after any
+/// sweep.
+#[cfg(windows)]
+fn unmapped_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TEXTURE_UNMAPPED").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Textures [`let_go_unmapped`] looks at in a sweep, the next ones at the
+/// next: some 60 s for 63,000.
+#[cfg(windows)]
+const UNMAPPED_PART: usize = 1024;
+
+/// [`unmapped_on`]'s pass, with the table of textures held: how many went
+/// and their bytes.
+#[cfg(windows)]
+fn let_go_unmapped(all: &std::collections::BTreeSet<usize>, frames: u64) -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    const IDLE_MS: u64 = 5_000;
+    static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let (mut looked, mut last) = (0usize, 0usize);
+    let (mut went, mut bytes) = (0u64, 0u64);
+    for &at in all.range(FROM.load(Relaxed)..).take(UNMAPPED_PART) {
+        looked += 1;
+        last = at;
+        // SAFETY: as in `let_go_idle` (the table is held).
+        let r = unsafe { &*(at as *const Resource) };
+        let used = r.host.used.load(Relaxed);
+        if used == 0
+            || !fills(&r.desc)
+            || !r.host.placed.load(Relaxed)
+            || !crate::host::long_ago(used, IDLE_MS, frames)
+            || crate::texture::host_wrote(at)
+            || crate::texture::mapped_now(r.data().cast_const(), 1)
+        {
+            continue;
+        }
+        let gone = {
+            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let idle = made.as_ref().is_some_and(|(host, _)| {
+                crate::host::long_ago(r.host.used.load(Relaxed), IDLE_MS, frames)
+                    && std::sync::Arc::strong_count(host) == 1
+                    && crate::host::references(&host.texture) == 1
+            });
+            if idle {
+                // As `let_go_idle` lets a copy go.
+                crate::texture::unstage(at as This);
+                r.host.wanted.store(u32::MAX, Relaxed);
+                r.host.used.store(0, Relaxed);
+                made.take()
+            } else {
+                None
+            }
+        };
+        if let Some((host, _)) = gone {
+            r.host.gone.store(true, Relaxed);
+            KINDS[2].fetch_add(1, Relaxed);
+            KINDS[3].fetch_add(host.bytes, Relaxed);
+            went += 1;
+            bytes += host.bytes;
+            crate::host::retire(host);
+        }
+    }
+    FROM.store(if looked == UNMAPPED_PART { last + 1 } else { 0 }, Relaxed);
+    RAM_SWEPT[2].fetch_add(went, Relaxed);
+    RAM_SWEPT[3].fetch_add(bytes, Relaxed);
+    (went, bytes)
 }
 
 // Slot eviction: memory stack by skornuta (skornuta/victory-memory-stack 57fb136, GPL-3.0),
@@ -3848,6 +4013,40 @@ mod tests {
         // Under the low line: off, and it stays off until the high one again.
         assert_eq!(slot_plan(true, budget, 750, high, low, cap), (false, 0));
         assert_eq!(slot_plan(false, budget, 840, high, low, cap), (false, 0));
+    }
+
+    /// `VICTORY_TEXTURE_RAM` is off unless it is 1, and then reads its two
+    /// numbers within their bounds.
+    #[test]
+    fn the_ram_sweep_is_off_unless_asked() {
+        assert_eq!(ram_settings_from(None, Some("5"), Some("512")), None);
+        assert_eq!(ram_settings_from(Some("0"), None, None), None);
+        assert_eq!(ram_settings_from(Some("yes"), None, None), None);
+        assert_eq!(ram_settings_from(Some("1"), None, None), Some((30_000, 256 << 20)));
+        assert_eq!(ram_settings_from(Some(" 1 "), Some("10"), Some("64")), Some((10_000, 64 << 20)));
+        assert_eq!(ram_settings_from(Some("1"), Some("1"), Some("1")), Some((5_000, 16 << 20)));
+        assert_eq!(ram_settings_from(Some("1"), Some("9999"), Some("99999")), Some((600_000, 2048 << 20)));
+        assert_eq!(ram_settings_from(Some("1"), Some("x"), Some("")), Some((30_000, 256 << 20)));
+    }
+
+    /// Off, or with the PC's memory to spare, the sweep's plan is the card's
+    /// rule's, whatever it is; short of memory, the shorter idle time and at
+    /// least a sweep's bytes, so the copies go the longest idle first.
+    #[test]
+    fn the_ram_sweep_changes_nothing_unless_on_and_short() {
+        let plans = [(600_000, u64::MAX), (5_000, 123 << 20), (1_500, 1 << 30), (2_500, u64::MAX), (1_000, 0)];
+        let on = ram_settings_from(Some("1"), None, None);
+        for (idle, most) in plans {
+            for pressured in [false, true] {
+                assert_eq!(ram_rule(None, pressured, idle, most), (idle, most));
+            }
+            assert_eq!(ram_rule(on, false, idle, most), (idle, most));
+        }
+        let step = 256 << 20;
+        assert_eq!(ram_rule(on, true, 600_000, u64::MAX), (30_000, step));
+        assert_eq!(ram_rule(on, true, 5_000, 123 << 20), (5_000, step));
+        assert_eq!(ram_rule(on, true, 1_500, 1 << 30), (1_500, 1 << 30));
+        assert_eq!(ram_rule(on, true, 1_000, 0), (1_000, step));
     }
 
     #[test]
