@@ -4152,6 +4152,7 @@ pub(crate) mod indirects;
 mod font;
 mod menu;
 mod panel;
+mod parts;
 mod place;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
@@ -4864,7 +4865,8 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    let sync = self.stamp_parts(vec![Some(list.cast()?)], &[parts::Kind::Sync], &mut []);
+                    self.queue.ExecuteCommandLists(&sync);
                     Ok(())
                 })()
             };
@@ -6133,15 +6135,19 @@ impl Host {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
-        for list in runs {
+        // What each of `lists` is, for the card's time by part (`parts`).
+        let mut kinds: Vec<parts::Kind> = Vec::with_capacity(2 * runs.len());
+        for (n, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
             // (None unless `VICTORY_PRELUDE_UPLOADS=1`.)
             let uploads = list.prelude_uploads(&mut batch);
             if let Some(prelude) = list.prelude(&uploads) {
                 lists.push(Some(prelude));
+                kinds.push(parts::Kind::Prelude);
             }
             lists.push(list.list.cast().ok());
+            kinds.push(if n == 0 && own.is_some() { parts::Kind::Steps } else { parts::Kind::Title });
         }
         batch.fill();
         stage.next("submit: the last refreshes");
@@ -6189,6 +6195,7 @@ impl Host {
         }
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
+            kinds.push(parts::Kind::Compare);
         }
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
@@ -6210,6 +6217,8 @@ impl Host {
         if let Some((ahead, behind)) = stamp.and_then(stamps::lists) {
             lists.insert(0, Some(ahead));
             lists.push(Some(behind));
+            kinds.insert(0, parts::Kind::Other);
+            kinds.push(parts::Kind::Other);
             firsts.iter_mut().for_each(|first| *first += 1);
         }
         #[cfg(feature = "diagnostics")]
@@ -6220,8 +6229,12 @@ impl Host {
             if let Some([front, behind]) = self.span_lists() {
                 lists.insert(0, Some(front));
                 lists.push(Some(behind));
+                kinds.insert(0, parts::Kind::Other);
+                kinds.push(parts::Kind::Other);
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
+            // The card's time by part (`VICTORY_CARD_PARTS=1`).
+            let lists = self.stamp_parts(lists, &kinds, &mut firsts);
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
@@ -6263,6 +6276,8 @@ impl Host {
             working(was_working);
             return Some((submitted, sent));
         }
+        // The card's time by part (`VICTORY_CARD_PARTS=1`).
+        let lists = self.stamp_parts(lists, &kinds, &mut firsts);
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
@@ -9725,6 +9740,7 @@ impl Meter {
         two_queues::line(frames);
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
+        parts::line(frames);
         crate::shadow::back_line(frames);
         submit_split_line(frames);
         fresh_open_line(frames);
@@ -10037,6 +10053,7 @@ impl Meter {
                     per_frame(5),
                     per_frame(6) / 1e3
                 );
+                tracing::info!("{}", crate::shadow::left_in_pc_line());
             }
             let [raw_srv, raw_uav] = crate::descriptor::host::raw_view_counts();
             tracing::info!(

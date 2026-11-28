@@ -66,3 +66,36 @@ Seconds 150-240 of each run, the first run of the new program discarded (10.2 fp
 A1 and B1 are one pair, in a scene that changed during the window (6,200 draws a frame, then 10,000 to 13,000 at
 different seconds in the two runs), and still compiling pipelines: not a measurement of the switch. The second
 round was stopped at the user's request.
+
+## Where the card's time goes (2026-11-28, in progress)
+
+The user's city run at night (Series S, DLSS Quality to 1440p, 5,700-8,800 draws) showed 12.8-15 fps with the F3
+panel's GPU BUSY at 62-73 ms. That figure is the frame's time less the stretches in which nothing of ours was
+queued (`card_clock_line` in `crates/victory-gpu/src/host.rs`): a list waiting for the card, and the system's time to
+start a submission and report it done, count as busy too. It does not say what the card worked on.
+
+- **`VICTORY_CARD_PARTS=1`** (`crates/victory-gpu/src/host/parts.rs`, every build, off by default): a timestamp
+  list stands in front of every list of every submission and behind the last, and each list's time on the card is
+  summed by what it is: the title's lists, the preludes (uploads ahead of a list), our list of steps done on the
+  card (`VICTORY_CARD_STEPS`), the compare passes after a submission's lists, and the list that sends what changed
+  up to the copies in the card's memory and hashes those pieces again. The frame line gets "the card's time by part
+  per frame", with the time from each submission's first stamp to its last. 4,096 stamps are made once and used in
+  turn; a stamp is read when it is used again, some ten frames later.
+- **Title memory left in the PC's memory**: a new line after "host copies in the card's memory" counts, since the
+  start, the title buffers and windows that were to go to the card's memory but stayed in the PC's (the copies'
+  limit `VICTORY_CARD_BUFFERS_MB`, the windows' `VICTORY_CARD_WINDOWS_MB`, or no room), with their bytes. Shaders
+  read those over the bus; on this card that once made the heaviest compute passes take 20-40 ms each.
+
+What the layer itself gives the card per frame, from the code and the user's log of that run (02:34, city):
+
+| Ours on the card | Per frame | Cost, estimated from the code |
+|---|---|---|
+| Compare passes after the lists (`CARD_COMPARE`, a group per 64 KiB piece) | 430 passes, 37,170 pieces = 2.4 GB read and hashed; each of about 30 compare lists starts with a full UAV barrier | about 5-8 ms at the card's 504 GB/s |
+| Sends up to card copies and the hashes after them (`card_before`) | 27-33 MB over the bus in about 680 runs and 230,000 scattered words; 180 rehash passes over 315 pieces | 1-2 ms |
+| Steps done on the card (`VICTORY_CARD_STEPS=2`) | 11,346 fills of 5.8 MB: as many small buffer copies, a full UAV barrier first in each list | 1-5 ms (many tiny copies) |
+| Indirect argument clamps in batches (`VICTORY_INDIRECT_BATCH=2`) | about 350 batch passes for 5,500 executions, a barrier after each | 1-5 ms (pipeline drains) |
+| The light stand-ins (`VICTORY_AMBIENT*`) | a few small passes at 64x36 and 160x90 points | under 0.5 ms |
+| Keeping the card awake (`VICTORY_CARD_AWAKE=1`) | one group of 64 threads, 2 ms at a time, on a compute queue of its own | little work; with hardware scheduling off it may cost the drawing queue turns (the old base measured +1 fps without it on an RTX 2070 SUPER) |
+| DLSS to 1440p | one upscaling | about 1-1.5 ms |
+
+The rest is the title's own lists. Measurements of each switch follow.
