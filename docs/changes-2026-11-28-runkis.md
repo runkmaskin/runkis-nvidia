@@ -228,3 +228,46 @@ With room for 5 GB, 2.8 GB of windows went to the card (another 0.4 GB was turne
 use) and the title's lists took 1.5-2 ms less: +0.15 fps, inside the noise, with four times the textures waiting for
 room. The default stays. The bus is not where the title's 37-55 ms go; the card still draws only 93-96 W at 95 % busy,
 so the time is in the title's own passes as translated (next: a captured frame, timed pass by pass).
+
+### The title's passes ranked (timing run, city at night, Series S DLSS Quality)
+
+`VICTORY_GPU_TIMING=1` (diagnostics build) puts a timestamp before every command the layer records; it now does so
+without device-removed data too (`HostList::note`), whose breadcrumbs cost the card 2-4x on NVIDIA. Submissions are
+waited for one by one in such a run, so the frame is slower, but each command's time on the card is its own. A
+captured frame (`VICTORY_RECORD`) could not be used: its replay lost the device (0x887A0006) on this card, with and
+without `VICTORY_RECORD_ALWAYS=1`.
+
+Of 32.6 ms of the title's commands a frame (mean of 20 lines): indirect executions 21.7, dispatches 6.6, mesh 1.5,
+draws 0.8.
+
+| ms a frame | program (shader hash) | console wave | barriers / LDS ops / wave ops in the translation |
+|---|---|---|---|
+| 8.2 | `water_shading:CS_TransmissionVolumetrics_Tiled_LocalLights` (6f225b641c5b0708) | 64 | 163 / 241 / 110 |
+| 2.5 | `vfx_proj_decal_vbuffer:CS_ProjDecalReduceClassification_Scalarized` (1f1fbd86759b3da2) | 64 | 148 / 217 / 156 |
+| 1.0 | alias copies (82 a frame) | | |
+| 0.7 | `sr_tracing:CS_RayMiss` (06bb6e728c7c99bf) | 32 | |
+| 0.6 | a vertex+pixel indirect draw (e732a8b4bea4c0dd) | | |
+| 0.5 | `cascadeshadows_rendering:CS_ShadowRenderTiledCascadesAlphaCB` (922e1d0ee1e19a85) | 64 | 91 / 133 / 76 |
+| 0.5 | `indirect_diffuse_lighting:CS_ScreenProbes_TemporalResolve_ReflectiveCaustics` (34fb51b8a0312e82) | 32 | |
+| 0.5 | `vfx_proj_decal_vbuffer:CS_ProjDecalResolve_Vectorized` (c4183d3cbee28e8e) | 64 | |
+| 0.4 | `scattering_transmittance_system:CS_Gather_Classified_16` (84eafa50504bc9ef) | 32 | |
+
+The two at the top are console 64-lane programs that a 32-lane NVIDIA wave runs as two host waves meeting in
+shared memory: each exchange between the halves is a store, a group barrier, two loads and a second barrier
+(`exchange_halves` in `victory-shader/src/emit/lower.rs`), and the water program runs in the wave-wide form (8
+branches taken by the whole console wave, two barriers each). Nothing else costs more than 0.7 ms.
+
+`VICTORY_WATER_LIGHT=0` (the F1 menu's WATER LIGHT, upstream's switch) leaves the water's two tiled light programs
+out. Interleaved, same spot:
+
+| | fps | 1 % low | median frame | frames over 100 ms | the title's lists |
+|---|---|---|---|---|---|
+| water light on (default) | 17.4 / 16.8 / 16.6 | 8.6 / 9.0 / 10.8 | 59 / 62 / 63 ms | 29 / 10 / 3 | 41.2 / 38.9 / 39.8 ms |
+| `VICTORY_WATER_LIGHT=0` | 19.4 / 19.9 / 20.3 | 11.2 / 10.7 / 11.6 | 48 / 47 / 46 ms | 1 / 1 / 1 | 32.8 / 32.9 / 32.0 ms |
+
++17 % (three interleaved pairs) and almost no frames over 100 ms. What it costs the picture: the water has no light of its own depth (darker,
+bluer; at night on the balcony barely visible). Left as the player's choice (F1, WATER LIGHT), not the default.
+
+Candidate translations, not done yet: an exchange between the two host waves needs its second barrier only so that
+the slots are not written again before both halves have read them; alternating two sets of slots per exchange (both
+halves exchange equally often) would make it one barrier, about half of these programs' barriers.
