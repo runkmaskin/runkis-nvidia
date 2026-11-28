@@ -151,13 +151,33 @@ overlap can still win is those 4 to 8 ms.
   cases, where the bytes every part reads are the same cut, joined and unjoined). The frame line gets
   "submissions cut ahead of their wait for landings per frame".
 - Upstream's own switches for the refusal itself, off there: `VICTORY_PLACED_READS=1` (fills behind such a copy read
-  where the copy reads) and `VICTORY_PLACED_ORDER=1` (the submission is cut behind the copy's list). To be measured
+  where the copy reads) and `VICTORY_PLACED_ORDER=1` (the submission is cut behind the copy's list). Measured
   beside it.
 
-**Not measured in game yet.** The A/B (off, `VICTORY_SUBMIT_PIPELINE=1`, `VICTORY_PLACED_READS=1` with
-`VICTORY_PLACED_ORDER=1`, two interleaved rounds of 240 s after a discarded warm-up run, Series S 1440p DLSS Quality,
-the city save) was queued when the game queue was paused by the user, and was withdrawn before it ran. What to
-look at: fps and 1 % low from the frame log; the frame line's "title memory read" wait and "the card idle behind
-us"; "submissions cut ahead of their wait" (how often a cut happens at all: when the first part is the one that
-reads what is in the air, there is nothing to cut). Until then the switch stays off and is not in the launcher's
-presets.
+**Measured in game** (binary of this commit on `ea668d8`, release build, the same file for all three; Series S
+1440p DLSS Quality, the city save, seconds 142-232 of each run, a discarded warm-up run first, interleaved):
+
+| Run | fps | 1 % low | median ms | draws | "title memory read" wait ms | refused / frame | cuts / frame | camera at 150 s / 225 s |
+|---|---|---|---|---|---|---|---|---|
+| off 1 | 17.55 | 11.0 | 59.6 | 7,720 | 10.8 | 0.3 | - | deck, wide / deck, wide |
+| `VICTORY_SUBMIT_PIPELINE=1` 1 | 17.55 | 11.7 | 59.2 | 7,687 | 10.4 | 0.3 | 0 | same / same |
+| `VICTORY_PLACED_READS=1` + `_ORDER=1` 1 | 18.61 | 12.2 | 50.3 | 7,998 | 10.6 | 0.5 | - | close-up / deck, wide |
+| off 2 | 14.11 | 7.3 | 70.6 | 8,317 | 14.6 | 0.3 | - | railing / railing |
+| `VICTORY_SUBMIT_PIPELINE=1` 2 | 18.79 | 11.2 | 51.5 | 7,639 | 5.4 | 0.2 | 0 | from above / railing |
+| `VICTORY_PLACED_READS=1` + `_ORDER=1` 2 | 17.05 | 12.1 | 57.2 | 7,622 | 16.4 | 0.6 | - | deck, wide / close-up |
+
+The window falls in a cutscene on the deck whose camera differs from run to run, and the runs of the same setting
+differ by up to 4.7 fps. Only off 1 and pipe 1 show the same shots at both seconds: 17.55 fps against 17.55. The
+picture was right in every run.
+
+- **`VICTORY_SUBMIT_PIPELINE=1` does nothing here: it never cuts.** Over the whole pipe 1 run the cuts add up to
+  about one, against 0.3 waits a frame that could not be cut. In every refused submission the first part already
+  reads the title's ring of constants, which the skinning passes declare written as a whole; that is the read the
+  card's steps exist for. So nothing ahead of the wait is free. It stays off, and is a candidate for removal.
+- **`VICTORY_PLACED_READS=1` moves the refusal, it does not remove it**: with it every refusal is "a step other
+  than a fill done on the card reads what a copy at its place writes" (`PLACED_READER`), 0.5-0.6 a frame, and the
+  "title memory read" wait stays at 10-16 ms. Its fps differences are within the cutscene's noise.
+- **What would overlap instead** (not done): cut a refused submission so that the part with the copy at its place
+  (and what reads its destination) is on its own, and let the card's steps take the other parts without a wait.
+  `card_steps::cut_for` does this for `BEHIND_PLACED` with `VICTORY_PLACED_ORDER=1`; it does not cover
+  `PLACED_READER`. A measurement needs a window outside the cutscene.
