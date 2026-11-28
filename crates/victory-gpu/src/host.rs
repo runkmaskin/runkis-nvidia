@@ -4025,11 +4025,15 @@ impl RelayBack {
             }
         }
         land::spent(land::stat::BACK, merging);
-        for ((_, from, to), written) in self.work.iter().zip(written) {
+        for ((shadow, from, to), written) in self.work.iter().zip(written) {
             COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::compared(*from, to - from, written as usize);
-            let _ = (from, to);
+            {
+                crate::copystat::compared(*from, to - from, written as usize);
+                let (start, len) = shadow.span();
+                crate::census::landed(start as usize, len as usize, *from, *to, written as usize);
+            }
+            let _ = (shadow, from, to);
         }
     }
 }
@@ -5303,6 +5307,13 @@ impl Host {
         }
         land::spent(land::stat::CARD, merging);
         COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
+        // Diagnostics: whether the CPU touches what came back before the
+        // next landing (`crate::census::landed`).
+        #[cfg(feature = "diagnostics")]
+        for (shadow, lo, hi, _) in &pieces {
+            let (start, len) = shadow.span();
+            crate::census::landed(start as usize, len as usize, start as usize + lo, start as usize + hi, 0);
+        }
         if let Some(f) = fetch.as_mut() {
             if let Some(check) = &check {
                 check.done(&mut f.suspects);

@@ -51,14 +51,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE,
+    MEM_COMMIT, MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
     VirtualAlloc, VirtualProtect, VirtualQuery,
 };
 
 const PAGE: usize = 4096;
 const BLOCK: usize = 64 << 10;
-/// Console addresses lie below 1 TiB: one bit per 4 KiB page of it.
-const PAGES: usize = 1 << 28;
+/// Pages of the address space, one bit each: all of a process's user space
+/// (47 bits): the title's console addresses lie below 1 TiB, the host heap's
+/// blocks it is given (committed resources) above.
+const PAGES: usize = 1 << 35;
 /// The trap flag.
 const TRAP: u32 = 0x100;
 /// Ranges the kernel wrote, left alone for the rest of a sample; past this
@@ -91,67 +93,117 @@ enum Via {
 
 /// Whether a sample is being taken.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
-/// The bitmap of the pages made read-only (0: not made yet).
+/// The bitmaps (0: not made yet): four of [`PAGES`] bits, reserved whole
+/// (16 GiB of address space) and committed 64 KiB at a time where a bit is
+/// first set; a part never committed reads as zeros.
 static BITS: AtomicUsize = AtomicUsize::new(0);
+/// Per 64 KiB of the bitmaps: committed.
+static COMMITTED: OnceLock<Box<[AtomicBool]>> = OnceLock::new();
+const WORDS: usize = PAGES / 64;
+const CHUNK_WORDS: usize = (64 << 10) / 8;
 
-/// Two bitmaps: the pages read-only now, then the pages ever made so
-/// (never cleared: a fault that was raised while a page was read-only may
-/// be looked at after it is read-write again).
-fn bits() -> Option<&'static [AtomicU64]> {
-    let at = BITS.load(Relaxed);
-    // SAFETY: once made, the bitmaps are never let go; atomics of zeroed pages.
-    (at != 0).then(|| unsafe { std::slice::from_raw_parts(at as *const AtomicU64, 3 * PAGES / 64) })
-}
+/// The pages read-only (or no-access) by the census's hand now.
+const ARMED: usize = 0;
+/// The pages it ever made so (never cleared: a fault that was raised while
+/// a page was read-only may be looked at after it is read-write again).
+const EVER: usize = 1;
+/// Pages read-only again after a counted store (the trap flag's,
+/// `VICTORY_WRITE_CENSUS_STORES` above 1), not since a refresh.
+const TRAPPED: usize = 2;
+/// Pages made no-access after what shaders wrote landed in them
+/// ([`landed`]): their first read or write by the CPU is noted.
+const NO_ACCESS: usize = 3;
 
 fn make_bits() -> bool {
     if BITS.load(Relaxed) != 0 {
         return true;
     }
-    // SAFETY: fresh zeroed memory of ours, 96 MiB of commit (pages are only
-    // taken where they are touched).
-    let at = unsafe { VirtualAlloc(std::ptr::null(), 3 * PAGES / 8, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
-    !at.is_null() && BITS.compare_exchange(0, at as usize, Relaxed, Relaxed).is_ok()
+    // SAFETY: a reservation of ours; parts are committed before use.
+    let at = unsafe { VirtualAlloc(std::ptr::null(), 4 * WORDS * 8, MEM_RESERVE, PAGE_READWRITE) };
+    if at.is_null() {
+        return false;
+    }
+    let _ = COMMITTED.set((0..4 * WORDS / CHUNK_WORDS).map(|_| AtomicBool::new(false)).collect());
+    BITS.compare_exchange(0, at as usize, Relaxed, Relaxed).is_ok()
+}
+
+/// The word of `section` that holds `page`'s bit, if that part of the
+/// bitmap is committed (`commit`: committed now if not).
+fn word(section: usize, page: usize, commit: bool) -> Option<&'static AtomicU64> {
+    use windows_sys::Win32::System::Memory::MEM_COMMIT;
+    let base = BITS.load(Relaxed);
+    if base == 0 || page >= PAGES {
+        return None;
+    }
+    let index = section * WORDS + page / 64;
+    let chunk = index / CHUNK_WORDS;
+    let committed = &COMMITTED.get()?[chunk];
+    if !committed.load(std::sync::atomic::Ordering::Acquire) {
+        if !commit {
+            return None;
+        }
+        let at = base + chunk * CHUNK_WORDS * 8;
+        // SAFETY: 64 KiB of our reservation (committing it twice is harmless).
+        if unsafe { VirtualAlloc(at as *const _, CHUNK_WORDS * 8, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+            return None;
+        }
+        committed.store(true, std::sync::atomic::Ordering::Release);
+    }
+    // SAFETY: a committed word of the bitmaps, which are never let go.
+    Some(unsafe { &*(base as *const AtomicU64).add(index) })
+}
+
+fn get(section: usize, page: usize) -> bool {
+    word(section, page, false).is_some_and(|w| w.load(Relaxed) >> (page % 64) & 1 != 0)
+}
+
+fn set(section: usize, page: usize, on: bool) {
+    if let Some(w) = word(section, page, on) {
+        if on {
+            w.fetch_or(1 << (page % 64), Relaxed);
+        } else {
+            w.fetch_and(!(1 << (page % 64)), Relaxed);
+        }
+    }
+}
+
+fn bits() -> Option<()> {
+    (BITS.load(Relaxed) != 0).then_some(())
 }
 
 fn armed(page: usize) -> bool {
-    page < PAGES && bits().is_some_and(|b| b[page / 64].load(Relaxed) >> (page % 64) & 1 != 0)
+    get(ARMED, page)
 }
 
-/// The third bitmap: pages read-only again after a counted store (the trap
-/// flag's, `VICTORY_WRITE_CENSUS_STORES` above 1), not since a refresh.
 fn trapped(page: usize) -> bool {
-    page < PAGES && bits().is_some_and(|b| b[2 * PAGES / 64 + page / 64].load(Relaxed) >> (page % 64) & 1 != 0)
+    get(TRAPPED, page)
+}
+
+fn no_access(page: usize) -> bool {
+    get(NO_ACCESS, page)
 }
 
 fn mark_trapped(page: usize, on: bool) {
-    if let Some(b) = bits() {
-        let word = &b[2 * PAGES / 64 + page / 64];
-        if on {
-            word.fetch_or(1 << (page % 64), Relaxed);
-        } else {
-            word.fetch_and(!(1 << (page % 64)), Relaxed);
-        }
-    }
+    set(TRAPPED, page, on);
 }
 
 /// A refresh took `[first, last)`: none of its pages is trapped any more
 /// (its next store is a first one), 64 at a time.
 fn untrap(first: usize, last: usize) {
-    let Some(b) = bits() else {
-        return;
-    };
     let mut page = first;
     while page < last {
         let n = (64 - page % 64).min(last - page);
         let mask = if n == 64 { !0u64 } else { ((1u64 << n) - 1) << (page % 64) };
-        b[2 * PAGES / 64 + page / 64].fetch_and(!mask, Relaxed);
+        if let Some(w) = word(TRAPPED, page, false) {
+            w.fetch_and(!mask, Relaxed);
+        }
         page += n;
     }
 }
 
 /// Whether the census ever made the page read-only.
 fn ever(page: usize) -> bool {
-    page < PAGES && bits().is_some_and(|b| b[PAGES / 64 + page / 64].load(Relaxed) >> (page % 64) & 1 != 0)
+    get(EVER, page)
 }
 
 /// The order that keeps the handler right: a page's bit is set BEFORE it is
@@ -160,20 +212,22 @@ fn ever(page: usize) -> bool {
 /// store fault on a read-only page whose bit was already or not yet clear,
 /// and the fault went on to the title, which died: run census-075138.)
 fn mark(page: usize, on: bool) {
-    if let Some(b) = bits() {
-        if on {
-            b[page / 64].fetch_or(1 << (page % 64), Relaxed);
-            b[PAGES / 64 + page / 64].fetch_or(1 << (page % 64), Relaxed);
-        } else {
-            b[page / 64].fetch_and(!(1 << (page % 64)), Relaxed);
-        }
+    set(ARMED, page, on);
+    if on {
+        set(EVER, page, true);
+    } else {
+        set(NO_ACCESS, page, false);
     }
 }
 
-/// Whether the page at `at` can be written now.
-fn writable_now(at: usize) -> bool {
-    query(at).is_some_and(|i| i.State == MEM_COMMIT && i.Protect & 0xff == PAGE_READWRITE && i.Protect & PAGE_GUARD == 0)
+/// Whether the page at `at` can be written (`write`) or read now.
+fn accessible_now(at: usize, write: bool) -> bool {
+    query(at).is_some_and(|i| {
+        let p = i.Protect & 0xff;
+        i.State == MEM_COMMIT && i.Protect & PAGE_GUARD == 0 && if write { p == PAGE_READWRITE } else { p == PAGE_READWRITE || p == PAGE_READONLY }
+    })
 }
+
 
 /// What the switches ask.
 struct Settings {
@@ -246,6 +300,12 @@ struct Region {
     copied: u64,
     first: u64,
     stores: u64,
+    /// Pages made no-access after landings in it ([`landed`]); the CPU's
+    /// first reads and writes of them (the title's, through any code); our
+    /// own first touches (a refresh copying it whole, a landing).
+    landed: u64,
+    touched: [u64; 2],
+    ours_touched: u64,
 }
 
 #[derive(Clone, Default)]
@@ -268,6 +328,10 @@ struct Totals {
     /// Refreshes whose pages were left as they were: the frame's time for
     /// making pages read-only was spent.
     over_budget: u64,
+    /// Pages made no-access after a landing ([`landed`]), and the CPU's
+    /// first reads and writes of them.
+    landed_pages: u64,
+    landed_touches: [u64; 2],
 }
 
 /// Ranges of addresses, joined where they meet or touch: start, end.
@@ -375,6 +439,9 @@ struct State {
     regions: Vec<Region>,
     sites: HashMap<(usize, usize, Via), Site>,
     site_regions: HashMap<(usize, usize, Via, usize), u64>,
+    /// The CPU's first reads and writes of pages after landings, by site and
+    /// host copy (`usize::MAX`: none).
+    touches: HashMap<(usize, usize, Via, usize), [u64; 2]>,
     /// Faults per page since it was last copied.
     traps: HashMap<usize, u32>,
     totals: Totals,
@@ -490,10 +557,24 @@ impl State {
             return id;
         }
         let id = self.regions.len();
-        self.regions.push(Region { start, len, kind, refreshes: 0, copied: 0, first: 0, stores: 0 });
+        self.regions.push(Region { start, len, kind, refreshes: 0, copied: 0, first: 0, stores: 0, landed: 0, touched: [0; 2], ours_touched: 0 });
         self.ids.insert((start, len), id);
         self.by_start.entry(start).or_default().push(id);
         id
+    }
+
+    /// Notes the CPU's first read (or `write`) of a page after a landing.
+    fn touch(&mut self, (rip, caller, via): (usize, usize, Via), at: usize, write: bool) {
+        let region = self.region_of(at);
+        if let Some(id) = region {
+            self.regions[id].touched[usize::from(write)] += 1;
+        }
+        let key = (rip, caller, via, region.unwrap_or(usize::MAX));
+        if self.touches.contains_key(&key) || self.touches.len() < SITES {
+            self.touches.entry(key).or_default()[usize::from(write)] += 1;
+        } else {
+            self.totals.overflow += 1;
+        }
     }
 
     /// Notes a store into `at` (`first`: the first since the page or block
@@ -668,11 +749,17 @@ fn arm(s: &mut State, from: usize, to: usize) {
 /// The first page from `page` on, below `last`, whose bit is `set` (`last`
 /// if none): 64 pages at a time where their word says all of them.
 fn next(mut page: usize, last: usize, set: bool) -> usize {
-    let Some(b) = bits() else {
-        return if set { last } else { page.min(last) };
-    };
+    let last = last.min(PAGES);
     while page < last {
-        let word = b[page / 64].load(Relaxed);
+        let Some(w) = word(ARMED, page, false) else {
+            // A part never committed: all clear.
+            if !set {
+                return page;
+            }
+            page = (page / 64 / CHUNK_WORDS + 1) * CHUNK_WORDS * 64;
+            continue;
+        };
+        let word = w.load(Relaxed);
         let word = (if set { word } else { !word }) >> (page % 64);
         if word != 0 {
             return (page + word.trailing_zeros() as usize).min(last);
@@ -705,6 +792,74 @@ pub(crate) fn refreshed(start: usize, len: usize, from: usize, to: usize, copied
         untrap(from / PAGE, to.div_ceil(PAGE).min(PAGES));
         arm(s, from, to);
     }
+}
+
+/// What shaders wrote in `[from, to)` of the host copy of
+/// `[start, start + len)` landed in title memory (`written` bytes changed,
+/// `crate::host`): during a sample, the whole pages of it in host memory
+/// (above 1 TiB: committed resources' blocks of the host heap) of a copy
+/// of 64 KiB or more are made no-access, so that the CPU's first read or
+/// write of them before the next landing is noted, by site
+/// ([`faulted`]). Whether the title reads what the card wrote decides
+/// whether it must come back at all.
+pub(crate) fn landed(start: usize, len: usize, from: usize, to: usize, written: usize) {
+    if !ACTIVE.load(Relaxed) || start >> 40 == 0 && !cfg!(test) || len < 64 << 10 {
+        return;
+    }
+    #[cfg(test)]
+    if !AS_TITLE.get() {
+        return;
+    }
+    let _ = written;
+    let mut guard = state();
+    let Some(s) = guard.as_mut().filter(|_| ACTIVE.load(Relaxed)) else {
+        return;
+    };
+    let id = match s.ids.get(&(start, len)) {
+        Some(&id) => id,
+        None => s.region(start, len, Kind::Whole),
+    };
+    if s.frame_arm_us >= s.arm_us || s.kernel.full() {
+        s.totals.over_budget += 1;
+        return;
+    }
+    let started = std::time::Instant::now();
+    let (from, to) = (from.div_ceil(PAGE) * PAGE, to / PAGE * PAGE);
+    if from < to {
+        learn(s, from, to, started);
+        let runs: Vec<(usize, usize, u32)> = s
+            .plain
+            .range(..to)
+            .rev()
+            .take_while(|(_, (e, _))| *e > from)
+            .map(|(&a, &(e, p))| (a.max(from), e.min(to), p))
+            .collect();
+        for (a, e, p) in runs.into_iter().rev() {
+            let (last, mut page) = (e / PAGE, next(a / PAGE, e / PAGE, false));
+            while page < last {
+                let end = next(page, last, true);
+                if !s.kernel.meets(page * PAGE, end * PAGE) {
+                    for q in page..end {
+                        mark(q, true);
+                        set(NO_ACCESS, q, true);
+                    }
+                    if protect(page * PAGE, (end - page) * PAGE, p & !0xff | PAGE_NOACCESS) {
+                        s.totals.landed_pages += (end - page) as u64;
+                        s.regions[id].landed += (end - page) as u64;
+                    } else {
+                        for q in page..end {
+                            mark(q, false);
+                        }
+                        s.totals.refused += 1;
+                    }
+                }
+                page = next(end, last, false);
+            }
+        }
+    }
+    let us = started.elapsed().as_micros() as u64;
+    s.frame_arm_us += us;
+    s.totals.arm_us += us;
 }
 
 /// The kernel will write `[at, at + len)` (a file read, a copy of ours
@@ -784,6 +939,12 @@ pub(crate) fn guard_fault(context: &CONTEXT, at: usize) {
 
 /// A write fault at `at`: if it is a page of the census, noted and opened.
 fn written(context: &mut CONTEXT, at: usize) -> bool {
+    faulted(context, at, true)
+}
+
+/// A fault at `at`, a write or (`write` false) a read: if it is a page of
+/// the census, noted and opened.
+fn faulted(context: &mut CONTEXT, at: usize, write: bool) -> bool {
     let page = at / PAGE;
     if !ever(page) {
         return false;
@@ -795,11 +956,15 @@ fn written(context: &mut CONTEXT, at: usize) -> bool {
     let mut guard = state();
     let Some(s) = guard.as_mut() else {
         // (The sample ended meanwhile: its pages are read-write again.)
-        return writable_now(at);
+        return accessible_now(at, write);
     };
     if !armed(page) {
-        // Opened meanwhile by another thread: the store is made again.
-        return writable_now(at);
+        // Opened meanwhile by another thread: the access is made again.
+        return accessible_now(at, write);
+    }
+    // A read faults only on a page made no-access.
+    if !write && !no_access(page) {
+        return false;
     }
     let block = at / BLOCK;
     // Stores counted since the page was copied: none unless the trap flag
@@ -810,8 +975,21 @@ fn written(context: &mut CONTEXT, at: usize) -> bool {
         // Ours alone (what shaders wrote, landed): not a store of the
         // title's. The whole block is opened, as such writes come in pieces.
         s.totals.ours += 1;
+        if no_access(page) {
+            if let Some(id) = s.region_of(at) {
+                s.regions[id].ours_touched += 1;
+            }
+        }
         let first = block * BLOCK / PAGE;
         s.totals.ours_pages += open_pages(s, first, (first + BLOCK / PAGE).min(PAGES));
+        return true;
+    }
+    if no_access(page) {
+        // The CPU's first touch of what shaders wrote since it landed.
+        s.totals.landed_touches[usize::from(write)] += 1;
+        s.touch(who, at, write);
+        protect(page * PAGE, PAGE, protection(s, page * PAGE));
+        mark(page, false);
         return true;
     }
     s.note(context, who, at, traps == 0, Kind::Watched);
@@ -881,8 +1059,8 @@ fn install() {
         } else {
             r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION
                 && r.NumberParameters >= 2
-                && r.ExceptionInformation[0] == 1
-                && written(context, r.ExceptionInformation[1])
+                && r.ExceptionInformation[0] <= 1
+                && faulted(context, r.ExceptionInformation[1], r.ExceptionInformation[0] == 1)
         };
         if ours { EXCEPTION_CONTINUE_EXECUTION } else { EXCEPTION_CONTINUE_SEARCH }
     }
@@ -942,6 +1120,7 @@ fn begin(limits: Limits, after: u64) -> bool {
     };
     s.sites.reserve(SITES + 1);
     s.site_regions.reserve(SITE_REGIONS + 1);
+    s.touches.reserve(SITES + 1);
     s.traps.reserve(TRAPS + 1);
     *state() = Some(s);
     LAST_FRAME_MS.store(now_ms(), Relaxed);
@@ -1203,6 +1382,37 @@ fn report(s: &State, ms: f64, name: &dyn Fn(usize) -> String) -> String {
             sites.join(", ")
         );
     }
+    let _ = writeln!(
+        out,
+        "\nwhat shaders wrote, landed: per frame {:.0} pages of host memory (copies of 64 KiB or more above 1 TiB) made no-access until touched; \
+         the CPU's first reads {:.1}, first writes {:.1} (by any code for the title); ours {:.1} (a refresh copying the copy whole, a landing)",
+        per(t.landed_pages),
+        per(t.landed_touches[0]),
+        per(t.landed_touches[1]),
+        per(s.regions.iter().map(|r| r.ours_touched).sum())
+    );
+    let _ = writeln!(out, "  landed pages/frame  reads/frame  writes/frame  ours/frame  copy");
+    let mut landed: Vec<&Region> = s.regions.iter().filter(|r| r.landed > 0).collect();
+    landed.sort_unstable_by_key(|r| std::cmp::Reverse(r.landed));
+    for r in landed.iter().take(40) {
+        let _ = writeln!(
+            out,
+            "  {:18.0}  {:11.2}  {:12.2}  {:10.1}  {:#x}+{:#x}",
+            per(r.landed),
+            per(r.touched[0]),
+            per(r.touched[1]),
+            per(r.ours_touched),
+            r.start,
+            r.len
+        );
+    }
+    let mut touches: Vec<_> = s.touches.iter().collect();
+    touches.sort_unstable_by_key(|(_, n)| std::cmp::Reverse(n[0] + n[1]));
+    let _ = writeln!(out, "  sites of those touches (reads/frame, writes/frame, site, copy):");
+    for &(&(rip, caller, via, id), n) in touches.iter().take(60) {
+        let copy = if id == usize::MAX { "-".into() } else { region_name(id) };
+        let _ = writeln!(out, "    {:8.2}  {:8.2}  {}  {copy}", per(n[0]), per(n[1]), site_name(&(rip, caller, via)));
+    }
     let _ = writeln!(out, "\nthe title's sites, as `image offset` (dirty pages per frame after each):");
     for (key, site) in sites.iter().filter(|(k, _)| k.2 == Via::Title).take(200) {
         if let Some((image, offset)) = crate::titlewrite::place(key.0) {
@@ -1329,6 +1539,47 @@ mod tests {
             VirtualFree(at as *mut _, 0, MEM_RELEASE);
             VirtualFree(other as *mut _, 0, MEM_RELEASE);
         }
+    }
+
+    /// After a landing, the CPU's first read and first write of a page are
+    /// noted (and see the bytes there), ours apart; untouched pages stay
+    /// no-access until the end, which opens them.
+    #[test]
+    fn touches_after_a_landing_are_counted() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let size = 32 * PAGE;
+        let at = memory(size).unwrap();
+        // SAFETY: the test's own memory.
+        unsafe { ((at + 3 * PAGE) as *mut u64).write(0x1234) };
+        assert!(begin(Limits { stores: 1, arm_us: u64::MAX / 4, stall_ms: 60_000 }, 0));
+        AS_TITLE.set(true);
+        landed(at, size, at + 100, at + 20 * PAGE, 0);
+        // The first page holds the range in part: left alone.
+        assert_eq!(protection_at(at), PAGE_READWRITE);
+        assert_eq!(protection_at(at + 3 * PAGE), PAGE_NOACCESS);
+        // SAFETY: as above; the reads and the write fault and go on.
+        unsafe {
+            assert_eq!(((at + 3 * PAGE) as *const u64).read_volatile(), 0x1234);
+            ((at + 4 * PAGE) as *mut u64).write_volatile(5);
+        }
+        assert_eq!(protection_at(at + 3 * PAGE), PAGE_READWRITE);
+        // Ours: another thread, whose code is no title's.
+        let page = at + 7 * PAGE;
+        // SAFETY: as above.
+        std::thread::spawn(move || unsafe { (page as *const u64).read_volatile() }).join().unwrap();
+        AS_TITLE.set(false);
+        let (s, ms) = end().unwrap();
+        assert_eq!(s.totals.landed_pages, 19);
+        assert_eq!(s.totals.landed_touches, [1, 1]);
+        assert_eq!(s.regions[0].touched, [1, 1]);
+        assert_eq!(s.regions[0].ours_touched, 1);
+        for page in 0..32 {
+            assert_eq!(protection_at(at + page * PAGE), PAGE_READWRITE, "page {page}");
+        }
+        let text = report(&s, ms, &|a| format!("{a:#x}"));
+        assert!(text.contains("what shaders wrote, landed"), "{text}");
+        // SAFETY: the test's own memory.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
 
     /// With no time for it in the frame, nothing is made read-only.
