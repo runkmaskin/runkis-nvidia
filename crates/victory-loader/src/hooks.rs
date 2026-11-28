@@ -265,6 +265,117 @@ fn title_pool_patches(bytes: u64) -> [OwnedPatch; 2] {
         },
     ]
 }
+/// Environment variable that sets the worker counts of the title's two large job pools:
+/// `<first>[,<second>]`, 1..=16 each (the title's are 8 and 5). Off by default.
+pub(crate) const TITLE_WORKERS_ENV: &str = "VICTORY_TITLE_WORKERS";
+
+/// The title starts three job pools at start-up from a read-only table of three rows (one per
+/// pool: a kind, the worker count, the workers' priority, a pointer to a processor list that
+/// is null in all three). The counts are fixed, 8, 5 and 1, whatever the processor count; the
+/// workers float over every processor. These are the first two rows' counts.
+const JOB_POOL_COUNTS: [(usize, u32); 2] = [(0x6188d2c, 8), (0x6188d44, 5)];
+
+/// The counts `VICTORY_TITLE_WORKERS` asks for: the first pool's, then the second's (the
+/// title's when not given).
+fn parse_workers(text: &str) -> Option<[u32; 2]> {
+    let mut counts = JOB_POOL_COUNTS.map(|(_, n)| n);
+    let mut parts = text.split(',');
+    for count in &mut counts {
+        if let Some(part) = parts.next() {
+            *count = part.trim().parse().ok().filter(|n| (1..=16).contains(n))?;
+        }
+    }
+    parts.next().is_none().then_some(counts)
+}
+
+/// The patches that give the two pools `counts` workers.
+fn worker_patches(counts: [u32; 2]) -> Vec<OwnedPatch> {
+    JOB_POOL_COUNTS
+        .iter()
+        .zip(counts)
+        .filter(|((_, title), n)| title != n)
+        .map(|(&(rva, title), n)| OwnedPatch {
+            what: "title job pool: worker count",
+            rva,
+            expect: title.to_le_bytes().to_vec(),
+            new: n.to_le_bytes().to_vec(),
+        })
+        .collect()
+}
+
+/// Environment variable (with `VICTORY_FRAME_INTERVAL_US`) that makes the title's timers step by
+/// at least one frame of the rate that interval gives, instead of one frame of the title's own
+/// 30. Off by default.
+pub(crate) const TITLE_STEP_ENV: &str = "VICTORY_TITLE_STEP";
+
+/// LOCAL: ported from trustno1-coder/VIctory-NVIDIA 45f6250 (GPL-3.0-or-later), its `Kind::SimRate`
+/// site. The simulation gives each of its timers the real time since the last frame, but at
+/// least `1 / rate`, and the rate comes from this function, which reads the title's frame rate
+/// setting (30). With our clock at 60 (`VICTORY_FRAME_INTERVAL_US=16667`) every frame shorter
+/// than 33.3 ms still moves game time 33.3 ms: game time runs fast (their run fps-1: twice the
+/// wall clock in the menus). `cmp dword [rax+210h], 0` becomes `mov eax, rate; jmp` to the
+/// function's `vcvtsi2ss`, so it returns `rate`. The bytes from the `cmp` to the `vcvtsi2ss`
+/// are compared first.
+const SIM_RATE: usize = 0x2241fdb;
+const SIM_RATE_EXPECT: [u8; 25] = [
+    0x83, 0xb8, 0x10, 0x02, 0x00, 0x00, 0x00, // cmp dword [rax+210h], 0
+    0x74, 0x12, // je
+    0xe8, 0xc7, 0xa1, 0xe0, 0x02, // call (the settings)
+    0x8b, 0x80, 0x10, 0x02, 0x00, 0x00, // mov eax, [rax+210h]
+    0xc4, 0xe1, 0xfa, 0x2a, 0xc0, // vcvtsi2ss xmm0, xmm0, rax
+];
+
+/// The rate an interval of `us` microseconds gives (16667 -> 60), 1000 at most.
+fn step_rate(us: u64) -> Option<u32> {
+    (us > 0).then(|| (1e6 / us as f64).round().clamp(1.0, 1000.0) as u32)
+}
+
+/// The timers' shortest step patch for `rate`: `mov eax, rate; jmp +13` (to the `vcvtsi2ss`, 20
+/// bytes on), the rest of the compared bytes as they are.
+fn sim_rate_patch(rate: u32) -> OwnedPatch {
+    let mut new = SIM_RATE_EXPECT.to_vec();
+    new[0] = 0xb8;
+    new[1..5].copy_from_slice(&rate.to_le_bytes());
+    new[5] = 0xeb;
+    new[6] = 0x0d;
+    OwnedPatch {
+        what: "timers: the shortest step follows our frame rate",
+        rva: SIM_RATE,
+        expect: SIM_RATE_EXPECT.to_vec(),
+        new,
+    }
+}
+
+/// Applies [`TITLE_STEP_ENV`] when asked for and `VICTORY_FRAME_INTERVAL_US` gives another rate
+/// than the title's 30. Returns how many applied.
+///
+/// # Safety
+/// As `disarm_watchdog`.
+pub(crate) unsafe fn timer_step(base: usize, hash: &blake3::Hash) -> usize {
+    if std::env::var_os(TITLE_STEP_ENV).is_none_or(|v| v != "1") {
+        return 0;
+    }
+    if !hash.to_hex().starts_with(BUILD_1_0_2_1) {
+        return 0;
+    }
+    let us = std::env::var("VICTORY_FRAME_INTERVAL_US").ok().and_then(|v| v.trim().parse::<u64>().ok());
+    let Some(rate) = us.and_then(step_rate).filter(|&r| r != 30) else {
+        tracing::info!("{TITLE_STEP_ENV}: the title's own 30 fps; its timers left as they are");
+        return 0;
+    };
+    let p = sim_rate_patch(rate);
+    let p = Patch {
+        what: p.what,
+        rva: p.rva,
+        expect: &p.expect,
+        new: &p.new,
+    };
+    // SAFETY: forwarded from this function's contract.
+    let done = unsafe { apply(base, &p) };
+    tracing::info!(rate, done, "{TITLE_STEP_ENV}: the title's timers step at least 1/{rate} s");
+    usize::from(done)
+}
+
 /// The scale `VICTORY_RENDER_SCALE` asks for, if valid.
 fn parse_scale(text: &str) -> Option<f32> {
     let v: f32 = text.trim().parse().ok()?;
@@ -280,7 +391,8 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
     let scale = std::env::var(RENDER_SCALE_ENV).ok();
     let own = std::env::var_os(OWN_UPSCALER_ENV).is_some_and(|v| v != "0");
     let pool = std::env::var(TITLE_POOL_ENV).ok().filter(|v| v.trim() != "0");
-    if scale.is_none() && !own && pool.is_none() {
+    let workers = std::env::var(TITLE_WORKERS_ENV).ok().filter(|v| v.trim() != "0");
+    if scale.is_none() && !own && pool.is_none() && workers.is_none() {
         return 0;
     }
     // Every image the loader maps comes here (the title's DLLs too); only
@@ -344,6 +456,25 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
                 text,
                 "{TITLE_POOL_ENV} wants a factor (1..=16) or MiB (1277..=16384) of the Series S graphics pool"
             ),
+        }
+    }
+    if let Some(text) = workers {
+        match parse_workers(&text) {
+            Some(counts) => {
+                for p in worker_patches(counts) {
+                    let p = Patch {
+                        what: p.what,
+                        rva: p.rva,
+                        expect: &p.expect,
+                        new: &p.new,
+                    };
+                    // SAFETY: forwarded from this function's contract (read-only data, made
+                    // writable by `apply` for the copy).
+                    applied += usize::from(unsafe { apply(base, &p) });
+                }
+                tracing::info!(?counts, "{TITLE_WORKERS_ENV}: the title's job pools");
+            }
+            None => tracing::warn!(text, "{TITLE_WORKERS_ENV} wants <first>[,<second>], 1..=16 each"),
         }
     }
     applied
@@ -473,6 +604,79 @@ mod tests {
         let disp = i32::from_le_bytes(p.new[4..8].try_into().unwrap());
         assert_eq!(0x28f1e8f_i64 + i64::from(disp), 0x5fc6ed8);
         assert_eq!(&p.new[..4], &[0xC5, 0xFA, 0x10, 0x05]);
+    }
+
+    #[test]
+    fn rates_come_from_the_interval() {
+        assert_eq!(step_rate(16667), Some(60));
+        assert_eq!(step_rate(33333), Some(30));
+        assert_eq!(step_rate(8333), Some(120));
+        assert_eq!(step_rate(1), Some(1000));
+        assert_eq!(step_rate(0), None);
+    }
+
+    /// The patched function run for real: it returns the rate instead of the setting.
+    #[test]
+    fn the_timer_step_returns_the_rate() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree};
+        let p = sim_rate_patch(60);
+        assert_eq!(&p.new[..7], &[0xb8, 60, 0, 0, 0, 0xeb, 0x0d]);
+        // The jump lands on the vcvtsi2ss.
+        assert_eq!(7 + usize::from(p.new[6]), 20);
+        assert_eq!(&p.new[20..], &SIM_RATE_EXPECT[20..]);
+        // A function: rax = settings (+0x210 = 30), the compared bytes with the call made
+        // harmless (the je skips nothing here: the setting is not 0), ret.
+        let settings = [30u32; 0x100];
+        let mut f = vec![0x48, 0xb8];
+        f.extend((settings.as_ptr() as u64).to_le_bytes());
+        let at = f.len();
+        let mut body = SIM_RATE_EXPECT;
+        body[9..14].copy_from_slice(&[0x0f, 0x1f, 0x44, 0x00, 0x00]); // the call -> nop
+        f.extend(body);
+        f.push(0xc3);
+        // SAFETY: our fresh page, written, patched and run.
+        unsafe {
+            let place = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as *mut u8;
+            assert!(!place.is_null());
+            std::ptr::copy_nonoverlapping(f.as_ptr(), place, f.len());
+            let rate: extern "system" fn() -> f32 = std::mem::transmute(place);
+            assert_eq!(rate(), 30.0);
+            // The real site's bytes (with its call) are what `apply` checks; here the call is
+            // a nop, so check and write by hand the same way.
+            let site = place.add(at);
+            assert_eq!(std::slice::from_raw_parts(site, 9), &SIM_RATE_EXPECT[..9]);
+            std::ptr::copy_nonoverlapping(p.new.as_ptr(), site, 7);
+            assert_eq!(rate(), 60.0);
+            VirtualFree(place.cast(), 0, MEM_RELEASE);
+        }
+        // `apply` checks all 25 bytes.
+        let (done, now) = patch_site(&p, &p.expect);
+        assert!(done);
+        assert_eq!(now, p.new);
+        let mut other = p.expect.clone();
+        other[2] = 0x14;
+        assert_eq!(patch_site(&p, &other), (false, other));
+    }
+
+    #[test]
+    fn worker_counts_patch_only_what_changes_and_check_first() {
+        assert_eq!(parse_workers("6"), Some([6, 5]));
+        assert_eq!(parse_workers(" 6 , 4 "), Some([6, 4]));
+        assert_eq!(parse_workers("0"), None);
+        assert_eq!(parse_workers("17"), None);
+        assert_eq!(parse_workers("6,4,2"), None);
+        assert_eq!(parse_workers("many"), None);
+        assert!(worker_patches([8, 5]).is_empty());
+        let p = worker_patches([6, 5]);
+        assert_eq!(p.len(), 1);
+        assert_eq!((p[0].rva, p[0].expect.as_slice()), (0x6188d2c, &[8, 0, 0, 0][..]));
+        let (done, now) = patch_site(&p[0], &p[0].expect);
+        assert!(done);
+        assert_eq!(now, [6, 0, 0, 0]);
+        // A count already changed, or another build: untouched.
+        assert_eq!(patch_site(&p[0], &[7, 0, 0, 0]), (false, vec![7, 0, 0, 0]));
+        let p = worker_patches([8, 3]);
+        assert_eq!((p[0].rva, p[0].new.as_slice()), (0x6188d44, &[3, 0, 0, 0][..]));
     }
 
     #[test]

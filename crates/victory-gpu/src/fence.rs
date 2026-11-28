@@ -171,6 +171,21 @@ pub(crate) fn set(this: This, value: u64) {
         }
         !reached
     });
+    drop(waiters);
+    #[cfg(windows)]
+    if wakes_address_waiters() {
+        // SAFETY: the value's address; waking nobody is harmless.
+        unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const fence.value).cast()) };
+    }
+}
+
+/// `VICTORY_FENCE_SLEEP=1`: the title's frame fence wait blocks on the fence's address
+/// (`WaitOnAddress`, the loader's `fence_wait`) instead of spinning, and every move of a fence
+/// wakes the threads waiting there. Off: no wake, as before.
+#[cfg(windows)]
+fn wakes_address_waiters() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FENCE_SLEEP").is_some_and(|v| v == "1"))
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let _called = crate::timeline::span("a fence set");

@@ -93,6 +93,10 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     // SAFETY: just mapped, and no title code has run.
     unsafe { crate::mouse_look::apply_asked(loaded.base(), &prepared.original_hash) };
     // SAFETY: just mapped, and no title code has run.
+    unsafe { crate::fence_wait::apply_asked(loaded.base(), &prepared.original_hash) };
+    // SAFETY: just mapped, and no title code has run.
+    unsafe { crate::hooks::timer_step(loaded.base(), &prepared.original_hash) };
+    // SAFETY: just mapped, and no title code has run.
     let levers = unsafe { crate::hooks::resolution_levers(loaded.base(), &prepared.original_hash) };
     if levers > 0 {
         tracing::warn!(
