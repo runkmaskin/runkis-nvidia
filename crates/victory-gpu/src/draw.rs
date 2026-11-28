@@ -131,6 +131,27 @@ fn ambient_stencil_skip() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_STENCIL_SKIP").is_some_and(|v| v == "1"))
 }
 
+/// A dynamic slot of view heap `heap` (the title's heap at `at`) holding a
+/// view of `texture`'s depth plane, made the first time and kept for the
+/// heap's life (with the texture: a few textures over a run). For the light
+/// stand-in ([`ambient_stencil_skip`]) when its depth place names the
+/// stencil plane and no other depth view of the right size is in the tables.
+fn plane_slot(at: usize, heap: &crate::descriptor::host::HostHeap, texture: &ID3D12Resource) -> Option<u32> {
+    static SLOTS: std::sync::Mutex<Vec<(usize, u64, usize, u32)>> = std::sync::Mutex::new(Vec::new());
+    let key = (at, heap.serial(), texture.as_raw() as usize);
+    let mut slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(.., index)) = slots.iter().find(|s| (s.0, s.1, s.2) == key) {
+        return Some(index);
+    }
+    let index = heap.dynamic(1)?;
+    if !heap.depth_plane_at(index, texture) {
+        heap.release(index, 1);
+        return None;
+    }
+    slots.push((key.0, key.1, key.2, index));
+    Some(index)
+}
+
 /// Whether a view is of a depth-stencil texture's stencil plane: formats
 /// X32_TYPELESS_G8X24_UINT (22) and X24_TYPELESS_G8_UINT (47), or a 2D view
 /// (dimension 4) of plane 1.
@@ -3228,6 +3249,26 @@ impl State {
                 .filter(|u| !stencil_at((u.slot, u.table_offset_dwords)))
                 .filter_map(|u| entry(ResourceType::Srv, (u.slot, u.table_offset_dwords)))
                 .find(|(d, _)| depth_like(d) && (d.Width, d.Height) == (of.Width, of.Height))
+                .or_else(|| {
+                    // None in the tables: a view of the same texture's depth
+                    // plane, in a slot of ours.
+                    let (slot, offset) = at;
+                    let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                        return None;
+                    };
+                    let Some(View::Shader(resource, _)) = crate::descriptor::view(table + u64::from(offset) * 4) else {
+                        return None;
+                    };
+                    let texture = crate::resource::host_resource(resource as This)?;
+                    // SAFETY: a live resource.
+                    let desc = unsafe { texture.GetDesc() };
+                    if (desc.Width, desc.Height) != (of.Width, of.Height) {
+                        return None;
+                    }
+                    let index = plane_slot(self.heaps[0], heap, texture)?;
+                    once!(?role, "stand-in: a view of the depth plane of the texture the stencil view names is made");
+                    Some((desc, heap.gpu_handle(index)))
+                })
         };
         let depth = match role {
             Role::Resolve => {
@@ -5333,6 +5374,54 @@ mod tests {
         assert!(!stencil_view(view(41, 4, 0)));
         assert!(!stencil_view(view(42, 2, 0)));
         assert!(!stencil_view(None));
+    }
+
+    /// The view of a depth-stencil texture's depth plane the stand-in makes
+    /// in place of a stencil view: the depth-plane format of each family,
+    /// none for colour formats; and the slot holds it on a real heap.
+    #[test]
+    fn a_depth_plane_view_is_made_for_the_stand_in() {
+        use crate::descriptor::host::{HostHeap, depth_plane_format};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+        assert_eq!(depth_plane_format(19), Some(21));
+        assert_eq!(depth_plane_format(20), Some(21));
+        assert_eq!(depth_plane_format(44), Some(46));
+        assert_eq!(depth_plane_format(45), Some(46));
+        assert_eq!(depth_plane_format(41), None);
+        assert_eq!(depth_plane_format(28), None);
+        let (Some(host), Some(heap)) = (crate::host::host(), HostHeap::new(false, 4)) else {
+            return; // no host GPU
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 8,
+            Height: 8,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT(19),
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a texture.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                    None,
+                    &mut texture,
+                )
+                .unwrap();
+        }
+        let texture = texture.unwrap();
+        let index = super::plane_slot(1, &heap, &texture).expect("a slot");
+        // The same texture on the same heap: the same slot.
+        assert_eq!(super::plane_slot(1, &heap, &texture), Some(index));
     }
 }
 

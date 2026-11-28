@@ -1839,6 +1839,17 @@ impl Taken {
     }
 }
 
+/// The shader view format of the depth plane of a depth-stencil texture of
+/// the host format `typeless`: R32_FLOAT_X8X24_TYPELESS (21) for R32G8X24
+/// (19, 20), R24_UNORM_X8_TYPELESS (46) for R24G8 (44, 45). Pure, for testing.
+pub(crate) fn depth_plane_format(typeless: i32) -> Option<i32> {
+    match typeless {
+        19 | 20 => Some(21),
+        44 | 45 => Some(46),
+        _ => None,
+    }
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -2983,6 +2994,40 @@ impl HostHeap {
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
         self.keep_ref(index, Some(buffer));
+    }
+
+    /// Makes slot `index` (a dynamic one) a view of the depth plane of
+    /// `texture`, a 2D depth-stencil texture of one slice: R32_FLOAT_X8X24
+    /// for R32G8X24 (19), R24_UNORM_X8 for R24G8 (44). False (and the slot
+    /// left as it is) for another format. For the light stand-in, whose
+    /// depth place may name the stencil plane (`crate::draw`).
+    pub(crate) fn depth_plane_at(&self, index: u32, texture: &ID3D12Resource) -> bool {
+        let Some(host) = host() else { return false };
+        // SAFETY: a live texture.
+        let of = unsafe { texture.GetDesc() };
+        let Some(format) = depth_plane_format(of.Format.0) else {
+            return false;
+        };
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT(format),
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        // SAFETY: a slot of our heap and a live texture.
+        unsafe { host.device.CreateShaderResourceView(texture, Some(&desc), self.at(index)) };
+        self.put(index);
+        // (Bound by its handle, not read by index.)
+        self.clear_twin(index);
+        self.keep_ref(index, Some(texture));
+        true
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
