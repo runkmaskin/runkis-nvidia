@@ -77,6 +77,11 @@ public sealed class LaunchProfile
     /// </summary>
     public bool TextureDiet { get; set; }
     /// <summary>
+    /// VICTORY_COMMITTED_WATCH=1: committed buffers are write-watched instead of copied whole each frame. Measured in
+    /// the prison intro (RTX 4070 SUPER, 2+2 interleaved runs): preparing 26.3 -> 23.5 ms, fps 23.6 -> 24.4.
+    /// </summary>
+    public bool CommittedWatch { get; set; }
+    /// <summary>
     /// VICTORY_TITLE_POOL (victory-loader title_pool.rs): the title's Series S pools this many times larger (0: as they are).
     /// Series S above 768 lines (DLAA, 1080 lines) needs 2.
     /// </summary>
