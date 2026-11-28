@@ -335,6 +335,10 @@ struct Totals {
     /// first reads and writes of them.
     landed_pages: u64,
     landed_touches: [u64; 2],
+    /// Bytes landed into committed buffers, by path ([`path`]), and
+    /// landings left alone for want of time.
+    landed_bytes: [u64; 5],
+    land_over_budget: u64,
 }
 
 /// Ranges of addresses, joined where they meet or touch: start, end.
@@ -431,6 +435,8 @@ struct State {
     plain: BTreeMap<usize, (usize, u32)>,
     /// Microseconds spent making pages read-only this frame, and the most.
     frame_arm_us: u64,
+    /// The same, for pages made no-access after landings ([`landed_by`]).
+    frame_land_us: u64,
     arm_us: u64,
     /// Why the sample ended.
     ended: &'static str,
@@ -668,11 +674,11 @@ fn open_pages(s: &State, first: usize, last: usize) -> u64 {
 
 /// Asks Windows what `[from, to)` is where it was not asked this sample,
 /// and keeps its committed private read-write runs.
-fn learn(s: &mut State, from: usize, to: usize, started: std::time::Instant) {
+fn learn(s: &mut State, from: usize, to: usize, started: std::time::Instant, spent: u64) {
     for (gap, gap_end) in s.known.gaps(from, to) {
         let mut at = gap;
         while at < gap_end {
-            if !ACTIVE.load(Relaxed) || s.frame_arm_us + started.elapsed().as_micros() as u64 >= s.arm_us {
+            if !ACTIVE.load(Relaxed) || spent + started.elapsed().as_micros() as u64 >= s.arm_us {
                 // (The rest is asked about at a later refresh.)
                 s.known.add(gap, at);
                 s.totals.over_budget += 1;
@@ -710,7 +716,7 @@ fn arm(s: &mut State, from: usize, to: usize) {
     let started = std::time::Instant::now();
     let (from, to) = (from / PAGE * PAGE, to.div_ceil(PAGE).min(PAGES) * PAGE);
     if from < to && !s.kernel.full() {
-        learn(s, from, to, started);
+        learn(s, from, to, started, s.frame_arm_us);
         // The plain runs that meet the range (they do not overlap).
         let runs: Vec<(usize, usize, u32)> = s
             .plain
@@ -832,7 +838,29 @@ fn committed_buffer(start: usize, len: usize) -> Option<(usize, usize, bool)> {
 /// no-access, so that the CPU's first read or write of them before the
 /// next landing is noted, by site ([`faulted`]). Whether the title reads
 /// what the card wrote decides whether it must come back at all.
+/// The paths what shaders wrote comes back to title memory by
+/// (`crate::host`), for [`landed`]'s count of bytes per path.
+pub(crate) mod path {
+    /// The relay's fetches of copies in the card's memory (`relay_card_back`).
+    pub(crate) const RELAY_CARD: usize = 0;
+    /// The relay's merges of copies in the PC's memory (`RelayBack::merge`).
+    pub(crate) const RELAY_PC: usize = 1;
+    /// Copies in the card's memory without the relay (`card_back`).
+    pub(crate) const CARD: usize = 2;
+    /// Copies in the PC's memory, looked through on threads (`copy_back_with`).
+    pub(crate) const PC_FOUND: usize = 3;
+    /// Copies in the PC's memory, one by one (`copy_back`).
+    pub(crate) const PC: usize = 4;
+    pub(crate) const NAMES: [&str; 5] =
+        ["the relay, card copies", "the relay, PC copies", "card copies without the relay", "PC copies, found on threads", "PC copies, one by one"];
+}
+
 pub(crate) fn landed(start: usize, len: usize, from: usize, to: usize, written: usize) {
+    landed_by(path::RELAY_PC, start, len, from, to, written);
+}
+
+/// [`landed`] by the path `by` ([`path`]); `bytes`: what it landed there.
+pub(crate) fn landed_by(by: usize, start: usize, len: usize, from: usize, to: usize, bytes: usize) {
     if !ACTIVE.load(Relaxed) || len < 64 << 10 {
         return;
     }
@@ -843,24 +871,26 @@ pub(crate) fn landed(start: usize, len: usize, from: usize, to: usize, written: 
     if !AS_TITLE.get() {
         return;
     }
-    let _ = written;
     let mut guard = state();
     let Some(s) = guard.as_mut().filter(|_| ACTIVE.load(Relaxed)) else {
         return;
     };
+    s.totals.landed_bytes[by.min(4)] += bytes as u64;
     let id = match s.ids.get(&(start, len)) {
         Some(&id) => id,
         None => s.region(start, len, if own { Kind::Watched } else { Kind::Whole }),
     };
     s.regions[id].committed = Some(own);
-    if s.frame_arm_us >= s.arm_us || s.kernel.full() {
-        s.totals.over_budget += 1;
+    // A time of its own: the refreshes spend theirs every frame (run
+    // census-094712: no landed page was ever made no-access).
+    if s.frame_land_us >= s.arm_us || s.kernel.full() {
+        s.totals.land_over_budget += 1;
         return;
     }
     let started = std::time::Instant::now();
     let (from, to) = (from.div_ceil(PAGE) * PAGE, to / PAGE * PAGE);
     if from < to {
-        learn(s, from, to, started);
+        learn(s, from, to, started, s.frame_land_us);
         let runs: Vec<(usize, usize, u32)> = s
             .plain
             .range(..to)
@@ -892,7 +922,7 @@ pub(crate) fn landed(start: usize, len: usize, from: usize, to: usize, written: 
         }
     }
     let us = started.elapsed().as_micros() as u64;
-    s.frame_arm_us += us;
+    s.frame_land_us += us;
     s.totals.arm_us += us;
 }
 
@@ -1261,6 +1291,7 @@ pub(crate) fn frame() {
             };
             s.frames += 1;
             s.frame_arm_us = 0;
+            s.frame_land_us = 0;
             s.frames
         };
         if frames >= settings.frames {
@@ -1425,6 +1456,12 @@ fn report(s: &State, ms: f64, name: &dyn Fn(usize) -> String) -> String {
         per(t.landed_touches[1]),
         per(s.regions.iter().map(|r| r.ours_touched).sum())
     );
+    let _ = writeln!(
+        out,
+        "  bytes landed into committed buffers per frame, by path: {}; {:.1} landings a frame not looked at for want of time",
+        (0..5).map(|i| format!("{} {:.2} MB", path::NAMES[i], per(t.landed_bytes[i]) / 1e6)).collect::<Vec<_>>().join(", "),
+        per(t.land_over_budget)
+    );
     {
         let buffers = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
         let mut big: Vec<(usize, usize, bool)> = buffers.iter().map(|(&a, &(e, own))| (a, e - a, own)).collect();
@@ -1527,11 +1564,13 @@ mod tests {
         let size = 16 * PAGE;
         let at = memory(size).unwrap();
         let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let rounds = std::sync::Arc::new(AtomicU64::new(0));
         let writer = {
-            let stop = stop.clone();
+            let (stop, rounds) = (stop.clone(), rounds.clone());
             std::thread::spawn(move || {
                 let mut n = 0u64;
                 while !stop.load(Relaxed) {
+                    rounds.fetch_add(1, Relaxed);
                     for page in 0..16 {
                         // SAFETY: the test's own memory.
                         unsafe { ((at + page * PAGE + (n as usize % 512) * 8) as *mut u64).write_volatile(n) };
@@ -1541,6 +1580,10 @@ mod tests {
                 n
             })
         };
+        // (Under a loaded machine the writer may start late.)
+        while rounds.load(Relaxed) == 0 {
+            std::thread::yield_now();
+        }
         AS_TITLE.set(true);
         for round in 0..200 {
             assert!(begin(Limits { stores: 1 + round % 3, arm_us: u64::MAX / 4, stall_ms: 60_000 }, 0));
@@ -1663,6 +1706,39 @@ mod tests {
         assert!(text.contains("(own pages)"), "{text}");
         drop(memory);
         assert!(committed_buffer(at, size).is_none(), "let go with its memory");
+    }
+
+    /// A frame whose refreshes spent all the time for making pages
+    /// read-only still looks at what lands (run census-094712: the
+    /// refreshes spent it every frame and no landed page was looked at);
+    /// the bytes are counted by the path they came by.
+    #[test]
+    fn landings_have_a_time_of_their_own() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let size = 64 * PAGE;
+        let (watched, buffer) = (memory(size).unwrap(), memory(size).unwrap());
+        assert!(begin(Limits { stores: 1, arm_us: 1, stall_ms: 60_000 }, 0));
+        AS_TITLE.set(true);
+        committed(buffer, size, true, true);
+        refreshed(watched, size, watched, watched + size, 0, Kind::Watched);
+        // (Spent, as the frame's refreshes spend it.)
+        state().as_mut().unwrap().frame_arm_us = 1_000;
+        refreshed(watched, size, watched, watched + size, 0, Kind::Watched);
+        landed_by(path::RELAY_CARD, buffer, size, buffer, buffer + size, size);
+        assert_eq!(protection_at(buffer + 9 * PAGE), PAGE_NOACCESS);
+        AS_TITLE.set(false);
+        let (s, ms) = end().unwrap();
+        assert!(s.totals.over_budget >= 1);
+        assert_eq!(s.totals.landed_pages, 64);
+        assert_eq!(s.totals.landed_bytes, [size as u64, 0, 0, 0, 0]);
+        let text = report(&s, ms, &|a| format!("{a:#x}"));
+        assert!(text.contains("the relay, card copies"), "{text}");
+        committed(buffer, size, true, false);
+        // SAFETY: the test's own memory.
+        unsafe {
+            VirtualFree(watched as *mut _, 0, MEM_RELEASE);
+            VirtualFree(buffer as *mut _, 0, MEM_RELEASE);
+        }
     }
 
     /// With no time for it in the frame, nothing is made read-only.
