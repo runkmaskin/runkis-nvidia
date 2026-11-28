@@ -18,6 +18,13 @@
 //! instruction with the trap flag set and the page is read-only again
 //! behind it.
 //!
+//! What it may cost is bounded: Windows is asked what memory is once per
+//! range a sample, making pages read-only takes at most
+//! `VICTORY_WRITE_CENSUS_ARM_MS` (8) of a frame, and a thread of its own
+//! ends the sample (every page read-write again, what was counted written)
+//! when no frame came for `VICTORY_WRITE_CENSUS_STALL_MS` (2000) or after a
+//! minute.
+//!
 //! Guarded view memory (`crate::watch`) faults at its first store into a
 //! 64 KiB block already: those faults are noted as they are taken
 //! ([`guard_fault`]), nothing more is done to that memory.
@@ -123,6 +130,18 @@ struct Settings {
     at: Vec<u64>,
     frames: u64,
     stores: u32,
+    /// Microseconds a frame the refreshes may spend making pages read-only.
+    arm_us: u64,
+    /// Milliseconds without a frame after which the sample ends.
+    stall_ms: u64,
+}
+
+/// How a sample is taken (what [`Settings`] asks of it).
+#[derive(Clone, Copy)]
+struct Limits {
+    stores: u32,
+    arm_us: u64,
+    stall_ms: u64,
 }
 
 fn settings() -> Option<&'static Settings> {
@@ -136,6 +155,8 @@ fn settings() -> Option<&'static Settings> {
                 at: times(&var("VICTORY_WRITE_CENSUS_AT").unwrap_or_else(|| "120,180,240".into())),
                 frames: var("VICTORY_WRITE_CENSUS_FRAMES").and_then(|v| v.trim().parse().ok()).unwrap_or(30).max(1),
                 stores: var("VICTORY_WRITE_CENSUS_STORES").and_then(|v| v.trim().parse().ok()).unwrap_or(1).clamp(1, 64),
+                arm_us: var("VICTORY_WRITE_CENSUS_ARM_MS").and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(8) * 1000,
+                stall_ms: var("VICTORY_WRITE_CENSUS_STALL_MS").and_then(|v| v.trim().parse().ok()).unwrap_or(2000).max(100),
             })
         })
         .as_ref()
@@ -191,6 +212,11 @@ struct Totals {
     overflow: u64,
     kernel_ranges: u64,
     forgotten_pages: u64,
+    /// Questions to Windows about what memory is (once per range a sample).
+    queries: u64,
+    /// Refreshes whose pages were left as they were: the frame's time for
+    /// making pages read-only was spent.
+    over_budget: u64,
 }
 
 /// Ranges of addresses, joined where they meet or touch: start, end.
@@ -218,6 +244,50 @@ impl Ranges {
     fn full(&self) -> bool {
         self.0.len() >= MOST_KERNEL_RANGES
     }
+
+    /// The parts of `[from, to)` no range holds.
+    fn gaps(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut at = from;
+        // (The one that starts before `from` and the ones that start inside.)
+        let before = self.0.range(..from).next_back().map(|(&a, &e)| (a, e));
+        for (a, e) in before.into_iter().chain(self.0.range(from..to).map(|(&a, &e)| (a, e))) {
+            if e <= at {
+                continue;
+            }
+            if a > at {
+                out.push((at, a.min(to)));
+            }
+            at = at.max(e);
+            if at >= to {
+                break;
+            }
+        }
+        if at < to {
+            out.push((at, to));
+        }
+        out
+    }
+
+    /// `[from, to)` is held by no range any more.
+    fn cut(&mut self, from: usize, to: usize) {
+        let met: Vec<(usize, usize)> = self
+            .0
+            .range(..to)
+            .rev()
+            .take_while(|(_, e)| **e > from)
+            .map(|(&a, &e)| (a, e))
+            .collect();
+        for (a, e) in met {
+            self.0.remove(&a);
+            if a < from {
+                self.0.insert(a, from);
+            }
+            if e > to {
+                self.0.insert(to, e);
+            }
+        }
+    }
 }
 
 /// Everything of a sample.
@@ -233,8 +303,19 @@ struct State {
     /// Our own image, and the title's images (base addresses).
     own: usize,
     titles: Vec<usize>,
-    /// The protection each 64 KiB block had where it was made read-only.
-    blocks: HashMap<usize, u32>,
+    /// Memory asked about this sample (`known`), and of it the committed
+    /// private read-write runs (start: end, protection), which alone are
+    /// made read-only. Windows is asked once per range: in the title's big
+    /// pools one question walks page tables for milliseconds, and asking at
+    /// every refresh, under the lock every fault waits for, stopped the
+    /// title's frames until its watchdog ended it (run census-051943).
+    known: Ranges,
+    plain: BTreeMap<usize, (usize, u32)>,
+    /// Microseconds spent making pages read-only this frame, and the most.
+    frame_arm_us: u64,
+    arm_us: u64,
+    /// Why the sample ended.
+    ended: &'static str,
     /// Ranges the kernel wrote: not made read-only again.
     kernel: Ranges,
     /// Host copies refreshed: by start and length, and by start alone.
@@ -405,9 +486,9 @@ impl State {
     }
 }
 
-/// The protection a page of `block` is given back.
-fn protection(s: &State, block: usize) -> u32 {
-    s.blocks.get(&block).copied().unwrap_or(PAGE_READWRITE)
+/// The protection the page at `at` had where it was made read-only.
+fn protection(s: &State, at: usize) -> u32 {
+    s.plain.range(..=at).next_back().filter(|(_, (e, _))| *e > at).map_or(PAGE_READWRITE, |(_, &(_, p))| p)
 }
 
 /// The read-only form of `protection` (its other bits kept).
@@ -436,31 +517,99 @@ fn open_pages(s: &State, first: usize, last: usize) -> u64 {
     let mut opened = 0;
     let mut page = next(first, last, true);
     while page < last {
-        let block = page * PAGE / BLOCK;
-        // (A run within one block: one protection.)
-        let end = next(page, last.min((block + 1) * BLOCK / PAGE), false);
+        // (A run within one of the runs it was made read-only in: one protection.)
+        let at = page * PAGE;
+        let run_end = s.plain.range(..=at).next_back().filter(|(_, (e, _))| *e > at).map_or(page + 1, |(_, &(e, _))| e / PAGE);
+        let end = next(page, last.min(run_end), false);
         for p in page..end {
             mark(p, false);
         }
-        protect(page * PAGE, (end - page) * PAGE, protection(s, block));
+        protect(at, (end - page) * PAGE, protection(s, at));
         opened += (end - page) as u64;
-        page = end;
+        page = next(end, last, true);
     }
     opened
 }
 
-/// Makes the write-watched pages of `[from, to)` that are not read-only yet
-/// read-only (committed private read-write pages only).
-fn arm(s: &mut State, from: usize, to: usize) {
-    let started = std::time::Instant::now();
-    let (first, last) = (from / PAGE, to.div_ceil(PAGE).min(PAGES));
-    let mut page = next(first, last, false);
-    while page < last {
-        let end = next(page, last, true);
-        arm_run(s, page * PAGE, end * PAGE);
-        page = next(end, last, false);
+/// Asks Windows what `[from, to)` is where it was not asked this sample,
+/// and keeps its committed private read-write runs.
+fn learn(s: &mut State, from: usize, to: usize, started: std::time::Instant) {
+    for (gap, gap_end) in s.known.gaps(from, to) {
+        let mut at = gap;
+        while at < gap_end {
+            if !ACTIVE.load(Relaxed) || s.frame_arm_us + started.elapsed().as_micros() as u64 >= s.arm_us {
+                // (The rest is asked about at a later refresh.)
+                s.known.add(gap, at);
+                s.totals.over_budget += 1;
+                return;
+            }
+            s.totals.queries += 1;
+            let Some(info) = query(at) else {
+                break;
+            };
+            let end = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(gap_end);
+            if end <= at {
+                break;
+            }
+            let plain = info.State == MEM_COMMIT
+                && info.Type == MEM_PRIVATE
+                && info.Protect & 0xff == PAGE_READWRITE
+                && info.Protect & PAGE_GUARD == 0;
+            if plain {
+                s.plain.insert(at, (end, info.Protect));
+            }
+            at = end;
+        }
+        s.known.add(gap, gap_end);
     }
-    s.totals.arm_us += started.elapsed().as_micros() as u64;
+}
+
+/// Makes the write-watched pages of `[from, to)` that are not read-only yet
+/// read-only (committed private read-write pages only), within the frame's
+/// time for it.
+fn arm(s: &mut State, from: usize, to: usize) {
+    if s.frame_arm_us >= s.arm_us {
+        s.totals.over_budget += 1;
+        return;
+    }
+    let started = std::time::Instant::now();
+    let (from, to) = (from / PAGE * PAGE, to.div_ceil(PAGE).min(PAGES) * PAGE);
+    if from < to && !s.kernel.full() {
+        learn(s, from, to, started);
+        // The plain runs that meet the range (they do not overlap).
+        let runs: Vec<(usize, usize, u32)> = s
+            .plain
+            .range(..to)
+            .rev()
+            .take_while(|(_, (e, _))| *e > from)
+            .map(|(&a, &(e, p))| (a.max(from), e.min(to), p))
+            .collect();
+        'runs: for (a, e, p) in runs.into_iter().rev() {
+            let (last, mut page) = (e / PAGE, next(a / PAGE, e / PAGE, false));
+            while page < last {
+                if !ACTIVE.load(Relaxed) || s.frame_arm_us + started.elapsed().as_micros() as u64 >= s.arm_us {
+                    s.totals.over_budget += 1;
+                    break 'runs;
+                }
+                let end = next(page, last, true);
+                if !s.kernel.meets(page * PAGE, end * PAGE) {
+                    if protect(page * PAGE, (end - page) * PAGE, read_only(p)) {
+                        for q in page..end {
+                            mark(q, true);
+                            s.traps.remove(&q);
+                        }
+                        s.totals.armed_pages += (end - page) as u64;
+                    } else {
+                        s.totals.refused += 1;
+                    }
+                }
+                page = next(end, last, false);
+            }
+        }
+    }
+    let us = started.elapsed().as_micros() as u64;
+    s.frame_arm_us += us;
+    s.totals.arm_us += us;
 }
 
 /// The first page from `page` on, below `last`, whose bit is `set` (`last`
@@ -478,43 +627,6 @@ fn next(mut page: usize, last: usize, set: bool) -> usize {
         page = (page / 64 + 1) * 64;
     }
     last
-}
-
-fn arm_run(s: &mut State, from: usize, to: usize) {
-    if s.kernel.full() || s.kernel.meets(from, to) {
-        return;
-    }
-    let mut at = from;
-    while at < to {
-        let Some(info) = query(at) else {
-            return;
-        };
-        let end = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(to);
-        if end <= at {
-            return;
-        }
-        let plain = info.State == MEM_COMMIT
-            && info.Type == MEM_PRIVATE
-            && info.Protect & 0xff == PAGE_READWRITE
-            && info.Protect & PAGE_GUARD == 0;
-        // One protection per 64 KiB block, as it is given back.
-        let same = (at / BLOCK..end.div_ceil(BLOCK)).all(|b| s.blocks.get(&b).is_none_or(|&p| p == info.Protect));
-        if plain && same {
-            if protect(at, end - at, read_only(info.Protect)) {
-                for b in at / BLOCK..end.div_ceil(BLOCK) {
-                    s.blocks.insert(b, info.Protect);
-                }
-                for p in at / PAGE..end / PAGE {
-                    mark(p, true);
-                    s.traps.remove(&p);
-                }
-                s.totals.armed_pages += ((end - at) / PAGE) as u64;
-            } else {
-                s.totals.refused += 1;
-            }
-        }
-        at = end;
-    }
 }
 
 /// A refresh of the host copy of the title buffer `[start, start + len)`
@@ -577,17 +689,25 @@ pub(crate) fn forget(at: usize, len: usize) {
         return;
     };
     s.generation += 1;
-    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE).min(PAGES));
-    for page in first..last {
-        if armed(page) {
-            mark(page, false);
-            s.totals.forgotten_pages += 1;
+    let end = at.saturating_add(len);
+    let (first, last) = (at / PAGE, end.div_ceil(PAGE).min(PAGES));
+    let mut page = next(first, last, true);
+    while page < last {
+        let run = next(page, last, false);
+        for p in page..run {
+            mark(p, false);
         }
+        s.totals.forgotten_pages += (run - page) as u64;
+        page = next(run, last, true);
     }
-    // Blocks wholly inside: their protection is the next allocation's.
-    for block in at.div_ceil(BLOCK)..at.saturating_add(len) / BLOCK {
-        s.blocks.remove(&block);
+    // What was known of the memory there is asked again when it is refreshed.
+    let met: Vec<(usize, usize)> =
+        s.plain.range(..end).rev().take_while(|(_, (e, _))| *e > at).map(|(&a, &(e, _))| (a, e)).collect();
+    for &(a, _) in &met {
+        s.plain.remove(&a);
     }
+    let (from, to) = met.iter().fold((at, end), |(f, t), &(a, e)| (f.min(a), t.max(e)));
+    s.known.cut(from, to);
 }
 
 /// A write fault of the title's on guarded view memory at `at`, taken by
@@ -635,7 +755,7 @@ fn written(context: &mut CONTEXT, at: usize) -> bool {
     }
     s.note(context, who, at, traps == 0, Kind::Watched);
     mark(page, false);
-    protect(page * PAGE, PAGE, protection(s, block));
+    protect(page * PAGE, PAGE, protection(s, page * PAGE));
     if s.traps.contains_key(&page) || s.traps.len() < TRAPS {
         *s.traps.entry(page).or_default() += 1;
     }
@@ -674,7 +794,7 @@ fn stepped(context: &mut CONTEXT) -> bool {
         if s.kernel.meets(at, at + PAGE) {
             continue;
         }
-        if protect(at, PAGE, read_only(protection(s, at / BLOCK))) {
+        if protect(at, PAGE, read_only(protection(s, at))) {
             mark(page, true);
         }
     }
@@ -737,15 +857,16 @@ fn images() -> (usize, Vec<usize>) {
     }
 }
 
-/// Begins a sample: `stores` stores counted per page between refreshes.
-fn begin(stores: u32, after: u64) -> bool {
+/// Begins a sample.
+fn begin(limits: Limits, after: u64) -> bool {
     if !make_bits() {
         return false;
     }
     install();
     let (own, titles) = images();
     let mut s = State {
-        stores,
+        stores: limits.stores,
+        arm_us: limits.arm_us,
         after,
         own,
         titles,
@@ -756,9 +877,75 @@ fn begin(stores: u32, after: u64) -> bool {
     s.site_regions.reserve(SITE_REGIONS + 1);
     s.traps.reserve(TRAPS + 1);
     *state() = Some(s);
+    LAST_FRAME_MS.store(now_ms(), Relaxed);
     ACTIVE.store(true, Relaxed);
+    watchdog(limits.stall_ms);
     true
 }
+
+/// Milliseconds since the first question.
+fn now_ms() -> u64 {
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// When the last frame of a sample was presented ([`now_ms`]).
+static LAST_FRAME_MS: AtomicU64 = AtomicU64::new(0);
+/// Samples ended so far (the next one's number).
+static MADE: AtomicU64 = AtomicU64::new(0);
+/// The longest a sample may take, whatever its frames.
+const MOST_MS: u64 = 60_000;
+
+/// A thread of its own ends the sample when no frame came for `stall_ms`
+/// (or the sample has lasted [`MOST_MS`]): every page gets its protection
+/// back and what was counted is written. The census must never hold the
+/// title's frames up for long; this does not wait for a frame to come.
+fn watchdog(stall_ms: u64) {
+    let began = now_ms();
+    std::thread::spawn(move || {
+        while ACTIVE.load(Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let now = now_ms();
+            let stalled = now.saturating_sub(LAST_FRAME_MS.load(Relaxed)) >= stall_ms;
+            if ACTIVE.load(Relaxed) && (stalled || now - began >= MOST_MS) {
+                // (Arming in progress sees this and lets go of the lock.)
+                ACTIVE.store(false, Relaxed);
+                finish(if stalled { "no frame came for the time allowed (VICTORY_WRITE_CENSUS_STALL_MS)" } else { "it lasted a minute" });
+                return;
+            }
+        }
+    });
+}
+
+/// Ends a sample and writes what it counted, if there is one.
+fn finish(why: &'static str) {
+    let Some((mut s, ms)) = end() else {
+        return;
+    };
+    s.ended = why;
+    let n = MADE.fetch_add(1, Relaxed);
+    let Some(settings) = settings() else {
+        #[cfg(test)]
+        {
+            *ENDED.lock().unwrap_or_else(|e| e.into_inner()) = Some((why, s.totals.armed_pages));
+        }
+        return;
+    };
+    let file = format!("{}.{n}.txt", settings.file);
+    if why != "its frames were taken" {
+        tracing::warn!(why, frames = s.frames, "write census sample ended early (VICTORY_WRITE_CENSUS)");
+    }
+    std::thread::spawn(move || {
+        let text = report(&s, ms, &name);
+        match std::fs::write(&file, text) {
+            Ok(()) => tracing::info!(file, sites = s.sites.len(), "write census written (VICTORY_WRITE_CENSUS)"),
+            Err(e) => tracing::warn!(file, %e, "write census not written"),
+        }
+    });
+}
+
+#[cfg(test)]
+static ENDED: Mutex<Option<(&'static str, u64)>> = Mutex::new(None);
 
 /// Ends a sample: every page is given its protection back. What was
 /// counted, and the milliseconds the sample took.
@@ -767,36 +954,9 @@ fn end() -> Option<(State, f64)> {
     ACTIVE.store(false, Relaxed);
     let s = guard.as_mut()?;
     s.generation += 1;
-    let blocks: Vec<usize> = s.blocks.keys().copied().collect();
-    for block in blocks {
-        let (first, last) = (block * BLOCK / PAGE, (block + 1) * BLOCK / PAGE);
-        let protection = protection(s, block);
-        let mut page = first;
-        while page < last {
-            if !armed(page) {
-                page += 1;
-                continue;
-            }
-            // A run read-only by our hand, as far as one protection goes
-            // (the title may have changed a protection there since: then
-            // it is left as the title made it).
-            let info = query(page * PAGE);
-            let mut end = page + 1;
-            while end < last && armed(end) {
-                end += 1;
-            }
-            if let Some(info) = info {
-                let region_end = (info.BaseAddress as usize + info.RegionSize) / PAGE;
-                end = end.min(region_end.max(page + 1));
-                if info.Protect == read_only(protection) {
-                    protect(page * PAGE, (end - page) * PAGE, protection);
-                }
-            }
-            for p in page..end {
-                mark(p, false);
-            }
-            page = end;
-        }
+    let runs: Vec<(usize, usize)> = s.plain.iter().map(|(&a, &(e, _))| (a, e)).collect();
+    for (a, e) in runs {
+        open_pages(s, a / PAGE, (e / PAGE).min(PAGES));
     }
     let ms = s.began.map_or(0.0, |b| b.elapsed().as_secs_f64() * 1e3);
     let taken = guard.take()?;
@@ -806,41 +966,31 @@ fn end() -> Option<(State, f64)> {
 /// A frame was presented: samples begin and end here.
 pub(crate) fn frame() {
     static BEGAN: OnceLock<std::time::Instant> = OnceLock::new();
-    static MADE: AtomicU64 = AtomicU64::new(0);
     let began = *BEGAN.get_or_init(std::time::Instant::now);
     let Some(settings) = settings() else {
         return;
     };
     if ACTIVE.load(Relaxed) {
+        LAST_FRAME_MS.store(now_ms(), Relaxed);
         let frames = {
             let mut guard = state();
             let Some(s) = guard.as_mut() else {
                 return;
             };
             s.frames += 1;
+            s.frame_arm_us = 0;
             s.frames
         };
-        if frames < settings.frames {
-            return;
+        if frames >= settings.frames {
+            finish("its frames were taken");
         }
-        let Some((s, ms)) = end() else {
-            return;
-        };
-        let file = format!("{}.{}.txt", settings.file, MADE.fetch_add(1, Relaxed));
-        std::thread::spawn(move || {
-            let text = report(&s, ms, &name);
-            match std::fs::write(&file, text) {
-                Ok(()) => tracing::info!(file, sites = s.sites.len(), "write census written (VICTORY_WRITE_CENSUS)"),
-                Err(e) => tracing::warn!(file, %e, "write census not written"),
-            }
-        });
     } else if let Some(&at) = settings.at.get(MADE.load(Relaxed) as usize) {
-        if began.elapsed().as_secs() >= at && begin(settings.stores, at) {
+        let limits = Limits { stores: settings.stores, arm_us: settings.arm_us, stall_ms: settings.stall_ms };
+        if began.elapsed().as_secs() >= at && begin(limits, at) {
             tracing::info!(frames = settings.frames, stores = settings.stores, "write census sample begun (VICTORY_WRITE_CENSUS)");
         }
     }
 }
-
 /// `image+offset` of a code address.
 fn name(address: usize) -> String {
     match crate::titlewrite::place(address) {
@@ -868,11 +1018,20 @@ fn report(s: &State, ms: f64, name: &dyn Fn(usize) -> String) -> String {
     let _ = writeln!(
         out,
         "write census (VICTORY_WRITE_CENSUS): {} frames from {} s after the start, {:.1} ms a frame with the census's faults; \
-         the first {} store(s) into a page between two refreshes counted",
+         the first {} store(s) into a page between two refreshes counted; ended as {}",
         s.frames,
         s.after,
         ms / frames,
-        s.stores
+        s.stores,
+        s.ended
+    );
+    let _ = writeln!(
+        out,
+        "making pages read-only: {:.1} ms a frame allowed (VICTORY_WRITE_CENSUS_ARM_MS), {:.1} refreshes a frame left as they were for want of it; \
+         {} questions to Windows about memory in the sample",
+        s.arm_us as f64 / 1e3,
+        per(t.over_budget),
+        t.queries
     );
     let _ = writeln!(
         out,
@@ -1007,11 +1166,80 @@ mod tests {
         query(at).unwrap().Protect
     }
 
+    /// The tests that take samples, one at a time (a sample is the process's).
+    static ONE: Mutex<()> = Mutex::new(());
+
+    /// Fresh read-write memory below 1 TiB, or `None`.
+    fn memory(size: usize) -> Option<usize> {
+        // SAFETY: a fresh allocation of the test's.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        if at / PAGE + size / PAGE >= PAGES {
+            // SAFETY: as above.
+            unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+            return None;
+        }
+        Some(at)
+    }
+
+    /// With no time for it in the frame, nothing is made read-only.
+    #[test]
+    fn arming_keeps_to_its_time() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let size = 8 * PAGE;
+        let Some(at) = memory(size) else { return };
+        assert!(begin(Limits { stores: 1, arm_us: 0, stall_ms: 60_000 }, 0));
+        AS_TITLE.set(true);
+        refreshed(at, size, at, at + size, 0, Kind::Watched);
+        assert_eq!(protection_at(at), PAGE_READWRITE);
+        assert!(!armed(at / PAGE));
+        AS_TITLE.set(false);
+        let (s, _) = end().unwrap();
+        assert_eq!((s.totals.armed_pages, s.totals.over_budget), (0, 1));
+        // SAFETY: the test's own memory.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A sample whose frames stop is ended by its watchdog: every page is
+    /// read-write again, without a frame coming (run census-051943 hung
+    /// with its pages read-only).
+    #[test]
+    fn a_sample_without_frames_ends_by_itself() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let size = 8 * PAGE;
+        let Some(at) = memory(size) else { return };
+        *ENDED.lock().unwrap() = None;
+        assert!(begin(Limits { stores: 1, arm_us: u64::MAX / 4, stall_ms: 200 }, 0));
+        AS_TITLE.set(true);
+        refreshed(at, size, at, at + size, 0, Kind::Watched);
+        AS_TITLE.set(false);
+        assert_eq!(protection_at(at) & 0xff, PAGE_READONLY);
+        let began = std::time::Instant::now();
+        while ACTIVE.load(Relaxed) && began.elapsed().as_secs() < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!ACTIVE.load(Relaxed), "the watchdog ended it");
+        assert!(began.elapsed().as_millis() >= 100, "not before the time allowed: {:?}", began.elapsed());
+        while ENDED.lock().unwrap().is_none() && began.elapsed().as_secs() < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let (why, armed_pages) = ENDED.lock().unwrap().unwrap();
+        assert!(why.starts_with("no frame came"), "{why}");
+        assert_eq!(armed_pages, 8);
+        for page in 0..8 {
+            assert_eq!(protection_at(at + page * PAGE), PAGE_READWRITE, "page {page}");
+            assert!(!armed(at / PAGE + page));
+        }
+        // SAFETY: the test's own memory.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
     /// Stores into pages a refresh took fault once each, are noted and go
     /// on; a refresh takes them again; a kernel write opens its range; the
     /// end gives every page its protection back.
     #[test]
     fn stores_into_copied_pages_are_counted_and_done() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: fresh memory of the test's, written by it alone.
         unsafe {
             let size = 16 * PAGE;
@@ -1022,11 +1250,13 @@ mod tests {
                 VirtualFree(at as *mut _, 0, MEM_RELEASE);
                 return;
             }
-            assert!(begin(3, 0));
+            assert!(begin(Limits { stores: 3, arm_us: u64::MAX / 4, stall_ms: 60_000 }, 0));
             AS_TITLE.set(true);
             refreshed(at, size, at, at + size, 123, Kind::Watched);
             assert_eq!(protection_at(at) & 0xff, PAGE_READONLY);
             assert!(armed(at / PAGE + 2));
+            let asked = state().as_ref().unwrap().totals.queries;
+            assert!(asked >= 1);
             let p = at as *mut u64;
             // Page 2: one store. Page 5: five stores, three of them counted.
             p.add(2 * PAGE / 8).write_volatile(7);
@@ -1049,6 +1279,9 @@ mod tests {
             // Taken again: page 2 faults once more as a first store.
             refreshed(at, size, at, at + size, 0, Kind::Watched);
             assert!(armed(at / PAGE + 2));
+            // Taking pages again asks Windows nothing more: asking at every
+            // refresh, under the lock faults wait for, hung run census-051943.
+            assert_eq!(state().as_ref().unwrap().totals.queries, asked);
             p.add(2 * PAGE / 8 + 1).write_volatile(8);
             // A kernel write: its pages open and stay so.
             disarm(at + 8 * PAGE, 2 * PAGE);
@@ -1092,5 +1325,12 @@ mod tests {
         r.add(50, 120);
         r.add(390, 450);
         assert_eq!(r.0.iter().collect::<Vec<_>>(), vec![(&50, &450)]);
+        assert_eq!(r.gaps(0, 500), vec![(0, 50), (450, 500)]);
+        assert!(r.gaps(60, 70).is_empty());
+        r.cut(100, 200);
+        assert_eq!(r.0.iter().collect::<Vec<_>>(), vec![(&50, &100), (&200, &450)]);
+        assert_eq!(r.gaps(0, 300), vec![(0, 50), (100, 200)]);
+        r.cut(0, 1000);
+        assert!(r.0.is_empty());
     }
 }
