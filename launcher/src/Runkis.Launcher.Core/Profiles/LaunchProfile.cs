@@ -54,6 +54,12 @@ public sealed class LaunchProfile
     public bool SmoothMotionCopy { get; set; }
     /// <summary>-WarmLimit for the pipeline warm-up (0: all).</summary>
     public int WarmLimit { get; set; }
+    /// <summary>
+    /// The full warm-up: every pipeline earlier plays recorded (-Warm alone), not only those they drew with
+    /// (-Warm -WarmUsed, the fast one). Chosen per warm-up, not saved.
+    /// </summary>
+    [JsonIgnore]
+    public bool WarmAll { get; set; }
 
     // ---- Picture (VN_* variables the script turns into VICTORY_* settings) ----
     /// <summary>VN_AIR -> VICTORY_AMBIENT_AIR: how much the air may scatter (indoor haze).</summary>

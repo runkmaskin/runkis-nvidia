@@ -184,7 +184,7 @@ the launcher's names and defaults against the layer's own lists.
 A switch at the bottom of the sidebar, remembered in `%APPDATA%\RunkisLauncher\launcher.json` (`DevMode`).
 
 - **Play mode** (the default) shows the pages a player needs: Play, Settings and Controls. The Play page has the
-  game, Start as, PLAY, Warm up shaders, the fps, frame time, 1 % low and hitch tiles, the frame-time graph, and
+  game, Start as, PLAY, the two warm-ups (below), the fps, frame time, 1 % low and hitch tiles, the frame-time graph, and
   the setup checks that did not pass, one line each. Settings shows the profile, the game, Display (mode, window
   size, monitor, upscale, sharpening), render height, graphics card, and the picture fixes as checkboxes
   (Quality mode, hair physics, decals and heat haze).
@@ -193,6 +193,21 @@ A switch at the bottom of the sidebar, remembered in `%APPDATA%\RunkisLauncher\l
   light values, Performance, Diagnostics (DRED, log filter, panel, warm-up limit) and the effective settings.
 
 Hidden fields keep their values; Play mode only hides them.
+
+## Warm-up (Play page)
+
+Both translate every shader into the cache first (`victory shaders`), then build pipelines into the driver's cache
+(`victory warm`), with the progress bar and the time left.
+
+- **Warm up (what you've played)**, the default: `-Warm -WarmUsed` (`victory warm --used`), only the pipelines
+  earlier plays drew with, those of the latest play first.
+- **Full warm-up (everything recorded)**: `-Warm` (`victory warm`), every pipeline the game has created, drawn
+  with or not. The pipelines drawn with come first here too.
+
+`victory warm` first names each pipeline by what the driver is given (the bar says "Finding the pipelines that
+are the same"), builds one of each, and keeps what it built by that name: after a new build only the pipelines
+whose translated code changed are built again. Dev mode's Build pipeline cache is the full one, without the
+translation step.
 
 ## Display (Settings page)
 

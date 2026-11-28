@@ -38,7 +38,7 @@ const STAGES: [&str; 8] =
     ["vertex", "pixel", "domain", "hull", "geometry", "compute", "amplification", "mesh"];
 
 /// `VICTORY_PIPELINE_BOOK=1`: the pipelines the title creates are kept.
-fn on() -> bool {
+pub(super) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_BOOK").is_some_and(|v| v == "1"))
 }
@@ -84,6 +84,12 @@ fn book() -> Option<&'static Mutex<Book>> {
             }
         });
         spawned.ok()?;
+        if warm_in_play() {
+            let at = dir.clone();
+            if let Err(e) = crate::named::spawn("victory-warm-play", move || play_warm(&at)) {
+                tracing::warn!(error = %e, "VICTORY_WARM_IN_PLAY: no warm-up beside the run");
+            }
+        }
         Some(Mutex::new(Book { dir, keys, shaders, new: Default::default(), added: 0 }))
     })
     .as_ref()
@@ -95,6 +101,13 @@ pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&Graphic
     let mut id = [0u8; 16];
     for (at, b) in id.iter_mut().enumerate() {
         *b = key.get(2 * at..2 * at + 2).and_then(|x| u8::from_str_radix(x, 16).ok()).unwrap_or(0);
+    }
+    if warm_in_play() && !shaders.is_empty() {
+        let mut created = CREATED.lock().unwrap_or_else(|e| e.into_inner());
+        let created = created.get_or_insert_default();
+        if created.0.insert(id) {
+            created.1.push(id);
+        }
     }
     let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
     if shaders.is_empty() || !book.keys.insert(id) {
@@ -122,6 +135,123 @@ pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&Graphic
     book.new[1].extend((entry.len() as u32).to_le_bytes());
     book.new[1].extend(entry);
     book.added += 1;
+}
+
+/// `VICTORY_WARM_IN_PLAY=1` (with the book on): while the title runs,
+/// `victory warm` builds the recorded pipelines not yet in the driver's
+/// cache beside it ([`play_warm`]), those the title created in this run
+/// first, the latest first: they are of the place being played, and the
+/// likeliest to be drawn with next. Its processes run at idle priority, on
+/// the cores the run leaves free, and only while the run's own pipeline
+/// workers have nothing waiting. Off by default: a run is CPU-bound, and
+/// what it costs in frames is not measured enough yet (docs/changes-2026-11-27.md).
+fn warm_in_play() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WARM_IN_PLAY").is_some_and(|v| v == "1"))
+}
+
+/// With [`warm_in_play`]: the keys of the pipelines this run created, in
+/// the order it created them.
+#[allow(clippy::type_complexity)]
+static CREATED: Mutex<Option<(HashSet<[u8; 16]>, Vec<[u8; 16]>)>> = Mutex::new(None);
+
+/// The file of the keys [`play_warm`] has made first.
+const PLAY_FIRST: &str = "play-created.txt";
+
+/// The warm-up beside the run ([`warm_in_play`]): a minute after the book
+/// opens (past the start's own compiles), batches of `victory warm`, each
+/// told the run's pipelines first. The processes are in a job that ends
+/// them with the run.
+fn play_warm(dir: &Path) {
+    use std::io::BufRead;
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
+    use std::time::Duration;
+    const START_AFTER: Duration = Duration::from_secs(60);
+    const BATCH: usize = 200;
+    const IDLE_PRIORITY_CLASS: u32 = 0x40;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let jobs = std::env::var("VICTORY_WARM_IN_PLAY_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2).max(1);
+    std::thread::sleep(START_AFTER);
+    let (Some(job), Ok(exe)) = (kill_on_close_job(), std::env::current_exe()) else {
+        tracing::warn!("VICTORY_WARM_IN_PLAY: no job for the warm-up's processes; none is started");
+        return;
+    };
+    let first = dir.join(PLAY_FIRST);
+    loop {
+        // The run's own pipeline workers have work: theirs comes first.
+        if super::make::waiting() > 0 {
+            std::thread::sleep(Duration::from_secs(2));
+            continue;
+        }
+        let keys: Vec<String> = {
+            let created = CREATED.lock().unwrap_or_else(|e| e.into_inner());
+            created
+                .iter()
+                .flat_map(|c| c.1.iter().rev())
+                .map(|id| id.iter().map(|b| format!("{b:02x}")).collect())
+                .collect()
+        };
+        if std::fs::write(&first, keys.join("\n")).is_err() {
+            return;
+        }
+        let began = std::time::Instant::now();
+        let child = std::process::Command::new(&exe)
+            .arg("warm")
+            .arg("--first")
+            .arg(&first)
+            .args(["--limit", &BATCH.to_string(), "--jobs", &jobs.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(IDLE_PRIORITY_CLASS | CREATE_NO_WINDOW)
+            .spawn();
+        let Ok(mut child) = child else { return };
+        // SAFETY: a job of ours and the process just started.
+        unsafe { windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(job, child.as_raw_handle()) };
+        let (mut nothing, mut said) = (false, String::new());
+        if let Some(out) = child.stdout.take() {
+            for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                nothing |= line.starts_with("nothing to make");
+                if line.contains(" made in ") {
+                    said = line;
+                }
+            }
+        }
+        let _ = child.wait();
+        tracing::info!(
+            seconds = began.elapsed().as_secs(),
+            first = keys.len(),
+            said = %said,
+            "VICTORY_WARM_IN_PLAY: pipelines built beside the run"
+        );
+        if nothing {
+            // All made: again once the run has created more.
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+}
+
+/// A job whose processes end when its last handle closes: when the run ends,
+/// however it ends.
+fn kill_on_close_job() -> Option<windows_sys::Win32::Foundation::HANDLE> {
+    use windows_sys::Win32::System::JobObjects::*;
+    // SAFETY: plain calls; the limit structure is of the size given.
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return None;
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let set = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        (set != 0).then_some(job)
+    }
 }
 
 /// Writes what was noted.
@@ -210,17 +340,84 @@ pub fn fingerprint() -> String {
     h.finalize().to_hex()[..16].to_owned()
 }
 
+/// What a driver's cached pipeline depends on besides its host description
+/// (`names`): the driver.
+pub fn driver_fingerprint() -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(b"driver");
+    if let Some(host) = crate::host::host() {
+        h.update(&host.driver().to_le_bytes());
+    }
+    h.finalize().to_hex()[..16].to_owned()
+}
+
+/// The physical memory free now, in MB.
+pub fn free_memory_mb() -> Option<u64> {
+    crate::host::available_physical_ram().map(|b| b >> 20)
+}
+
 /// The translations of earlier runs are in `dir` (the pipeline library is
 /// not used: what is made here is the driver's to keep).
 pub fn use_translations(dir: PathBuf) {
     crate::shader_cache::use_shader_cache(dir);
 }
 
+/// What came of one pipeline in [`make`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Made {
+    /// Milliseconds in all.
+    pub ms: f64,
+    /// Of them, translating its shaders (or reading them from the cache).
+    pub translate_ms: f64,
+    /// Whether there is a host pipeline.
+    pub there: bool,
+}
+
+/// Stages the host pipelines are made of ([`HostPipeline::new`]): only these
+/// are translated before the pipeline is made, so that the time of the
+/// translations is told apart from the driver's.
+const MADE_OF: [&str; 4] = ["vertex", "pixel", "mesh", "compute"];
+
 /// Makes the host pipelines of those of `which` (numbers in the file) and
 /// lets each go again: the driver's cache on disk keeps them. `each` is told
-/// the number before, and what came of it after: milliseconds and whether
-/// there is one.
-pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64, bool)>)) {
+/// the number before, and what came of it after.
+pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<Made>)) {
+    walk_entries(dir, which, |n, entry, read| {
+        each(n, None);
+        let began = std::time::Instant::now();
+        let parsed = parse(entry, read);
+        if let Some((shaders, _)) = &parsed {
+            for s in shaders.iter().filter(|s| MADE_OF.contains(&s.stage)) {
+                s.translated();
+            }
+        }
+        let translate_ms = began.elapsed().as_secs_f64() * 1e3;
+        let there = parsed.and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref())).is_some();
+        each(n, Some(Made { ms: began.elapsed().as_secs_f64() * 1e3, translate_ms, there }));
+    });
+}
+
+/// The name each of `which` has in the pipeline library: the hash of all
+/// that its host description holds (the translated shaders' code, the root
+/// signature, the state; `library::name`), found without making it. `None`:
+/// it gets no host pipeline (a shader that does not translate, a stage the
+/// host is not given). Two pipelines of one name are one pipeline to the
+/// driver, and a name that stays the same across a change of the translator
+/// is a pipeline whose driver cache entry is still good.
+pub fn names(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<String>)) {
+    walk_entries(dir, which, |n, entry, read| {
+        let name = parse(entry, read).and_then(|(shaders, g)| {
+            let (name, _) = super::library::name_only(|| HostPipeline::new(&shaders, g.as_deref()));
+            name
+        });
+        each(n, name);
+    });
+}
+
+/// Calls `f` with each of `which` (numbers in the file), in that order: its
+/// entry and a reader of the containers by hash.
+#[allow(clippy::type_complexity)]
+fn walk_entries(dir: &Path, which: &[usize], mut f: impl FnMut(usize, &[u8], &mut dyn FnMut(&[u8; 32]) -> Option<Vec<u8>>)) {
     let mut places = HashMap::new();
     walk_shaders(dir, |stage, hash, at, len| {
         places.insert(hash, (stage, at, len));
@@ -242,19 +439,14 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
     };
     for n in which {
         let Some(entry) = entries.get(n) else { continue };
-        each(*n, None);
-        let began = std::time::Instant::now();
-        let made = parse(entry, &mut read)
-            .and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref()))
-            .is_some();
-        each(*n, Some((began.elapsed().as_secs_f64() * 1e3, made)));
+        f(*n, entry, &mut read);
     }
 }
 
 #[allow(clippy::type_complexity)]
 fn parse(
     entry: &[u8],
-    read: &mut impl FnMut(&[u8; 32]) -> Option<Vec<u8>>,
+    read: &mut dyn FnMut(&[u8; 32]) -> Option<Vec<u8>>,
 ) -> Option<(Vec<Arc<Shader>>, Option<Box<GraphicsState>>)> {
     let mut rest = entry.get(16..)?;
     let (&count, after) = rest.split_first()?;

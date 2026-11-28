@@ -16,6 +16,12 @@ public sealed partial class WarmProgress
     // victory warm: "19000 of 83564, 474 s"
     [GeneratedRegex(@"^(\d+) of (\d+), (\d+) s$")]
     private static partial Regex WarmStep();
+    // victory warm, first naming what the driver is given: "83564 pipelines to name, 10 processes"
+    [GeneratedRegex(@"^(\d+) pipelines to name, ")]
+    private static partial Regex NameTotal();
+    // victory warm: "5000 of 83564 named, 12 s"
+    [GeneratedRegex(@"^(\d+) of (\d+) named, (\d+) s$")]
+    private static partial Regex NameStep();
     // victory shaders: "12000 shaders in the cache, 95 s" and at the end "40211 shaders in the cache, 7 do not translate, 310 s"
     [GeneratedRegex(@"^(\d+) shaders in the cache, (?:(\d+) do not translate, )?(\d+) s$")]
     private static partial Regex ShaderStep();
@@ -26,6 +32,8 @@ public sealed partial class WarmProgress
     /// <summary>0 when not known.</summary>
     public long Total { get; private set; }
     public double Seconds { get; private set; }
+    /// <summary>The warm-up is naming the pipelines (finding which are the same to the driver), not building them yet.</summary>
+    public bool Naming { get; private set; }
     /// <summary>The translation reported its last line: its count is the total for the next one.</summary>
     public long? FinishedTotal { get; private set; }
 
@@ -38,7 +46,19 @@ public sealed partial class WarmProgress
         if (WarmTotal().Match(t) is { Success: true } total)
         {
             Total = long.Parse(total.Groups[2].Value, CultureInfo.InvariantCulture);
-            Done = 0;
+            Phase(naming: false);
+            return true;
+        }
+        if (NameTotal().Match(t) is { Success: true } names)
+        {
+            Total = long.Parse(names.Groups[1].Value, CultureInfo.InvariantCulture);
+            Phase(naming: true);
+            return true;
+        }
+        if (NameStep().Match(t) is { Success: true } named)
+        {
+            Total = long.Parse(named.Groups[2].Value, CultureInfo.InvariantCulture);
+            Note(long.Parse(named.Groups[1].Value, CultureInfo.InvariantCulture), double.Parse(named.Groups[3].Value, CultureInfo.InvariantCulture));
             return true;
         }
         if (WarmStep().Match(t) is { Success: true } step)
@@ -63,6 +83,14 @@ public sealed partial class WarmProgress
             return true;
         }
         return false;
+    }
+
+    /// <summary>A new step starts from nothing: the last one's rate says nothing of its time left.</summary>
+    private void Phase(bool naming)
+    {
+        Naming = naming;
+        Done = 0;
+        samples.Clear();
     }
 
     private void Note(long done, double seconds)

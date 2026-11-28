@@ -258,6 +258,20 @@ static CALLS: Mutex<Vec<(u32, &'static str, String, u64)>> = Mutex::new(Vec::new
 thread_local! {
     /// The pipeline this thread is making (its shaders), for [`CALLS`].
     static LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// While [`name_only`] runs: [`pipeline`] makes nothing and keeps the
+    /// first name it is asked for here.
+    static NAME_ONLY: std::cell::RefCell<Option<Option<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `work` with [`pipeline`] making nothing (it fails at once): the name
+/// of the first pipeline `work` asked for, and what `work` returned. For
+/// `victory warm`, which tells by the names which pipelines are one to the
+/// driver without compiling any.
+pub(crate) fn name_only<T>(work: impl FnOnce() -> T) -> (Option<String>, T) {
+    NAME_ONLY.with(|n| *n.borrow_mut() = Some(None));
+    let done = work();
+    let name = NAME_ONLY.with(|n| n.borrow_mut().take()).flatten();
+    (name, done)
 }
 
 /// Names the pipeline this thread makes next.
@@ -579,6 +593,16 @@ pub(crate) fn pipeline(
     load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    let named = NAME_ONLY.with(|n| match &mut *n.borrow_mut() {
+        Some(slot) => {
+            slot.get_or_insert_with(|| name.to_owned());
+            true
+        }
+        None => false,
+    });
+    if named {
+        return Err(windows::Win32::Foundation::E_ABORT.into());
+    }
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
@@ -784,7 +808,11 @@ fn save_in(dir: &std::path::Path, library: &Library) {
     let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
     let written = library_written
         .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
+        .and_then(|()| match super::known::on() {
+            true => write_atomically(&dir.join(RECENT_FILE), recent_list(dir).join("\n").as_bytes()),
+            false => Ok(()),
+        });
     match written {
         Ok(()) => tracing::info!(
             bytes,
@@ -927,11 +955,79 @@ pub(crate) fn note_used(key: &str) {
     if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
+    drop(used);
+    if super::known::on() {
+        let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+        let recent = recent.get_or_insert_default();
+        if recent.1.len() < EARLY_MAX && recent.0.insert(key.to_owned()) {
+            recent.1.push(key.to_owned());
+            USED_CHANGED.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// With the pipeline book on (`known`): the title pipelines this run
+/// requested, in the order of their first request, written before those of
+/// earlier runs ([`recent_list`]). `victory warm` makes them first: the
+/// places played last are the likeliest to be played next.
+const RECENT_FILE: &str = "recent-pipelines.txt";
+#[allow(clippy::type_complexity)]
+static RECENT: Mutex<Option<(HashSet<String>, Vec<String>)>> = Mutex::new(None);
+
+/// What [`RECENT_FILE`] holds after this run: this run's, then the earlier
+/// runs' that this one did not request, at most [`EARLY_MAX`].
+fn recent_list(dir: &std::path::Path) -> Vec<String> {
+    static EARLIER: OnceLock<Vec<String>> = OnceLock::new();
+    let earlier = EARLIER.get_or_init(|| {
+        let listed = std::fs::read_to_string(dir.join(RECENT_FILE)).unwrap_or_default();
+        listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect()
+    });
+    let recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+    match recent.as_ref() {
+        Some((this_run, order)) => latest_first(this_run, order, earlier),
+        None => earlier.clone(),
+    }
+}
+
+/// `order` (this run's, in the order of first request), then those of
+/// `earlier` this run did not request, at most [`EARLY_MAX`].
+fn latest_first(this_run: &HashSet<String>, order: &[String], earlier: &[String]) -> Vec<String> {
+    let mut list = order.to_vec();
+    list.extend(earlier.iter().filter(|k| !this_run.contains(*k)).cloned());
+    list.truncate(EARLY_MAX);
+    list
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_latest_run_is_first() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+        let order = s(&["c", "a"]);
+        let this_run: HashSet<String> = order.iter().cloned().collect();
+        assert_eq!(latest_first(&this_run, &order, &s(&["a", "b", "d", "c"])), s(&["c", "a", "b", "d"]));
+        assert_eq!(latest_first(&HashSet::new(), &[], &s(&["b"])), s(&["b"]));
+    }
+
+    /// `victory warm`'s naming: the first name asked for is kept, nothing is
+    /// made, and after it pipelines are asked for as before.
+    #[test]
+    fn naming_makes_nothing() {
+        let make = |name: &str| {
+            pipeline(name, |_, _| unreachable!("nothing is loaded"), || unreachable!("nothing is made"))
+        };
+        let (name, made) = name_only(|| {
+            let first = make("first");
+            let _ = make("second");
+            first
+        });
+        assert_eq!(name.as_deref(), Some("first"));
+        assert!(made.is_err());
+        assert!(NAME_ONLY.with(|n| n.borrow().is_none()));
+        assert_eq!(name_only(|| ()).0, None);
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {

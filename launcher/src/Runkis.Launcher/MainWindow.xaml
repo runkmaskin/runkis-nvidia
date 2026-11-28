@@ -148,8 +148,13 @@
                   </Button>
                   <Button Command="{Binding WarmUp}" Margin="0,10,0,0" Padding="16,8"
                           Visibility="{Binding IsRunning, Converter={StaticResource Vis}, ConverterParameter=not}"
-                          ToolTip="Translates every shader of the game into the cache, then builds every pipeline earlier plays recorded into the driver's cache. Fewer hitches the first time a place is seen. Run it once after a new build, and again after playing new places. Needs about 23 GB free on C:.">
-                    <TextBlock Text="⚡  Warm up shaders"/>
+                          ToolTip="The fast warm-up: translates every shader of the game into the cache, then builds the pipelines earlier plays drew with into the driver's cache, the places played last first. Fewer hitches when you come back to a place. Run it once after a new build, and again after playing new places.">
+                    <TextBlock Text="⚡  Warm up (what you've played)"/>
+                  </Button>
+                  <Button Command="{Binding WarmUpFull}" Margin="0,6,0,0" Padding="12,5" FontSize="12"
+                          Visibility="{Binding IsRunning, Converter={StaticResource Vis}, ConverterParameter=not}"
+                          ToolTip="The full warm-up: as the fast one, then every pipeline the game has ever created, drawn with or not (fewer hitches in places never visited). Takes an hour or more and needs about 23 GB free on C:.">
+                    <TextBlock Text="Full warm-up (everything recorded)"/>
                   </Button>
                   <TextBlock Text="{Binding StateDetail}" Style="{StaticResource Hint}" MaxWidth="260" TextAlignment="Center" Margin="0,10,0,0"/>
                 </StackPanel>
@@ -245,8 +250,8 @@
                     (needs about 23 GB free on C:). Both cut the hitches of the first visit.
                   </TextBlock>
                   <TextBlock Style="{StaticResource Hint}" Margin="0" Visibility="{Binding DevMode, Converter={StaticResource Vis}, ConverterParameter=not}">
-                    Press Warm up shaders once after a new build, and again after playing new places (needs about 23 GB free on C:).
-                    It cuts the hitches of the first visit.
+                    Press Warm up once after a new build, and again after playing new places. It cuts the hitches when you
+                    come back to a place. The full warm-up also builds what you have not drawn yet (an hour or more, about 23 GB on C:).
                   </TextBlock>
                   <TextBlock Text="{Binding ChecksSummary}" Margin="0,10,0,0" Foreground="{StaticResource Muted}"/>
                   <TextBlock Text="{Binding CheckIssues}" Margin="0,6,0,0" Foreground="{StaticResource Warn}" TextWrapping="Wrap"

@@ -73,7 +73,7 @@ public sealed class MainViewModel : Observable, IDisposable
         Bench = new BenchmarkViewModel(this);
 
         Launch = new Command(() => _ = StartAsync(RunMode.Play), () => CanStart);
-        Warm = new Command(() => _ = StartAsync(RunMode.Warm), () => CanStart);
+        Warm = new Command(() => { warmAll = true; _ = StartAsync(RunMode.Warm); }, () => CanStart);
         Precompile = new Command(() => _ = StartAsync(RunMode.Precompile), () => CanStart);
         Stop = new Command(() => _ = StopAsync(), () => IsRunning);
         BrowseGame = new Command(DoBrowseGame);
@@ -97,7 +97,8 @@ public sealed class MainViewModel : Observable, IDisposable
         Go = new Command(p => Page = p as string ?? "Play");
         ToggleDevMode = new Command(() => DevMode = !DevMode);
         SavePreset = new Command(DoSavePreset, () => UsingPreset);
-        WarmUp = new Command(() => { warmUpNext = true; _ = StartAsync(RunMode.Precompile); }, () => CanStart);
+        WarmUp = new Command(() => { warmUpNext = true; warmAll = false; _ = StartAsync(RunMode.Precompile); }, () => CanStart);
+        WarmUpFull = new Command(() => { warmUpNext = true; warmAll = true; _ = StartAsync(RunMode.Precompile); }, () => CanStart);
 
         fast = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(250) };
         fast.Tick += (_, _) => FastTick();
@@ -439,7 +440,9 @@ public sealed class MainViewModel : Observable, IDisposable
         SetState("Preparing", "Reading the tuned settings from play-nvidia.ps1", "Accent");
         try
         {
-            var plan = await new PlanBuilder(repo).BuildAsync(EffectiveProfile.Clone(), mode);
+            var chosen = EffectiveProfile.Clone();
+            chosen.WarmAll = warmAll;
+            var plan = await new PlanBuilder(repo).BuildAsync(chosen, mode);
             if (!File.Exists(plan.Victory.Replace("victory_sm.exe", "victory.exe")))
                 throw new PlanException($"{plan.Victory} is not built. Build it with: {RepoLayout.BuildCommand(profile.Build)}");
             session?.Dispose();
@@ -454,7 +457,7 @@ public sealed class MainViewModel : Observable, IDisposable
             s.ProblemFound += p => Application.Current.Dispatcher.BeginInvoke(() => Problems.Add(p));
             s.StateChanged += st => Application.Current.Dispatcher.BeginInvoke(() => OnSessionState(s, st));
             session = s;
-            RunTitle = mode switch { RunMode.Warm => "Warm-up: building the pipeline cache", RunMode.Precompile => "Warm-up: translating shaders", _ => $"{GameName} · {SelectedStart?.Label}" };
+            RunTitle = mode switch { RunMode.Warm => warmAll ? "Full warm-up: building every recorded pipeline" : "Warm-up: building the pipelines you have played", RunMode.Precompile => "Warm-up: translating shaders", _ => $"{GameName} · {SelectedStart?.Label}" };
             warm = mode switch { RunMode.Warm => new WarmProgress(), RunMode.Precompile => new WarmProgress(settings.LastShaderTotal ?? 0), _ => null };
             WarmPercent = warm?.Percent;
             s.Start();
@@ -493,7 +496,9 @@ public sealed class MainViewModel : Observable, IDisposable
                         Toast("Warm-up stopped: translating the shaders failed (see Logs).");
                 }
                 else if (s.Plan.Mode == RunMode.Warm && ok)
-                    Toast("Warm-up done: shaders and recorded pipelines are cached. Pipelines get recorded while you play, so warm up again after playing new places.");
+                    Toast(warmAll
+                        ? "Full warm-up done: shaders and every recorded pipeline are cached."
+                        : "Warm-up done: shaders and the pipelines of the places you have played are cached. Warm up again after playing new places.");
                 break;
         }
         Raise(nameof(IsRunning));
@@ -546,7 +551,9 @@ public sealed class MainViewModel : Observable, IDisposable
         if (moved && warm != null && session != null)
         {
             var precompile = session.Plan.Mode == RunMode.Precompile;
-            RunTitle = (precompile ? "Translating shaders: " : "Building pipelines: ") + warm.Describe(precompile ? "shaders" : "pipelines");
+            RunTitle = precompile ? "Translating shaders: " + warm.Describe("shaders")
+                : warm.Naming ? "Finding the pipelines that are the same: " + warm.Describe("pipelines")
+                : "Building pipelines: " + warm.Describe("pipelines");
             WarmPercent = warm.Percent;
             if (precompile && warm.FinishedTotal is long total && total != settings.LastShaderTotal)
             {
@@ -783,9 +790,16 @@ public sealed class MainViewModel : Observable, IDisposable
     public Command ClearLog { get; }
     public Command Go { get; }
     public Command SavePreset { get; }
-    /// <summary>Translates every shader into the cache, then builds every recorded pipeline into the driver's cache.</summary>
+    /// <summary>
+    /// The fast warm-up: translates every shader into the cache, then builds the pipelines earlier plays drew with into
+    /// the driver's cache (the places played last first).
+    /// </summary>
     public Command WarmUp { get; }
+    /// <summary>The full warm-up: as <see cref="WarmUp"/>, then every pipeline earlier plays recorded (an hour or more).</summary>
+    public Command WarmUpFull { get; }
     private bool warmUpNext;
+    /// <summary>The next pipeline warm-up builds every recorded pipeline, not only those drawn with.</summary>
+    private bool warmAll;
 
     // ---------------------------------------------------------------- for the Benchmark page
     internal RepoLayout? Repo => repo;

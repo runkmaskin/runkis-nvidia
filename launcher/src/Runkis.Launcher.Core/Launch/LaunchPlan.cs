@@ -76,6 +76,7 @@ public sealed class PlanBuilder(RepoLayout repo)
         if (mode == RunMode.Warm)
         {
             a.Add("-Warm");
+            if (!p.WarmAll) a.Add("-WarmUsed");
             if (p.WarmLimit > 0) a.AddRange(["-WarmLimit", p.WarmLimit.ToString(CultureInfo.InvariantCulture)]);
         }
         if (mode == RunMode.Precompile) a.Add("-Precompile");

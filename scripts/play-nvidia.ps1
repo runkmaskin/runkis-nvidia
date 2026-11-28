@@ -27,6 +27,7 @@ param(
     [switch]$Precompile,  # local: translate every shader with these exact settings (cache warm), no run
     [switch]$Warm,        # local: build every recorded pipeline into the driver's cache (victory warm), no run
     [int]$WarmLimit = 0,  # local: with -Warm, at most this many pipelines (0: all)
+    [switch]$WarmUsed,    # local: with -Warm, only the pipelines earlier plays drew with (the fast warm-up)
     [switch]$PrintEnv     # launcher: print the settings, victory.exe path and arguments as JSON and stop. Nothing is
                           # copied, set or started, so the launcher runs the same settings as this script.
 )
@@ -166,7 +167,7 @@ if ($PrintEnv) {
     $runArgs = @('run', $Exe, '--execute')
     if (-not $SeriesX) { $runArgs += @('--console', 'series-s') }
     if ($Precompile) { $runArgs = @('shaders', (Split-Path $Exe)) }
-    if ($Warm) { $runArgs = @('warm'); if ($WarmLimit -gt 0) { $runArgs += @('--limit', "$WarmLimit") } }
+    if ($Warm) { $runArgs = @('warm'); if ($WarmUsed) { $runArgs += @('--used') }; if ($WarmLimit -gt 0) { $runArgs += @('--limit', "$WarmLimit") } }
     $sorted = [ordered]@{}
     foreach ($k in ($settings.Keys | Sort-Object)) { $sorted[$k] = [string]$settings[$k] }
     [ordered]@{
@@ -196,6 +197,6 @@ $Exe = (Resolve-Path $Exe).Path
 $runArgs = @('run', $Exe, '--execute')
 if (-not $SeriesX) { $runArgs += @('--console', 'series-s') }
 if ($Precompile) { $runArgs = @('shaders', (Split-Path $Exe)) }
-if ($Warm) { $runArgs = @('warm'); if ($WarmLimit -gt 0) { $runArgs += @('--limit', "$WarmLimit") } }
+if ($Warm) { $runArgs = @('warm'); if ($WarmUsed) { $runArgs += @('--used') }; if ($WarmLimit -gt 0) { $runArgs += @('--limit', "$WarmLimit") } }
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try { & $victory @runArgs } finally { Pop-Location }

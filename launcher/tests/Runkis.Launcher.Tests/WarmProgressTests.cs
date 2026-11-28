@@ -33,6 +33,24 @@ public class WarmProgressTests
     }
 
     [Fact]
+    public void Naming_comes_first_and_its_rate_is_not_the_building_rate()
+    {
+        var w = new WarmProgress();
+        Assert.True(w.Take("83564 pipelines to name, 10 processes"));
+        Assert.True(w.Naming);
+        Assert.True(w.Take("5000 of 83564 named, 4 s"));
+        Assert.True(w.Take("80000 of 83564 named, 70 s"));
+        Assert.Equal(80000, w.Done);
+        Assert.False(w.Take("83564 of 83564 named in 73 s"));
+        Assert.True(w.Take("83564 pipelines known, 0 made before (95d12808af53e887), 0 bad; 31000 to make, 10 processes (83564 looked at: 900 get no host pipeline, 51664 are the same as another to the driver)"));
+        Assert.False(w.Naming);
+        Assert.Equal(31000, w.Total);
+        Assert.Equal(0, w.Done);
+        Assert.True(w.Take("250 of 31000, 80 s"));
+        Assert.Null(w.Left); // one sample of building: the naming's samples are gone
+    }
+
+    [Fact]
     public void Shaders_use_the_last_total_and_learn_the_new_one_at_the_end()
     {
         var w = new WarmProgress(knownTotal: 40000);

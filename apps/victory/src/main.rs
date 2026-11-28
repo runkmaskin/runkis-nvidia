@@ -124,9 +124,27 @@ enum Command {
         /// Only the pipelines earlier runs drew with.
         #[arg(long)]
         used: bool,
+        /// Pipelines a process makes before another takes its place
+        /// (default: 40).
+        #[arg(long)]
+        at_once: Option<usize>,
+        /// Only find which pipelines are one to the driver (by their host
+        /// description) and print the counts; make none.
+        #[arg(long)]
+        plan: bool,
+        /// (Measurements: leave out the first this many of the order.)
+        #[arg(long, hide = true)]
+        from: Option<usize>,
+        /// (A file of pipeline keys to make first, in its order: the running
+        /// title's, with `VICTORY_WARM_IN_PLAY=1`.)
+        #[arg(long, hide = true)]
+        first: Option<PathBuf>,
         /// (What the processes it starts are given.)
         #[arg(long, hide = true)]
         these: Option<String>,
+        /// (With --these: name them, make none.)
+        #[arg(long, hide = true)]
+        names: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -216,7 +234,9 @@ fn main() -> Result<()> {
         }
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        Command::Warm { jobs, limit, again, used, at_once, plan, from, first, these, names } => {
+            warm::run(warm::Options { jobs, limit, again, used, at_once, plan, from, first, these, names })
+        }
         Command::Run {
             exe,
             unimplemented,

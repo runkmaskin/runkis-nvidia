@@ -208,7 +208,12 @@ public class PlanTests
         var p = new LaunchProfile { GameExe = @"D:\g\game_scarlett_master.exe", Console = ConsoleModel.SeriesX, Quality = true, Resolution = 720, Adapter = "#1", WarmLimit = 50 };
         var a = PlanBuilder.ScriptArgs(p, RunMode.Warm);
         Assert.Equal(["-Exe", @"D:\g\game_scarlett_master.exe", "-Build", "diag", "-SeriesX", "-Quality", "-Resolution", "720", "-Adapter", "#1",
-            "-NoSmoothMotion", "-Warm", "-WarmLimit", "50", "-PrintEnv"], a);
+            "-NoSmoothMotion", "-Warm", "-WarmUsed", "-WarmLimit", "50", "-PrintEnv"], a);
+        // The full warm-up: every recorded pipeline.
+        p.WarmAll = true;
+        Assert.DoesNotContain("-WarmUsed", PlanBuilder.ScriptArgs(p, RunMode.Warm));
+        // Chosen per warm-up: not saved with the profile.
+        Assert.False(p.Clone().WarmAll);
     }
 
     [Fact]
@@ -400,7 +405,9 @@ public class PlanTests
         Assert.Equal("1", quality.Settings["VICTORY_RELAY"]);
         Assert.Equal("0.6667", quality.Settings["VICTORY_RENDER_SCALE"]);
         var warm = await b.ResolveAsync(new LaunchProfile { GameExe = @"D:\none\game_scarlett_master.exe", WarmLimit = 7 }, RunMode.Warm);
-        Assert.Equal(["warm", "--limit", "7"], warm.Args);
+        Assert.Equal(["warm", "--used", "--limit", "7"], warm.Args);
+        var full = await b.ResolveAsync(new LaunchProfile { GameExe = @"D:\none\game_scarlett_master.exe", WarmAll = true }, RunMode.Warm);
+        Assert.Equal(["warm"], full.Args);
     }
 }
 
