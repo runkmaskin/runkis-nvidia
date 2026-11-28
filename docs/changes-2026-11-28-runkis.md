@@ -213,3 +213,18 @@ The rest is the title's own lists.
   stopped together); not looked into further, and no Series X runs since.
 - The first runs of a build at a new path compile pipelines for minutes (draws dropped, flat untextured surfaces):
   the driver keeps pipelines by program path. `victory warm --used` with the same program made 4,114 in 4 minutes.
+
+### Windows on the card: measured, not kept
+
+Two rounds interleaved, Series S DLSS Quality, city (the game's idle camera moves between shots, so draws vary):
+
+| | fps (round 1 / 2) | 1 % low | the title's lists | frames over 100 ms | card memory in use | textures waiting |
+|---|---|---|---|---|---|---|
+| as it is (windows to 1,010 MB) | 17.1 / 18.4 | 8.1 / 10.5 | 40.1 / 37.6 ms | 10 / 2 | 7.7 GB | 2,300 |
+| `VICTORY_CARD_WINDOWS_MB=5120` | 17.3 / 18.5 | 10.5 / 10.4 | 38.0 / 36.2 | 4 / 3 | 8.8 GB | 9,600 |
+| and `VICTORY_CARD_BUFFERS_MB=4096` | 17.0 / 17.3 | 10.7 / 11.2 | 38.8 / 38.5 | 2 / 0 | 8.5 GB | 8,200 |
+
+With room for 5 GB, 2.8 GB of windows went to the card (another 0.4 GB was turned down at four fifths of the card in
+use) and the title's lists took 1.5-2 ms less: +0.15 fps, inside the noise, with four times the textures waiting for
+room. The default stays. The bus is not where the title's 37-55 ms go; the card still draws only 93-96 W at 95 % busy,
+so the time is in the title's own passes as translated (next: a captured frame, timed pass by pass).
