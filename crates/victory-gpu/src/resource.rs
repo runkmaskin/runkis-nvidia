@@ -1211,10 +1211,13 @@ impl Drop for Memory {
         if self.pages {
             use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
             let at = self.ptr.as_ptr() as usize;
+            // What was known of the pages goes, BEFORE they do: told after,
+            // it opened the guards of whatever another thread had mapped
+            // at the address meanwhile (the watch tests' views, failing
+            // once in a few runs of the suite; in the game a lost write).
+            crate::watch::title_memory_freed(at, self.layout.size().next_multiple_of(64 << 10));
             // SAFETY: the pages of `watched_pages`, whole.
             unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
-            // What was known of the pages goes with them.
-            crate::watch::title_memory_freed(at, self.layout.size().next_multiple_of(64 << 10));
             return;
         }
         match (self.attributes, ALLOCATOR.get()) {
@@ -4097,14 +4100,22 @@ mod tests {
         let start = at.as_ptr() as usize;
         assert_eq!(start % BLOCK, 0);
         let end = start + size.next_multiple_of(BLOCK);
-        // Taken once: whatever was written since the allocation.
-        assert!(crate::watch::writes(start, end, false).is_some());
+        // Asked of the kernel itself, not through `crate::watch` (whose books
+        // are the process's, and other tests' at the same time).
+        let written = || {
+            use windows_sys::Win32::System::Memory::GetWriteWatch;
+            let mut found = vec![std::ptr::null_mut(); (end - start) / 4096];
+            let (mut count, mut granularity) = (found.len(), 0);
+            // SAFETY: the answer buffer holds `count` entries.
+            let failed = unsafe { GetWriteWatch(1, start as *const _, end - start, found.as_mut_ptr(), &mut count, &mut granularity) };
+            assert_eq!(failed, 0, "write-watched");
+            found.truncate(count);
+            found.into_iter().map(|p| p as usize).collect::<Vec<_>>()
+        };
+        written();
         // SAFETY: inside the pages just made.
         unsafe { at.as_ptr().add(3 * BLOCK + 100).write_volatile(7) };
-        let (_, written) = crate::watch::writes(start, end, false).expect("write-watched");
-        let blocks: Vec<usize> = written.iter().map(|&(p, _)| p).collect();
-        assert!(blocks.contains(&(start / BLOCK + 3)), "{blocks:?}");
-        assert!(blocks.len() < 20, "not all of it: {blocks:?}");
+        assert_eq!(written(), [start + 3 * BLOCK]);
         let memory = Memory { ptr: at, layout: Layout::from_size_align(size, 256).unwrap(), attributes: None, pages: true };
         drop(memory);
     }

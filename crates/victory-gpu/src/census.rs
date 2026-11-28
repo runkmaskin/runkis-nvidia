@@ -339,7 +339,19 @@ struct Totals {
     /// landings left alone for want of time.
     landed_bytes: [u64; 5],
     land_over_budget: u64,
+    /// Of landings into committed buffers: pieces seen, pages of them in
+    /// committed private read-write runs, pages held in part at a piece's
+    /// ends, pages not in such runs, pages a kernel write keeps open,
+    /// pages the store census held read-only that were made no-access.
+    land: [u64; 6],
 }
+
+const LAND_PIECES: usize = 0;
+const LAND_ELIGIBLE: usize = 1;
+const LAND_EDGES: usize = 2;
+const LAND_NOT_PLAIN: usize = 3;
+const LAND_KERNEL: usize = 4;
+const LAND_UPGRADED: usize = 5;
 
 /// Ranges of addresses, joined where they meet or touch: start, end.
 #[derive(Default)]
@@ -876,6 +888,7 @@ pub(crate) fn landed_by(by: usize, start: usize, len: usize, from: usize, to: us
         return;
     };
     s.totals.landed_bytes[by.min(4)] += bytes as u64;
+    s.totals.land[LAND_PIECES] += 1;
     let id = match s.ids.get(&(start, len)) {
         Some(&id) => id,
         None => s.region(start, len, if own { Kind::Watched } else { Kind::Whole }),
@@ -888,7 +901,9 @@ pub(crate) fn landed_by(by: usize, start: usize, len: usize, from: usize, to: us
         return;
     }
     let started = std::time::Instant::now();
+    let pages = (to - from) as u64 / PAGE as u64;
     let (from, to) = (from.div_ceil(PAGE) * PAGE, to / PAGE * PAGE);
+    s.totals.land[LAND_EDGES] += pages.saturating_sub((to.saturating_sub(from) / PAGE) as u64);
     if from < to {
         learn(s, from, to, started, s.frame_land_us);
         let runs: Vec<(usize, usize, u32)> = s
@@ -898,26 +913,43 @@ pub(crate) fn landed_by(by: usize, start: usize, len: usize, from: usize, to: us
             .take_while(|(_, (e, _))| *e > from)
             .map(|(&a, &(e, p))| (a.max(from), e.min(to), p))
             .collect();
+        let plain: u64 = runs.iter().map(|&(a, e, _)| ((e - a) / PAGE) as u64).sum();
+        s.totals.land[LAND_ELIGIBLE] += plain;
+        s.totals.land[LAND_NOT_PLAIN] += ((to - from) / PAGE) as u64 - plain;
         for (a, e, p) in runs.into_iter().rev() {
-            let (last, mut page) = (e / PAGE, next(a / PAGE, e / PAGE, false));
-            while page < last {
-                let end = next(page, last, true);
-                if !s.kernel.meets(page * PAGE, end * PAGE) {
-                    for q in page..end {
-                        mark(q, true);
-                        set(NO_ACCESS, q, true);
-                    }
-                    if protect(page * PAGE, (end - page) * PAGE, p & !0xff | PAGE_NOACCESS) {
-                        s.totals.landed_pages += (end - page) as u64;
-                        s.regions[id].landed += (end - page) as u64;
-                    } else {
-                        for q in page..end {
-                            mark(q, false);
-                        }
-                        s.totals.refused += 1;
-                    }
+            if s.kernel.meets(a, e) {
+                s.totals.land[LAND_KERNEL] += ((e - a) / PAGE) as u64;
+                continue;
+            }
+            // Every page of it, those the store census holds read-only too
+            // (a committed buffer with pages of its own is write-watched:
+            // all its pages were read-only for the stores, and skipping
+            // them left run census-105501 with no page no-access at all).
+            let mut fresh = 0;
+            for q in a / PAGE..e / PAGE {
+                if no_access(q) {
+                    continue;
                 }
-                page = next(end, last, false);
+                if armed(q) {
+                    s.totals.land[LAND_UPGRADED] += 1;
+                }
+                fresh += 1;
+                mark(q, true);
+                set(NO_ACCESS, q, true);
+            }
+            if fresh == 0 {
+                continue;
+            }
+            if protect(a, e - a, p & !0xff | PAGE_NOACCESS) {
+                s.totals.landed_pages += fresh;
+                s.regions[id].landed += fresh;
+            } else {
+                // (Back as they were: the store census's pages read-only.)
+                for q in a / PAGE..e / PAGE {
+                    set(NO_ACCESS, q, false);
+                }
+                let _ = protect(a, e - a, read_only(p));
+                s.totals.refused += 1;
             }
         }
     }
@@ -1462,6 +1494,17 @@ fn report(s: &State, ms: f64, name: &dyn Fn(usize) -> String) -> String {
         (0..5).map(|i| format!("{} {:.2} MB", path::NAMES[i], per(t.landed_bytes[i]) / 1e6)).collect::<Vec<_>>().join(", "),
         per(t.land_over_budget)
     );
+    let _ = writeln!(
+        out,
+        "  of those landings, per frame: {:.0} pieces; pages: {:.0} in committed private read-write runs, {:.0} held in part at a piece's ends, \
+         {:.0} in no such run, {:.0} kept open by a kernel write, {:.0} read-only for the store census and made no-access",
+        per(t.land[LAND_PIECES]),
+        per(t.land[LAND_ELIGIBLE]),
+        per(t.land[LAND_EDGES]),
+        per(t.land[LAND_NOT_PLAIN]),
+        per(t.land[LAND_KERNEL]),
+        per(t.land[LAND_UPGRADED])
+    );
     {
         let buffers = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
         let mut big: Vec<(usize, usize, bool)> = buffers.iter().map(|(&a, &(e, own))| (a, e - a, own)).collect();
@@ -1739,6 +1782,48 @@ mod tests {
             VirtualFree(watched as *mut _, 0, MEM_RELEASE);
             VirtualFree(buffer as *mut _, 0, MEM_RELEASE);
         }
+    }
+
+    /// A write-watched committed buffer (`VICTORY_COMMITTED_WATCH`) whose
+    /// pages the store census holds read-only, landed in unaligned pieces of
+    /// 64 KiB by the relay's card path: its pages are made no-access all the
+    /// same (run census-105501: 21 MB a frame landed and none was), and the
+    /// CPU's read of one is counted.
+    #[test]
+    fn landed_pieces_of_a_watched_committed_buffer_are_looked_at() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let size = 6 * BLOCK;
+        let at = memory(size).unwrap();
+        assert!(begin(Limits { stores: 1, arm_us: u64::MAX / 4, stall_ms: 60_000 }, 0));
+        AS_TITLE.set(true);
+        committed(at, size, true, true);
+        refreshed(at, size, at, at + size, 0, Kind::Watched);
+        assert_eq!(protection_at(at + PAGE) & 0xff, PAGE_READONLY);
+        for piece in 0..5 {
+            let from = at + 0x100 + piece * BLOCK;
+            landed_by(path::RELAY_CARD, at, size, from, from + BLOCK, BLOCK);
+        }
+        assert_eq!(protection_at(at + 3 * BLOCK + 7 * PAGE), PAGE_NOACCESS);
+        // SAFETY: the test's own memory: the read faults and goes on.
+        assert_eq!(unsafe { ((at + 2 * BLOCK + 3 * PAGE) as *const u64).read_volatile() }, 0);
+        AS_TITLE.set(false);
+        let (s, ms) = end().unwrap();
+        let t = &s.totals;
+        assert_eq!(t.land[LAND_PIECES], 5);
+        // Each piece holds its first and last page in part.
+        assert_eq!(t.land[LAND_ELIGIBLE], 5 * 15);
+        assert!(t.land[LAND_UPGRADED] > 60, "{:?}", t.land);
+        assert_eq!(t.landed_pages, 5 * 15);
+        assert_eq!(t.landed_touches, [1, 0]);
+        assert_eq!(t.landed_bytes[path::RELAY_CARD], 5 * BLOCK as u64);
+        let text = report(&s, ms, &|a| format!("{a:#x}"));
+        assert!(text.contains("made no-access"), "{text}");
+        for page in 0..size / PAGE {
+            assert_eq!(protection_at(at + page * PAGE), PAGE_READWRITE, "page {page}");
+        }
+        committed(at, size, true, false);
+        // SAFETY: the test's own memory.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
 
     /// With no time for it in the frame, nothing is made read-only.
