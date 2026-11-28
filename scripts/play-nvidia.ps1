@@ -61,6 +61,11 @@ $settings = @{
     # on a core; 21.70 -> 22.58 fps, 1 % low 9.8 -> 11.6 (one run against two). The title's loop still tests its own
     # condition, so it exits at the same fence value.
     VICTORY_FENCE_SLEEP = '1'
+    # measured in game (768p, 2026-11-28): shader-written pool buffers of 1 MB and more stay on the card instead of
+    # being fetched back every frame (port of trustno1 50c15a1/2f81d0c); copying back 17 -> 5.8 ms a frame, fetched
+    # 41 -> 5.8 MB, fps 22.25 -> 25.4, 1 % low 11.3 -> 13.4 (one run against two). Smaller results the title reads
+    # (exposure, culling) are still fetched, so no stale values.
+    VICTORY_WC_NO_BACK = '1'; VICTORY_WC_NO_BACK_MIN_KB = '1024'
     # local: programs the shader validator refused (all their draws dropped) now validate: 41 with mixed interpolation
     # in a signature row, 3 alpha-clip materials with a level query on an array; game run: nothing new refused, same fps
     VICTORY_SIG_ROWS = '1'; VICTORY_LOD_ARRAY = '1'
