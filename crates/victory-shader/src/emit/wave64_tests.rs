@@ -899,6 +899,126 @@ fn console_waves_of_one_group_meet_on_their_own_in_loops_of_their_own() {
     eprintln!("ran on the hardware device: both console waves' loops, as the console runs them");
 }
 
+/// One console wave in a two-dimensional group of 8x8 threads, run as two host waves of 32,
+/// with an LDS write and read in one lane branch (`if ((t & 31) < s0)`): lane t writes
+/// t + s1 to its dword and reads that of lane t ^ 32, which is in the other host wave; after
+/// the branch every lane adds lane 0's value (`v_readlane_b32`). The shape of the untiled
+/// `CS_TransmissionVolumetrics` (groups of 8x8; "an LDS read and write in one lane-branch
+/// region, v_readlane"), which per lane stays a 64-lane program and so was dropped on 32-lane
+/// hosts: with the branch taken wave-wide it is a 32-lane program and gives what the console
+/// does.
+#[test]
+fn an_lds_exchange_in_a_lane_branch_of_an_8x8_group_runs_wave_wide() {
+    let vop2 = |op: u32, d: u32, s1: u32, s0: u32| op << 25 | d << 17 | s1 << 9 | s0;
+    let words = [
+        vop2(0x1A, 2, 1, 0x83),  // v_lshlrev_b32 v2, 3, v1: 8y
+        vop2(0x25, 2, 2, 0x100), // v_add_nc_u32 v2, v0, v2: t = x + 8y
+        vop2(0x1A, 1, 2, 0x82),  // v_lshlrev_b32 v1, 2, v2: this lane's LDS dword
+        vop2(0x1D, 3, 2, 0xA0),  // v_xor_b32 v3, 32, v2
+        vop2(0x1A, 3, 3, 0x82),  // v_lshlrev_b32 v3, 2, v3: lane t ^ 32's, in the other host wave
+        vop2(0x1B, 6, 2, 0x9F),  // v_and_b32 v6, 31, v2
+        0x7E08_0287,             // v_mov_b32 v4, 7
+        vop2(0x25, 5, 2, 1),     // v_add_nc_u32 v5, s1, v2
+        0x7D88_0000 | 6 << 9,    // v_cmp_gt_u32 vcc, s0, v6
+        0xBE8C_246A,             // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0005,             // s_cbranch_execz to the restore of EXEC
+        0xD834_0000,
+        0x0000_0501, // ds_write_b32 v1, v5
+        0xD8D8_0000,
+        0x0400_0003, // ds_read_b32 v4, v3
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xD760_0007,
+        0x0001_0104,          // v_readlane_b32 s7, v4, 0
+        vop2(0x25, 4, 4, 7), // v_add_nc_u32 v4, s7, v4
+        0xE070_1000,
+        0x8002_0401, // buffer_store_dword v4, v1, s[8:11], 0 offen
+    ];
+    let mut native = native_of(&words, true, 64);
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: 5 << 1 | 1 << 11 | 1 << 15, // 5 user SGPRs, thread ids x and y, 512 bytes of LDS
+        threads: [8, 8, 1],
+    });
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let branch = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+        .expect("the branch");
+    // per lane: still 64 lanes (or refused), and the lowering names the branch to widen
+    lower::take_needs();
+    let st = structure::structure_wide(&p, &HashSet::new()).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let per_lane = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    });
+    lower::TEST_HOST_WAVE.set(was);
+    assert!(
+        per_lane.as_ref().map_or(true, |l| l.wave_size == Some(64)),
+        "per lane it should not be a 32-lane program"
+    );
+    let needs = lower::take_needs();
+    let st = structure::structure(&p).expect("structure");
+    assert_eq!(lower::branches_around(&st, &needs), Some(vec![branch]));
+    // wave-wide: waves of 32, nothing left to meet over
+    let wide = HashSet::from([branch]);
+    let (wave, shader) = lowered_with_wave(&native, &p, &wide);
+    assert_eq!(wave, Some(32));
+    assert!(lower::take_needs().is_empty());
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    // the console: one wave in step, every write of the branch before its reads
+    let console = |s0: u32, s1: u32| {
+        let inside = |t: u32| (t & 31) < s0;
+        let v4: Vec<u32> = (0..64).map(|t| if inside(t) { (t ^ 32).wrapping_add(s1) } else { 7 }).collect();
+        (0..64).map(|t| v4[t].wrapping_add(v4[0])).collect::<Vec<u32>>()
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program: {e}; not run");
+            return;
+        }
+    };
+    for (s0, s1) in [(0u32, 5u32), (1, 100), (13, 0xFFFF_FFF0), (31, 3), (32, 1000)] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = [s0, s1][d as usize];
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        assert_eq!(&out[0][..64], &console(s0, s1)[..], "s0 = {s0}, s1 = {s1:#x}");
+    }
+    eprintln!("ran on the hardware device: the exchange across host waves, as the console does it");
+}
+
 /// Which LDS accesses need the host waves of their console wave to meet
 /// ([`lower::LdsOrder`]): before a barrier a lane writes its dword and reads it back (the
 /// order counts); after it the lanes read and add with atomics only (it does not: a read

@@ -630,6 +630,9 @@ pub fn emit(
         // them on 32-lane hosts and their dispatches were dropped (no volumetric light
         // or fog on NVIDIA). Widened, they translate (4 and 7 branches taken wave-wide).
         // The underwater one (`CS_TransmissionVolumetricsSubmerged`) likewise (29 branches).
+        // So is the untiled `CS_TransmissionVolumetrics` (groups of 8x8, 17 branches): the
+        // city's, which every frame dropped there with "no wave32 lowering" (runkis-nvidia,
+        // RTX 4070 SUPER, 2026-11-28); widened it translates, validates and is made.
         // The triangle clip's heap defragmentation (`vfx_triangleClip:CS_DefragHeap_
         // ComputeRelocations`, groups of 128) holds two console waves, which walk the heap
         // each its own way: their host waves meet per console wave ([`widen`]). (Its
@@ -643,6 +646,7 @@ pub fn emit(
                     | [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
                     | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
                     | [0xf1, 0xf1, 0x61, 0xe4, 0x7e, 0xef, 0xa3, 0x64, 0x69, 0x18, 0x39, 0xfd, 0x72, 0x06, 0xcc, 0xf6]
+                    | [0xc4, 0x0b, 0xd9, 0x53, 0x09, 0x6e, 0x88, 0x25, 0xce, 0x64, 0x50, 0xb5, 0x53, 0xf1, 0x23, 0x5c]
             )
             || matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 128)
                 && c.digest == [0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a, 0xa1, 0x23, 0xc6];

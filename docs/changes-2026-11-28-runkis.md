@@ -66,3 +66,43 @@ Seconds 150-240 of each run, the first run of the new program discarded (10.2 fp
 A1 and B1 are one pair, in a scene that changed during the window (6,200 draws a frame, then 10,000 to 13,000 at
 different seconds in the two runs), and still compiling pipelines: not a measurement of the switch. The second
 round was stopped at the user's request.
+
+## Dropped draws and pipelines in the city (2026-11-28)
+
+The play log's "dropped ~300 without a host pipeline" and "~900 indirect" lines, classified in two diagnostics
+runs of the city save (Series S, 1440p, RTX 4070 SUPER, this branch plus the fix below): a first start after a
+translator change, then a second start. Per frame, in the 5 s lines:
+
+| Reason | First start | Second start |
+|---|---|---|
+| A stage of the ray-tracing structure builder, which is off (`VICTORY_BVH_BUILDER` unset) | 300 (180-380) | 296 |
+| `CS_RaytracingResolve`, left out without the builder (the "indirect" ones) | 860-950 | 900 |
+| Named in `VICTORY_LEAVE_OUT` (decal heap defragmentation, heat haze) | 2 | 2 |
+| Being made (the pipeline still compiling) | up to 2,880 for the first ~15 s of the world, gone ~80 s after it | **none** |
+| Indirect mesh / dispatch, "prepare failed" | 37 + 14, in one 5 s window | none |
+
+So the steady ~300 of the frame line are the builder's stages and nothing else: by design, not pipelines that
+fail. The frame line's "being made" count is the pipeline queue (early starts included), not draws waiting: it
+read 200-400 while no draw was dropped for it.
+
+- **Pop-in while pipelines compile:** only on the first start after the translator or the driver changes
+  (every shader is translated again): up to 2,880 draws and dispatches a frame dropped for about 15 s, then
+  tens to hundreds for a minute. The second start had none in 5 minutes. `VICTORY_SHOW_NEW_LATER` is about
+  texture slots and does not help here; the pipeline library the first start saves does. `victory preload`
+  (shaders, then `warm`, then the library) does the same before play and should cover the city; it was not
+  run here.
+- **Driver refusals:** the six compute pipelines the old base's driver refused (`E_INVALIDARG`:
+  2cc4c197ee29e291, 02384a60fda6f2d0, 6b82bc7d22016cb5, 5dc3b25986622949, 6f225b641c5b0708, 6871d6e4b3ac9a10)
+  are not refused on this base: four are made, 02384a60fda6f2d0 is left out on purpose, and the other two did
+  not translate ("no wave32 lowering for this wave64 program"). No pipeline was refused in any run on it.
+- **Fixed: `CS_TransmissionVolumetrics` (6871d6e4b3ac9a10)**, the untiled volumetric light, groups of 8x8 like
+  its tiled siblings: its digest joins the list that chooses the wave-wide form (`emit::emit`, 17 branches).
+  It translates, validates and is made, and both runs had no device loss. The title asked for it in the city
+  (the second start made it at once, as it does the pipelines earlier runs used), but it is not one of the frame line's drops, so its effect on the picture
+  is not measured. Test: `an_lds_exchange_in_a_lane_branch_of_an_8x8_group_runs_wave_wide` (GPU-run). The
+  change is in the translator, so every shader is translated again once.
+- **Not fixed: `CS_CollectTriangles_Meshlets` (6b82bc7d22016cb5)**, groups of 1024: its own LDS is the
+  host's whole 32 KiB, with no room for the exchange. It was not among the drops in either run.
+- **Never made by design:** device methods 0x1c8 and 0x218 (not implemented, `device.rs`), at least 16,384 and
+  2,048 calls a run. The title goes without those pipelines and draws nothing with them.
+- **Translator warnings in the logs:** only the two "does not translate" lines above.
