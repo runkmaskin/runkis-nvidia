@@ -2491,6 +2491,32 @@ impl HostHeap {
         self.keep(index, None);
     }
 
+    /// The title slots that view one of `buffers` (host buffers by address)
+    /// become null views, each under its lock as any slot is made, and let
+    /// go of what they held (retired after the submissions that may still
+    /// read it). For each, the buffer goes into `unmade`. The next draw that
+    /// reads such a slot through a table makes it again ([`HostHeap::mirror`]).
+    pub(crate) fn unslot_viewing(&self, buffers: &crate::fx::Set<usize>, unmade: &mut Vec<usize>) {
+        use windows::core::Interface;
+        let held = |i: u32| self.kept.get(i as usize)?.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|r| r.as_raw() as usize);
+        let _retiring = retiring();
+        for index in 0..self.count {
+            // A look without the slot's lock first: nearly all slots hold
+            // something else.
+            let Some(raw) = held(index).filter(|raw| buffers.contains(raw)) else {
+                continue;
+            };
+            let _made = self.made.lock(index);
+            // Made from another record meanwhile, or never from one of the
+            // title's: left as it is.
+            if held(index) != Some(raw) || self.made.get(index).is_none_or(|key| key == 0) {
+                continue;
+            }
+            self.unmake(index);
+            unmade.push(raw);
+        }
+    }
+
     /// The slots [`HostHeap::note_buffer`] found stale for slot `index`, with
     /// what they were made from then, become null. None of their locks is
     /// held here; one made from another record meanwhile is left as it is.
@@ -6912,6 +6938,41 @@ mod list_cpu {
                 assert_eq!(references(o), references(n));
             }
         }
+    }
+
+    /// `VICTORY_WINDOW_UNSLOT`: only the title slots made from a record that
+    /// view one of the buffers named become null and let go of them; the
+    /// others keep what they hold, and the card is fine.
+    #[test]
+    fn unslot_makes_only_the_slots_viewing_the_buffers_null() {
+        let (Some(heap), Some(set)) = (HostHeap::new(false, 8), buffers(3)) else {
+            return; // no host GPU
+        };
+        for slot in 0..8u32 {
+            heap.keep_ref(slot, Some(&set[slot as usize % 3]));
+            // A record of no known kind: made null as a plain view.
+            heap.made.set(slot, 0xFFFF_FFFF_0000_0000 | u64::from(slot));
+        }
+        // Holds the buffer, but is made from no record of the title's.
+        heap.made.set(7, 0);
+        let named: crate::fx::Set<usize> = [set[1].as_raw() as usize].into_iter().collect();
+        let before = references(&set[1]);
+        let mut unmade = Vec::new();
+        heap.unslot_viewing(&named, &mut unmade);
+        assert_eq!(unmade, vec![set[1].as_raw() as usize; 2]);
+        for slot in 0..8u32 {
+            let held = heap.kept_raw(slot);
+            if slot == 1 || slot == 4 {
+                assert_eq!(held, None, "slot {slot}");
+                assert!(!heap.made(slot), "slot {slot}");
+            } else {
+                assert_eq!(held, Some(set[slot as usize % 3].as_raw() as usize), "slot {slot}");
+            }
+        }
+        // Let go of by the two slots (retired, or dropped at once).
+        assert!(references(&set[1]) <= before);
+        // SAFETY: a plain query.
+        assert!(unsafe { host().unwrap().device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// A nested batch leaves the outer one to retire what both let go of.

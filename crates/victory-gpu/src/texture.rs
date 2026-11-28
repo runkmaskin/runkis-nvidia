@@ -653,6 +653,53 @@ pub(crate) fn let_go_idle() {
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }
+    if crate::pool::compact() && crate::host::ram_short() {
+        move_out_of_emptying(map);
+    }
+}
+
+/// Bytes of staging moved by one call of [`move_out_of_emptying`] at most:
+/// the copy reads upload memory, which the CPU reads slowly.
+const MOVE_BYTES: u64 = 8 << 20;
+
+/// `VICTORY_STAGING_COMPACT=1`: moves the staging buffers that lie in
+/// blocks being emptied (`crate::pool::compact`) and that only the table
+/// holds into other blocks, bytes and all. No list holds such a one, so no
+/// recorded upload reads its old place; the old piece rests in the pool
+/// before it is used again, as any piece given back. Everything else of
+/// the staging (what was detiled, its hash, whether it is uploaded) stays.
+fn move_out_of_emptying(map: &mut HashMap<usize, Arc<Staging>>) {
+    let keys: Vec<usize> = map
+        .iter()
+        .filter(|(_, s)| Arc::strong_count(s) == 1 && s._piece.as_ref().is_some_and(crate::pool::StagingPiece::to_move))
+        .map(|(&k, _)| k)
+        .collect();
+    let mut moved = 0u64;
+    for key in keys {
+        if moved >= MOVE_BYTES {
+            break;
+        }
+        let Some(s) = map.remove(&key) else { continue };
+        let mut s = match Arc::try_unwrap(s) {
+            Ok(s) => s,
+            Err(s) => {
+                map.insert(key, s);
+                continue;
+            }
+        };
+        if let Some((piece, buffer, base, data)) = crate::pool::staging_for_move(s.bytes) {
+            // SAFETY: both are ours alone (no list holds the staging, the
+            // new piece is no one else's) and `bytes` long; they never overlap.
+            unsafe { std::ptr::copy_nonoverlapping(s.data, data, s.bytes as usize) };
+            s.buffer = buffer;
+            s.base = base;
+            s.data = data;
+            // The old piece goes back to rest.
+            s._piece = Some(piece);
+            moved += s.bytes;
+        }
+        map.insert(key, Arc::new(s));
+    }
 }
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on

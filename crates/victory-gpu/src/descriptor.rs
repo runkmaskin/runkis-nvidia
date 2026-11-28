@@ -165,6 +165,27 @@ fn mirror(handle: u64) {
     }
 }
 
+/// The title slots of every shader-visible view heap that view one of
+/// `buffers` (host buffers by address) become null views
+/// (`crate::shadow` `unslot`): for each slot made null, the buffer it viewed.
+#[cfg(windows)]
+pub(crate) fn unslot_viewing(buffers: &crate::fx::Set<usize>) -> Vec<usize> {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut unmade = Vec::new();
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+        // the `SHADER_HEAPS` lock held here.
+        let heap = unsafe { &*(at as *const Heap) };
+        if heap.samplers() {
+            continue;
+        }
+        if let Some(Some(host)) = heap.host.get() {
+            host.unslot_viewing(buffers, &mut unmade);
+        }
+    }
+    unmade
+}
+
 /// Whether [`sync_heaps`] is done (`VICTORY_HEAP_SYNC=0`: not).
 #[cfg(windows)]
 fn sync_on() -> bool {

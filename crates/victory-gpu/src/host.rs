@@ -11194,7 +11194,7 @@ fn frame_log(presented: [u64; 2]) {
 }
 
 /// The highest value so far of each field of [`memory_line`].
-static MEMORY_PEAKS: [std::sync::atomic::AtomicU64; 21] = [const { std::sync::atomic::AtomicU64::new(0) }; 21];
+static MEMORY_PEAKS: [std::sync::atomic::AtomicU64; 24] = [const { std::sync::atomic::AtomicU64::new(0) }; 24];
 
 /// What holds memory, by who holds it, in one line with the frame-rate
 /// lines every five seconds, for a launcher to read: `memory by subsystem:`
@@ -11209,7 +11209,7 @@ fn memory_line(host: &Host) {
     let kept = crate::pipeline::kept();
     let video = host.video_memory().unwrap_or_default();
     let system = system_memory();
-    let fields: [(&str, u64); 21] = [
+    let fields: [(&str, u64); 24] = [
         ("private", private_bytes()),
         ("list_allocators", HELD_CALLS.load(Ordering::Relaxed) * CALL_BYTES),
         ("list_scratch", alive(2)),
@@ -11240,6 +11240,14 @@ fn memory_line(host: &Host) {
         // Spares in the PC's memory let go while it was short of memory
         // (`VICTORY_RAM_TRIM=1`), since the start.
         ("ram_trimmed", RAM_TRIMS[1].load(Ordering::Relaxed)),
+        // Staging moved out of blocks being emptied
+        // (`VICTORY_STAGING_COMPACT=1`), since the start.
+        ("staging_moved", crate::pool::STAGING_MOVED.load(Ordering::Relaxed)),
+        // Windows that only descriptor slots hold and nothing asked for in
+        // 20 s (what `VICTORY_WINDOW_UNSLOT=1` lets go), and the windows'
+        // bytes it made slots let go of since the start.
+        ("windows_slot_idle", crate::shadow::slot_only_idle_bytes()),
+        ("windows_unslotted", crate::shadow::UNSLOTTED[1].load(Ordering::Relaxed)),
     ];
     tracing::info!("{}", memory_text(&fields, &MEMORY_PEAKS));
 }
@@ -11741,7 +11749,8 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                // A timed still is what the window shows: the interface laid over.
+                .then(|| crate::capture::read_back(&self.device, list, if crate::capture::timed(frame) { shown } else { texture }))
                 .flatten();
             #[cfg(feature = "diagnostics")]
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };

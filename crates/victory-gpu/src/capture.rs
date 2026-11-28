@@ -135,6 +135,36 @@ pub(crate) fn capture_next(frame: u64) {
     }
 }
 
+/// `VICTORY_CAPTURE_EVERY_S=<seconds>`: with a capture folder, a frame each
+/// time that many more seconds have passed since the first present, saved
+/// with the interface laid over it (`at-<s>s-frame-<n>.png`). A scripted
+/// route reaches the same places at the same seconds, not the same frame
+/// numbers, so stills of two settings compare only by time.
+fn every_s() -> Option<f64> {
+    static EVERY: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let s = std::env::var("VICTORY_CAPTURE_EVERY_S").ok()?.trim().parse::<f64>().ok()?;
+        (s >= 1.0).then_some(s)
+    })
+}
+
+/// The frame [`every_s`] asked for, and its second.
+static TIMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static TIMED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether frame `n` is the one [`every_s`] asked for (it is saved with the
+/// interface over it).
+pub(crate) fn timed(n: u64) -> bool {
+    n == TIMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Which step of `every` seconds `elapsed` seconds lie in, if it is a later
+/// one than `last`.
+fn step_due(elapsed: f64, every: f64, last: u64) -> Option<u64> {
+    let k = (elapsed / every) as u64;
+    (k > last).then_some(k)
+}
+
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -157,6 +187,16 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
             tracing::info!(frame = frame + 1, "F9: this frame is captured");
         } else if !down {
             WAS_DOWN.store(false, Relaxed);
+        }
+        if let Some(every) = every_s() {
+            static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            static STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let elapsed = START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64();
+            if let Some(k) = step_due(elapsed, every, STEP.load(Relaxed)) {
+                STEP.store(k, Relaxed);
+                TIMED_AT.store((k as f64 * every) as u64, Relaxed);
+                TIMED.store(frame + 1, Relaxed);
+            }
         }
     }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -185,12 +225,17 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world || timed(n))
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
 pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+    if timed(n) {
+        let at = TIMED_AT.load(std::sync::atomic::Ordering::Relaxed);
+        save_as(&format!("at-{at:04}s-frame-{n}"), width, height, pitch, bgra, rows);
+    } else {
+        save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+    }
 }
 
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
@@ -891,6 +936,22 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    /// A timed still is due once per step, at the first frame past it.
+    #[test]
+    fn timed_stills_fall_once_per_step() {
+        let mut last = 0;
+        let mut due = Vec::new();
+        for tenth in 0..1000u64 {
+            if let Some(k) = super::step_due(tenth as f64 / 10.0, 15.0, last) {
+                last = k;
+                due.push(tenth);
+            }
+        }
+        assert_eq!(due, (1..=6).map(|k| k * 150).collect::<Vec<_>>());
+        // A long frame skips a step's still and takes the latest.
+        assert_eq!(super::step_due(46.0, 15.0, 1), Some(3));
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);

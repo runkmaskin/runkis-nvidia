@@ -57,6 +57,46 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         // card's memory, and stay as they were.)
         settle(&STAGING, now());
     }
+    if compact() {
+        lock(&STAGING).plan(crate::host::ram_short());
+    }
+}
+
+/// `VICTORY_STAGING_COMPACT=1` (off): while the PC is short of memory
+/// (`VICTORY_RAM_TRIM=1`), the staging pieces textures keep move out of
+/// blocks that are at most half full into fuller ones, so that the emptied
+/// blocks can go. In a 768p run the staging blocks held 448 MB for 43 MB
+/// while short: 103 pieces kept by textures sampled every frame lay in six
+/// blocks, and only empty blocks go. A piece moves only while no list holds
+/// its staging buffer (`texture::let_go_idle`), with its bytes copied, so
+/// every upload after it reads what it would have read before. Off: no
+/// block is ever emptied, and takes are as before.
+pub(crate) fn compact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_STAGING_COMPACT"))
+}
+
+/// Bytes of staging moved out of blocks being emptied since the start (the
+/// memory line's `staging_moved`).
+pub(crate) static STAGING_MOVED: AtomicU64 = AtomicU64::new(0);
+
+impl StagingPiece {
+    /// Whether this piece lies in a block being emptied ([`compact`]).
+    pub(crate) fn to_move(&self) -> bool {
+        lock(&STAGING).in_emptying(&self.0)
+    }
+}
+
+/// For a staging piece that moves ([`compact`]): `bytes` of upload memory in
+/// a block that is not being emptied, never a new block. Its bytes are
+/// whatever was there; the caller writes all of them. `None`: no room.
+pub(crate) fn staging_for_move(bytes: u64) -> Option<(StagingPiece, ID3D12Resource, u64, *mut u8)> {
+    let bytes = bytes.next_multiple_of(512);
+    let (piece, memory) = lock(&STAGING).take_for_move(bytes, 512, now())?;
+    // SAFETY: the piece lies in the block's mapping.
+    let data = unsafe { memory.1.add(piece.start as usize) };
+    STAGING_MOVED.fetch_add(bytes, Ordering::Relaxed);
+    Some((StagingPiece(piece), memory.0, piece.start, data))
 }
 
 /// `VICTORY_POOL_SETTLE=1`: [`settle`] once a second as well. Off by default:
@@ -216,6 +256,9 @@ struct Pool<B> {
     /// The most it keeps while `short` says the PC is short of memory.
     most_short: usize,
     short: fn() -> bool,
+    /// Blocks whose pieces are to move to fuller ones ([`Pool::plan`]); new
+    /// pieces are cut elsewhere first. Empty: none (always for textures).
+    emptying: Vec<bool>,
 }
 
 impl<B: Clone> Pool<B> {
@@ -226,7 +269,7 @@ impl<B: Clone> Pool<B> {
     /// A pool that keeps at most `most_short` empty blocks while `short`
     /// says so.
     const fn with_short(most: usize, most_short: usize, short: fn() -> bool) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, most_short, short }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, most_short, short, emptying: Vec::new() }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -252,12 +295,26 @@ impl<B: Clone> Pool<B> {
         }
         self.rested(now);
         let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
-            {
-                found = Some((i, start));
+        // Blocks being emptied ([`Pool::plan`]) last: without any, one pass
+        // over the blocks as before.
+        let emptying = &self.emptying;
+        for last in [false, true] {
+            if last && !emptying.contains(&true) {
+                break;
+            }
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                if emptying.get(i).copied().unwrap_or(false) != last {
+                    continue;
+                }
+                if let Some(block) = block
+                    && ripe.is(block)
+                    && let Some(start) = block.free.take(len, align)
+                {
+                    found = Some((i, start));
+                    break;
+                }
+            }
+            if found.is_some() {
                 break;
             }
         }
@@ -346,6 +403,61 @@ impl<B: Clone> Pool<B> {
 
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
+    }
+
+    /// Bytes of each block that taken pieces hold (not free, not resting).
+    fn live(&self) -> Vec<u64> {
+        let mut live: Vec<u64> =
+            self.blocks.iter().map(|b| b.as_ref().map_or(0, |b| BLOCK - b.free.0.values().sum::<u64>())).collect();
+        for (_, piece) in &self.resting {
+            if let Some(l) = live.get_mut(piece.block) {
+                *l = l.saturating_sub(piece.len);
+            }
+        }
+        live
+    }
+
+    /// Picks the blocks whose pieces are to move ([`compact`]): the fullest
+    /// blocks that hold what is taken at three quarters full are kept, and
+    /// the others that are at most half full are emptied. `on` false: none.
+    fn plan(&mut self, on: bool) {
+        self.emptying.clear();
+        if !on {
+            return;
+        }
+        let live = self.live();
+        let total: u64 = live.iter().sum();
+        let mut order: Vec<usize> = (0..live.len()).filter(|&i| live[i] > 0).collect();
+        order.sort_by_key(|&i| (std::cmp::Reverse(live[i]), i));
+        let keep = (total * 4 / 3).div_ceil(BLOCK).max(1) as usize;
+        self.emptying = vec![false; self.blocks.len()];
+        for &i in order.iter().skip(keep) {
+            if live[i] <= BLOCK / 2 {
+                self.emptying[i] = true;
+            }
+        }
+    }
+
+    /// Whether `piece` lies in a block being emptied.
+    fn in_emptying(&self, piece: &Piece) -> bool {
+        self.emptying.get(piece.block).copied().unwrap_or(false)
+    }
+
+    /// A piece of `len` bytes for a piece that moves out of a block being
+    /// emptied: from a block that is not, never a new block. Its bytes are
+    /// whatever they were (the move writes all of them).
+    fn take_for_move(&mut self, len: u64, align: u64, now: u64) -> Option<(Piece, B)> {
+        self.rested(now);
+        let emptying = &self.emptying;
+        let (i, start) = self.blocks.iter_mut().enumerate().find_map(|(i, block)| {
+            if emptying.get(i).copied().unwrap_or(false) {
+                return None;
+            }
+            Some((i, block.as_mut()?.free.take(len, align)?))
+        })?;
+        let block = self.blocks[i].as_mut()?;
+        block.used_to = block.used_to.max(start + len);
+        Some((Piece { block: i, start, len }, block.memory.clone()))
     }
 }
 
@@ -824,6 +936,96 @@ mod tests {
             assert_eq!(before, now, "seed {seed:#x}: the same bytes reach the card");
             assert!(most_empty <= STAGING_SHORT, "seed {seed:#x}: {most_empty} empty blocks kept while short");
             assert!(made_now >= made_before, "seed {seed:#x}");
+        }
+    }
+
+    /// `VICTORY_STAGING_COMPACT`: after bursts that left a few pieces kept in
+    /// many blocks, the pieces of the blocks being emptied move (bytes copied,
+    /// as `texture::move_out_of_emptying` does) into fuller blocks, never into
+    /// a block being emptied or a new one; the emptied blocks then go, every
+    /// piece keeps its bytes, and no two live pieces overlap. Without a plan
+    /// the takes are those of before (fixed seeds).
+    #[test]
+    fn kept_pieces_move_out_and_their_blocks_go() {
+        use std::collections::HashMap;
+        SPARES.store(SPARE_KEPT, Ordering::Relaxed);
+        for seed in [0x9E37_79B9_7F4A_7C15u64, 0x1234_5678, 0xDEAD_BEEF_CAFE, 77] {
+            let mut seed = seed;
+            let made = std::cell::Cell::new(0u64);
+            let make = || {
+                made.set(made.get() + 1);
+                Some(made.get())
+            };
+            // Two pools fed the same takes; one plans with nothing to empty.
+            let mut pool: Pool<u64> = Pool::with_short(STAGING_KEPT, STAGING_SHORT, || true);
+            let mut same: Pool<u64> = Pool::with_short(STAGING_KEPT, STAGING_SHORT, || true);
+            let mut bytes: HashMap<(u64, u64), u8> = HashMap::new();
+            let mut kept: Vec<(Piece, u64, u8)> = Vec::new();
+            let mut now = 0;
+            for burst in 0..6 {
+                let mut gone = Vec::new();
+                for i in 0..40 {
+                    let len = (1 + next(&mut seed) % 8) << 20;
+                    let (p, b, _) = pool.take(len, 512, now, make).unwrap();
+                    let (q, _, _) = same.take(len, 512, now, || Some(0)).unwrap();
+                    assert_eq!(p, q, "without a plan, takes are as before");
+                    let fill = next(&mut seed) as u8 | 1;
+                    bytes.insert((b, p.start), fill);
+                    if i % 13 == burst % 13 {
+                        kept.push((p, b, fill));
+                    } else {
+                        gone.push(p);
+                    }
+                }
+                now += 10;
+                for p in gone {
+                    pool.give(p, now);
+                    same.give(p, now);
+                }
+                now += REST;
+                pool.rested(now);
+                same.rested(now);
+                same.plan(false);
+                assert!(same.emptying.is_empty());
+            }
+            let held: u64 = kept.iter().map(|k| k.0.len).sum();
+            let before = pool.blocks();
+            pool.plan(true);
+            let made_before = made.get();
+            // Moves, a few at a time, until none is left to move.
+            for _ in 0..100 {
+                let mut any = false;
+                for k in kept.iter_mut() {
+                    if !pool.in_emptying(&k.0) {
+                        continue;
+                    }
+                    let Some((p, b)) = pool.take_for_move(k.0.len, 512, now) else { continue };
+                    assert!(!pool.in_emptying(&p), "a piece moves into a block being emptied");
+                    assert_eq!(bytes[&(k.1, k.0.start)], k.2);
+                    bytes.insert((b, p.start), k.2);
+                    pool.give(k.0, now);
+                    *k = (p, b, k.2);
+                    any = true;
+                }
+                now += REST;
+                pool.rested(now);
+                pool.plan(true);
+                if !any {
+                    break;
+                }
+            }
+            assert_eq!(made.get(), made_before, "seed {seed:#x}: no block made for a move");
+            for (i, (p, b, fill)) in kept.iter().enumerate() {
+                assert_eq!(bytes[&(*b, p.start)], *fill, "seed {seed:#x}: a piece kept its bytes");
+                assert_eq!(pool.blocks[p.block].as_ref().map(|x| x.memory), Some(*b));
+                for (q, c, _) in &kept[i + 1..] {
+                    assert!(b != c || p.start + p.len <= q.start || q.start + q.len <= p.start, "seed {seed:#x}: overlap");
+                }
+            }
+            let need = (held * 4 / 3).div_ceil(BLOCK) as usize;
+            let after = pool.blocks();
+            assert!(after <= need + 1 + STAGING_SHORT, "seed {seed:#x}: {before} -> {after} blocks for {} MB", held >> 20);
+            assert!(after < before, "seed {seed:#x}: {before} -> {after} blocks");
         }
     }
 

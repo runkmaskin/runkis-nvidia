@@ -3586,6 +3586,7 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    start_unslot();
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -3618,6 +3619,87 @@ pub(crate) fn let_go_idle() {
         // submission is running after all.
         crate::host::retire(shadow);
     }
+}
+
+/// `VICTORY_WINDOW_UNSLOT=1` (off): the title slots that still view a window
+/// nothing asked for in [`UNSLOT_IDLE_MS`] and [`UNSLOT_FRAMES`] frames, and
+/// that no list and no pass over the heap holds, become null views, so the
+/// window can go ([`let_go_idle`]). A slot keeps the buffer it views until
+/// the title writes it again, and the title leaves most slots as they are:
+/// 760 of 770 windows (3.2 GB of the PC's memory at 768p) were held by
+/// slots alone. Safe for the card: the slot is made null under its lock
+/// (`descriptor::host::HostHeap::unslot_viewing`) and the buffer it viewed is
+/// retired after every submission that may still read it through the old
+/// view. Every draw that reads such a slot through a table makes it again
+/// from the title's record, with a new window, as after any change. What
+/// can show: a draw recorded between the look at the window and the slot's
+/// unmaking reads zeros there once. Off: no slot is touched.
+fn unslot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_WINDOW_UNSLOT"))
+}
+
+/// How long a window must have been idle before its slots are made null.
+const UNSLOT_IDLE_MS: u64 = 20_000;
+const UNSLOT_FRAMES: u64 = 120;
+
+/// Title slots made null for [`unslot`] since the start, and the bytes of
+/// the windows they held.
+pub(crate) static UNSLOTTED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The windows held by nothing but descriptor slots (or lists' views of
+/// them) that nothing asked for in [`UNSLOT_IDLE_MS`]: their host buffers
+/// (by address) and bytes.
+fn slot_only_idle() -> Vec<(usize, u64)> {
+    let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    map.values()
+        .filter(|s| {
+            Arc::strong_count(s) == 1
+                && crate::host::long_ago(s.used.load(Ordering::Relaxed), UNSLOT_IDLE_MS, UNSLOT_FRAMES)
+                && crate::host::references(&s.buffer) > 1
+        })
+        .map(|s| (windows::core::Interface::as_raw(&s.buffer) as usize, s.len))
+        .collect()
+}
+
+/// For the memory line: the bytes of the windows [`unslot`] would free.
+pub(crate) fn slot_only_idle_bytes() -> u64 {
+    slot_only_idle().iter().map(|w| w.1).sum()
+}
+
+/// With [`unslot`]: a thread that every few seconds makes null the title
+/// slots that view the windows of [`slot_only_idle`]. Its own thread: it
+/// walks every title slot of the view heaps (some hundred thousand), which
+/// the submitting thread has no time for.
+fn start_unslot() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    if !unslot() {
+        return;
+    }
+    STARTED.call_once(|| {
+        let spawned = std::thread::Builder::new().name("victory window unslot".into()).spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let idle = slot_only_idle();
+            if idle.is_empty() {
+                continue;
+            }
+            let bytes: crate::fx::Map<usize, u64> = idle.into_iter().collect();
+            let set: crate::fx::Set<usize> = bytes.keys().copied().collect();
+            let unmade = crate::descriptor::unslot_viewing(&set);
+            if unmade.is_empty() {
+                continue;
+            }
+            let freed: u64 = unmade.iter().collect::<crate::fx::Set<_>>().iter().filter_map(|b| bytes.get(b)).sum();
+            UNSLOTTED[0].fetch_add(unmade.len() as u64, Ordering::Relaxed);
+            UNSLOTTED[1].fetch_add(freed, Ordering::Relaxed);
+            crate::host::trail(|| {
+                format!("unslot: {} title slots viewing idle windows made null ({} KiB of windows)", unmade.len(), freed >> 10)
+            });
+        });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "VICTORY_WINDOW_UNSLOT: no thread");
+        }
+    });
 }
 
 /// For [`Shadow::writing`]: into `parts`, the parts of `range` that none of
