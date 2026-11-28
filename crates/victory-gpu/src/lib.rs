@@ -38,6 +38,9 @@ pub mod dxgi;
 mod external;
 pub mod fence;
 pub mod frame;
+// The same file as victory-shader's; not every alias is used here.
+#[allow(dead_code)]
+mod fx;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]

@@ -1390,12 +1390,13 @@ pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
     if first == 0 || !held_only() {
         return placed_bytes(desc);
     }
-    type Known = std::collections::HashMap<([u32; 14], u32), Option<u64>>;
+    // (Only looked up: FxHash, as `crate::fx` says.)
+    type Known = crate::fx::Map<(crate::descriptor::host::WordKey<14>, u32), Option<u64>>;
     thread_local! {
         static KNOWN: std::cell::RefCell<Known> = std::cell::RefCell::default();
     }
     KNOWN.with(|known| {
-        *known.borrow_mut().entry((*desc, first)).or_insert_with(|| {
+        *known.borrow_mut().entry((crate::descriptor::host::WordKey(*desc), first)).or_insert_with(|| {
             let whole = placed_bytes(desc)?;
             // SAFETY: 56 bytes in the description's layout.
             let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
@@ -1476,8 +1477,8 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
 /// title places in that memory in another format shows ([`alias_of`]). A
 /// texture leaves the table before it is freed.
 #[cfg(windows)]
-static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static TARGETS_AT: std::sync::RwLock<std::collections::BTreeMap<u64, usize>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
 
 /// For `this`, a texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the
@@ -1523,8 +1524,10 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     if !r.host.placed.load(Relaxed) || !fills(&r.desc) || !one(&r.desc) {
         return None;
     }
-    // Under the table's lock: a texture leaves it before it is freed.
-    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    // Under the table's lock: a texture leaves it before it is freed. (Read,
+    // shared: every shader read of a placed texture asks, on all the
+    // recording threads at once; only a target made or freed writes.)
+    let targets = TARGETS_AT.read().unwrap_or_else(|e| e.into_inner());
     let other = *targets.get(&(r.data() as u64))? as This;
     let o = resource(other);
     const DEPTH: u32 = 0x2;
@@ -1575,7 +1578,7 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
 #[cfg(windows)]
 fn placed_inside_target(address: u64, this: This) {
     let hit = {
-        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let targets = TARGETS_AT.read().unwrap_or_else(|e| e.into_inner());
         targets.range(..address).next_back().map(|(&start, &other)| (start, other))
     };
     let Some((start, other)) = hit else {
@@ -3213,7 +3216,7 @@ fn hand_out_resource(
         crate::texback::replaced(resource.data() as usize);
         if !fills(&desc) {
             TARGETS_AT
-                .lock()
+                .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(resource.data() as u64, at);
         }
@@ -3239,7 +3242,7 @@ impl Drop for Resource {
             crate::texback::released(address);
             textures().remove(&address);
             if !fills(&self.desc) {
-                let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+                let mut targets = TARGETS_AT.write().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
                 if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
                     targets.remove(&at);

@@ -550,9 +550,10 @@ pub(crate) struct State {
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
-    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    /// (FxHash: only looked up and cleared, never walked.)
+    root_srv_slots: crate::fx::Map<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
-    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_uav_slots: crate::fx::Map<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
@@ -1865,6 +1866,8 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // What the slots this bind fills let go of is retired together.
+        let _retiring = crate::descriptor::host::retiring();
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -5336,7 +5339,7 @@ impl State {
                 && match run.as_mut() {
                     Some((r, Some(held))) => match host_signature(kind, r.step) {
                         Some(signature) => {
-                            held.signature = signature;
+                            held.signature = signature.clone();
                             r.join(&call, call.epoch);
                             true
                         }
@@ -5386,7 +5389,7 @@ impl State {
                 // host copies are kept alive by the list, and the signature is cached.
                 unsafe {
                     list.list.ExecuteIndirect(
-                        &signature,
+                        signature,
                         max,
                         &bounded,
                         at,
@@ -5475,6 +5478,125 @@ fn compute_word(p: &HostPipeline, kind: u32) -> Option<(u32, u32)> {
     Some((param, word.index))
 }
 
+/// [`host_signature`] against the code it replaced: one table under one
+/// lock, a clone handed out each time. `cargo test --release -p victory-gpu
+/// --lib -- --ignored --nocapture list_cpu_signatures`.
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+    use windows::core::Interface;
+
+    fn old_host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
+        static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> = std::sync::Mutex::new(Vec::new());
+        let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
+            return Some(s.clone());
+        }
+        let s = made_signature(kind, stride)?.clone();
+        made.push(((kind, stride), s.clone()));
+        Some(s)
+    }
+
+    const KEYS: [(u32, u32); 5] = [(0, 16), (1, 20), (2, 12), (0, 32), (10, 12)];
+
+    /// Each key gives one object, the same on every thread and every call,
+    /// as the old table did; different keys, different objects.
+    #[test]
+    fn a_signature_is_one_object_for_the_run() {
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        let raw = |k: (u32, u32)| host_signature(k.0, k.1).map(|s| s.as_raw() as usize);
+        let first: Vec<_> = KEYS.iter().map(|&k| raw(k)).collect();
+        assert!(first.iter().all(Option::is_some));
+        let old: Vec<_> = KEYS.iter().map(|&k| old_host_signature(k.0, k.1).map(|s| s.as_raw() as usize)).collect();
+        assert_eq!(first, old, "the old table hands out the same objects");
+        let mut sorted = first.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), KEYS.len());
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..100 {
+                        let again: Vec<_> = KEYS.iter().map(|&k| raw(k)).collect();
+                        assert_eq!(again, first);
+                    }
+                });
+            }
+        });
+    }
+
+    /// 5,000 indirect executions a frame spread over eight recording
+    /// threads: the shared lock and a clone each against the thread's own.
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn list_cpu_signatures() {
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        let run = |new: bool| {
+            let began = std::time::Instant::now();
+            std::thread::scope(|s| {
+                for t in 0..8usize {
+                    s.spawn(move || {
+                        let mut sum = 0usize;
+                        for i in 0..5_000 / 8 * 20 {
+                            let k = KEYS[(t + i) % KEYS.len()];
+                            sum += if new {
+                                host_signature(k.0, k.1).map_or(0, |s| s.as_raw() as usize)
+                            } else {
+                                old_host_signature(k.0, k.1).map_or(0, |s| s.as_raw() as usize)
+                            };
+                        }
+                        std::hint::black_box(sum);
+                    });
+                }
+            });
+            began.elapsed().as_secs_f64() * 1e3 / 20.0
+        };
+        let best = |new| (0..5).map(|_| run(new)).fold(f64::MAX, f64::min);
+        let (before, after) = (best(false), best(true));
+        eprintln!("command signatures, 5,000 executions a frame on 8 threads: shared lock and clone {before:.3} ms, per thread {after:.3} ms a frame");
+    }
+
+    /// The table of textures the host writes, by address, read for every
+    /// shader read of a placed texture on eight threads: a mutex, as it
+    /// was, against the read lock it is now (the same map, so the same
+    /// answers).
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn list_cpu_targets_lock() {
+        let map: std::collections::BTreeMap<u64, usize> = (0..400u64).map(|i| (i * 0x9_1000, i as usize)).collect();
+        let mutex = std::sync::Mutex::new(map.clone());
+        let rw = std::sync::RwLock::new(map);
+        const READS: usize = 5_000 * 20;
+        let run = |locked: &(dyn Fn(u64) -> usize + Sync)| {
+            let began = std::time::Instant::now();
+            std::thread::scope(|s| {
+                for t in 0..8u64 {
+                    s.spawn(move || {
+                        let mut sum = 0;
+                        for i in 0..(READS / 8) as u64 {
+                            sum += locked(((t * 131 + i) % 800) * 0x4_8800);
+                        }
+                        std::hint::black_box(sum);
+                    });
+                }
+            });
+            began.elapsed().as_secs_f64() * 1e3
+        };
+        let by_mutex = |a: u64| mutex.lock().unwrap().get(&a).copied().unwrap_or(0);
+        let by_read = |a: u64| rw.read().unwrap().get(&a).copied().unwrap_or(0);
+        for a in (0..800u64).map(|i| i * 0x4_8800) {
+            assert_eq!(by_mutex(a), by_read(a));
+        }
+        let best = |f: &(dyn Fn(u64) -> usize + Sync)| (0..5).map(|_| run(f)).fold(f64::MAX, f64::min);
+        let (before, after) = (best(&by_mutex), best(&by_read));
+        eprintln!("targets by address, {READS} reads a frame on 8 threads: mutex {before:.3} ms, read lock {after:.3} ms");
+    }
+}
+
 #[cfg(test)]
 mod thread_tests {
     use super::*;
@@ -5490,13 +5612,37 @@ mod thread_tests {
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
-/// once.
-fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
-    static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
-        std::sync::Mutex::new(Vec::new());
+/// once and kept for the run.
+///
+/// Each thread keeps the few it used: every indirect execution took one
+/// lock all recording threads share, and a COM reference, for the same
+/// handful of signatures (`Mutex::lock_contended` and `IUnknown::clone` in
+/// the game profile on 886ae0e). They are never released, so a borrow for
+/// the run is sound.
+fn host_signature(kind: u32, stride: u32) -> Option<&'static ID3D12CommandSignature> {
+    thread_local! {
+        static SEEN: std::cell::RefCell<Vec<((u32, u32), &'static ID3D12CommandSignature)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if let Some(s) = SEEN.with_borrow(|seen| seen.iter().find(|(k, _)| *k == (kind, stride)).map(|&(_, s)| s)) {
+        return Some(s);
+    }
+    let s = made_signature(kind, stride)?;
+    SEEN.with_borrow_mut(|seen| seen.push(((kind, stride), s)));
+    Some(s)
+}
+
+/// [`host_signature`]'s table, shared: each signature made once, and never
+/// released (leaked into the table, which lives for the run anyway).
+fn made_signature(kind: u32, stride: u32) -> Option<&'static ID3D12CommandSignature> {
+    struct Made(Vec<((u32, u32), &'static ID3D12CommandSignature)>);
+    // SAFETY: D3D12 objects are free-threaded; these are only read.
+    unsafe impl Send for Made {}
+    static MADE: std::sync::Mutex<Made> = std::sync::Mutex::new(Made(Vec::new()));
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        return Some(s.clone());
+    let made = &mut made.0;
+    if let Some(&(_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
+        return Some(s);
     }
     let argument = D3D12_INDIRECT_ARGUMENT_DESC {
         Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
@@ -5521,8 +5667,8 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
         once!(error = %e, kind, stride, "host command signature refused");
         return None;
     }
-    let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
+    let signature: &'static ID3D12CommandSignature = Box::leak(Box::new(signature?));
+    made.push(((kind, stride), signature));
     Some(signature)
 }
 
