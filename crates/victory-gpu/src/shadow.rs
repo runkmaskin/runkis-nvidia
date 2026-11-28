@@ -2289,7 +2289,22 @@ pub(crate) fn merged_stats() -> [u64; 3] {
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
+///
+/// With AVX2, 64 bytes are compared at a time and the runs read off the
+/// bits ([`changed_runs_avx2`]): the walk byte by byte inside a run was most
+/// of a 64 KiB page whose floats changed all over (their low bytes changed,
+/// the high ones not: thousands of short runs). The runs are the same.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the processor has AVX2.
+        return unsafe { changed_runs_avx2(now, was) };
+    }
+    changed_runs_bytes(now, was)
+}
+
+/// [`changed_runs`] without AVX2, as it was.
+fn changed_runs_bytes(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -2313,6 +2328,73 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
             i += 1;
         }
         runs.push((first, i - first));
+    }
+    runs
+}
+
+/// [`changed_runs`], 64 bytes at a time: a bit per byte that differs, runs
+/// read off the bits and joined where one goes on into the next 64 bytes.
+/// Equal stretches are passed 256 bytes at a time.
+///
+/// # Safety
+/// AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_runs_avx2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use std::arch::x86_64::*;
+    let n = now.len().min(was.len());
+    let (a, b) = (now.as_ptr(), was.as_ptr());
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut push = |from: usize, len: usize| match runs.last_mut() {
+        Some((at, m)) if *at + *m == from => *m += len,
+        _ => runs.push((from, len)),
+    };
+    let mut i = 0;
+    while i + 64 <= n {
+        // Equal 256 bytes, skipped whole (a page looked at under a flight's
+        // writes hardly ever differs at all).
+        while i + 256 <= n {
+            // SAFETY: inside both (`i + 256 <= n`).
+            let same = unsafe {
+                let mut any = _mm256_setzero_si256();
+                for k in 0..8 {
+                    let x = _mm256_loadu_si256(a.add(i + 32 * k).cast());
+                    let y = _mm256_loadu_si256(b.add(i + 32 * k).cast());
+                    any = _mm256_or_si256(any, _mm256_xor_si256(x, y));
+                }
+                _mm256_testz_si256(any, any) != 0
+            };
+            if !same {
+                break;
+            }
+            i += 256;
+        }
+        if i + 64 > n {
+            break;
+        }
+        // SAFETY: inside both (`i + 64 <= n`).
+        let differ = unsafe {
+            let lo = _mm256_cmpeq_epi8(_mm256_loadu_si256(a.add(i).cast()), _mm256_loadu_si256(b.add(i).cast()));
+            let hi = _mm256_cmpeq_epi8(_mm256_loadu_si256(a.add(i + 32).cast()), _mm256_loadu_si256(b.add(i + 32).cast()));
+            !(u64::from(_mm256_movemask_epi8(lo) as u32) | (u64::from(_mm256_movemask_epi8(hi) as u32) << 32))
+        };
+        let mut bits = differ;
+        while bits != 0 {
+            let first = bits.trailing_zeros();
+            let count = (bits >> first).trailing_ones();
+            push(i + first as usize, count as usize);
+            if first + count >= 64 {
+                break;
+            }
+            bits &= u64::MAX << (first + count);
+        }
+        i += 64;
+    }
+    while i < n {
+        if now[i] != was[i] {
+            push(i, 1);
+        }
+        i += 1;
     }
     runs
 }
@@ -2913,6 +2995,116 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+}
+
+/// The copy-back's compares made faster: each against the code it replaced,
+/// kept here (or beside it) as the reference, on memory of a frame's sizes.
+#[cfg(test)]
+mod back_speed_tests {
+    use super::{PIECE, changed_runs, changed_runs_bytes};
+
+    fn random(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    /// A page as the title leaves it under a flight's writes: `kind` 0
+    /// unchanged, 1 a few words, 2 floats changed all over (low bytes), 3
+    /// changed stretches of every length, 4 all of it.
+    fn changed(was: &[u8], kind: usize, seed: &mut u64) -> Vec<u8> {
+        let mut now = was.to_vec();
+        let n = now.len();
+        match kind {
+            _ if n == 0 => {}
+            0 => {}
+            1 => {
+                for _ in 0..8 {
+                    let at = random(seed) as usize % n;
+                    now[at] ^= 1 + (random(seed) % 255) as u8;
+                }
+            }
+            2 => {
+                for at in (0..n.saturating_sub(3)).step_by(4) {
+                    if !random(seed).is_multiple_of(3) {
+                        now[at] = now[at].wrapping_add(1 + (random(seed) % 255) as u8);
+                        if random(seed).is_multiple_of(2) {
+                            now[at + 1] ^= 0x10;
+                        }
+                    }
+                }
+            }
+            3 => {
+                for _ in 0..200 {
+                    let at = random(seed) as usize % n.max(1);
+                    let len = [1, 2, 3, 31, 32, 33, 63, 64, 65, 255, 256, 257, 700][random(seed) as usize % 13].min(n - at);
+                    for b in &mut now[at..at + len] {
+                        *b ^= 1 + (random(seed) % 255) as u8;
+                    }
+                }
+            }
+            _ => now.iter_mut().for_each(|b| *b = !*b),
+        }
+        now
+    }
+
+    /// The runs are those the byte-by-byte walk finds, for every kind of
+    /// page, lengths that are not multiples of 64 or 256, and runs across
+    /// every boundary of the blocks compared at once.
+    #[test]
+    fn changed_runs_are_those_of_the_walk_byte_by_byte() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for round in 0..600 {
+            let n = [PIECE, PIECE - 1, 4096, 4095, 300, 257, 256, 255, 65, 64, 63, 1, 0][round % 13];
+            let was: Vec<u8> = (0..n).map(|_| random(&mut seed) as u8).collect();
+            let now = changed(&was, round / 13 % 5, &mut seed);
+            assert_eq!(changed_runs(&now, &was), changed_runs_bytes(&now, &was), "round {round}, {n} bytes");
+            // Slices of different lengths: the shorter one's.
+            assert_eq!(changed_runs(&now[..n / 2], &was), changed_runs_bytes(&now[..n / 2], &was), "round {round}");
+        }
+        // A change at every place of a block, alone and as the end of a run.
+        let was = vec![0u8; 1024];
+        for at in 0..1024 {
+            let mut now = was.clone();
+            now[at] = 1;
+            assert_eq!(changed_runs(&now, &was), [(at, 1)]);
+            now[..at].fill(2);
+            assert_eq!(changed_runs(&now, &was), [(0, at + 1)]);
+        }
+    }
+
+    fn best(rounds: usize, mut f: impl FnMut()) -> f64 {
+        (0..rounds)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                f();
+                t.elapsed().as_secs_f64() * 1e3
+            })
+            .fold(f64::MAX, f64::min)
+    }
+
+    /// What the runs of a frame's pages cost, before and after (ignored: a
+    /// measurement; `cargo test --release -p victory-gpu --lib back_speed
+    /// -- --ignored --nocapture`). 400 pages of 64 KiB (session
+    /// play-1125-1724: 190,000 runs in 400 pages).
+    #[test]
+    #[ignore]
+    fn what_changed_runs_cost() {
+        let mut seed = 0x1234_5678u64;
+        for (kind, label) in [(0, "unchanged"), (1, "a few words"), (2, "floats all over"), (3, "stretches"), (4, "all of it")] {
+            let pages: Vec<(Vec<u8>, Vec<u8>)> = (0..400)
+                .map(|_| {
+                    let was: Vec<u8> = (0..PIECE).map(|_| random(&mut seed) as u8).collect();
+                    (changed(&was, kind, &mut seed), was)
+                })
+                .collect();
+            let runs: usize = pages.iter().map(|(now, was)| changed_runs(now, was).len()).sum();
+            let before = best(5, || pages.iter().for_each(|(now, was)| drop(std::hint::black_box(changed_runs_bytes(now, was)))));
+            let after = best(5, || pages.iter().for_each(|(now, was)| drop(std::hint::black_box(changed_runs(now, was)))));
+            println!("400 pages of 64 KiB, {label} ({runs} runs): {before:.2} ms before, {after:.2} ms now");
+        }
     }
 }
 
