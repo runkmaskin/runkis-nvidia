@@ -2697,7 +2697,18 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             }
             sig.unwrap()
         };
-        // Three records of 65,535 x 16 groups: about half the budget each.
+        // A small record of 64 groups (cost 4,096), then three that fill exactly what is left
+        // of the budget (2^21 groups of 64 threads): 65,535 x 16, 65,535 x 15 and 65,503 x 1.
+        // A record that does not fit takes nothing from the ones after it
+        // (`VICTORY_INDIRECT_REST` off, the default), so the budget is spent by records that
+        // fit, not by one that is refused.
+        const FILL: [[u32; 3]; 3] = [[65535, 16, 1], [65535, 15, 1], [65503, 1, 1]];
+        const SMALL_GROUPS: u32 = 64;
+        assert_eq!(
+            FILL.iter().map(|g| u64::from(g[0] * g[1] * g[2])).sum::<u64>() + u64::from(SMALL_GROUPS),
+            1 << 21,
+            "the records fill the budget exactly"
+        );
         let Some((big, big_ptr)) = host.shared_buffer(3 * u64::from(STRIDE)) else {
             return;
         };
@@ -2709,22 +2720,19 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         };
         // SAFETY: mapped buffers of these sizes; nothing runs yet.
         unsafe {
-            for i in 0..3 {
-                let words = [65535u32, 16, 1];
-                std::ptr::copy_nonoverlapping(
-                    words.as_ptr().cast::<u8>(),
-                    big_ptr.add(i * STRIDE as usize),
-                    12,
-                );
+            for (i, words) in FILL.iter().enumerate() {
+                std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), big_ptr.add(i * STRIDE as usize), 12);
             }
-            std::ptr::copy_nonoverlapping([1u32, 1, 1].as_ptr().cast::<u8>(), small_ptr, 12);
-            std::ptr::write_bytes(hits_ptr, 0, 256);
+            std::ptr::copy_nonoverlapping([SMALL_GROUPS, 1, 1].as_ptr().cast::<u8>(), small_ptr, 12);
         }
         // SAFETY: a live buffer.
         let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
-        for round in 0..2 {
-            // Spends the budget (clamped, not executed), then one group.
-            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
+        for round in 0..3 {
+            // SAFETY: a mapped buffer; the list is not running.
+            unsafe { std::ptr::write_bytes(hits_ptr, 0, 256) };
+            // The small record first, run at once; then the budget is spent to its last unit
+            // (clamped, not executed). Had a submission's budget carried over to the next, the
+            // small record of every round after the first would run empty.
             let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
             // SAFETY: an open list; the worker's root signature and
             // pipeline; buffers the test holds until the list has run.
@@ -2734,33 +2742,24 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
                 list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
                 list.list.ExecuteIndirect(&signature, 1, &scratch, 0, None, 0);
             }
+            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
+            // The budget is spent now: the same small record again runs empty.
+            let again = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+            // SAFETY: as above.
+            unsafe {
+                list.list.SetComputeRootSignature(&worker.root);
+                list.list.SetPipelineState(&worker.pso);
+                list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                list.list.ExecuteIndirect(&signature, 1, &again, 0, None, 0);
+            }
             list.close();
             assert_eq!(host.log_messages(), None, "the debug layer found an error");
             host.execute(&[&list]);
             list.reset();
             // SAFETY: the list has run; a mapped buffer.
             let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
-            // The small record comes after the big ones spent the budget:
-            // it runs empty, in every round alike (none carries over).
-            assert_eq!(hits, 0, "round {round}: the spent budget empties the record after it");
+            assert_eq!(hits, SMALL_GROUPS, "round {round}: the budget starts empty at each submission");
         }
-        // A recording with only the small record: the budget is empty
-        // again, so it runs.
-        let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
-        // SAFETY: as above.
-        unsafe {
-            list.list.SetComputeRootSignature(&worker.root);
-            list.list.SetPipelineState(&worker.pso);
-            list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
-            list.list.ExecuteIndirect(&signature, 1, &scratch, 0, None, 0);
-        }
-        list.close();
-        assert_eq!(host.log_messages(), None, "the debug layer found an error");
-        host.execute(&[&list]);
-        list.reset();
-        // SAFETY: the list has run; a mapped buffer.
-        let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
-        assert_eq!(hits, 1, "the budget starts empty at the next submission");
     }
 
     /// Records the dispatch records `groups` (three words each, `step`
@@ -3193,7 +3192,14 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             };
             assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
             assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
-            assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
+            // Each record charges 2^26 for each execution, and one that does not fit whole
+            // takes nothing (`VICTORY_INDIRECT_REST` off, the default): three executions of one
+            // record (3 * 2^26) are refused and leave the budget untouched.
+            let expected = (0..records).fold(0u32, |spent, _| {
+                let cost = (1u32 << 26) * times;
+                if BUDGET - spent >= cost { spent + cost } else { spent }
+            });
+            assert_eq!(spent, expected, "{times} times {records}");
         }
     }
 
